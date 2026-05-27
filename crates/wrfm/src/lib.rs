@@ -6,7 +6,7 @@ use std::path::Path;
 pub struct WrfmModel {
     pub name: String,
     pub vertices: Vec<(f64, f64, f64)>,
-    pub edges: Vec<(usize, usize)>
+    pub edges: Vec<(usize, usize)>,
 }
 
 impl WrfmModel {
@@ -14,7 +14,7 @@ impl WrfmModel {
         Self {
             name: name.into(),
             vertices: Vec::new(),
-            edges: Vec::new()
+            edges: Vec::new(),
         }
     }
 
@@ -25,7 +25,8 @@ impl WrfmModel {
         let reader = BufReader::new(file);
 
         let mut model = WrfmModel {
-            name: path.as_ref()
+            name: path
+                .as_ref()
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("Unknown")

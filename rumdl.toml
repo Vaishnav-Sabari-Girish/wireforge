@@ -1,5 +1,5 @@
 [MD013]
-line-length = 80
+line-length = 120
 reflow = true
 code-blocks = false
 tables = false

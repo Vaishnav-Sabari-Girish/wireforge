@@ -2,33 +2,27 @@ use clap::Parser;
 use crossterm::{
     event::{self, Event, KeyCode},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 
 use notify::{EventKind, RecursiveMode, Watcher};
-use ratatui::{
-    backend::CrosstermBackend,
-    style::Color,
-    Terminal
-};
+use ratatui::{Terminal, backend::CrosstermBackend, style::Color};
 
 use ratatui_wireframe::WireframeWidget;
-use std::{
-    error::Error,
-    io,
-    path::PathBuf,
-    sync::mpsc,
-    time::Duration
-};
+use std::{error::Error, io, path::PathBuf, sync::mpsc, time::Duration};
 use wrfm::WrfmModel;
 
 #[derive(Parser, Debug)]
-#[command(name = "wireforge", author, version, about = "TUI editor and viewer for .wrfm braille-based 3D models")]
+#[command(
+    name = "wireforge",
+    author,
+    version,
+    about = "TUI editor and viewer for .wrfm braille-based 3D models"
+)]
 struct Args {
     #[arg(required = true)]
-    file: PathBuf
+    file: PathBuf,
 }
-
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
@@ -43,13 +37,16 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let (tx, rx) = mpsc::channel();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-        if let Ok(event) = res && matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
-                let _ = tx.send(());
-            }
-        
+        if let Ok(event) = res
+            && matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_))
+        {
+            let _ = tx.send(());
+        }
     })?;
 
-    let watch_path = target_file.canonicalize().unwrap_or_else(|_| target_file.clone());
+    let watch_path = target_file
+        .canonicalize()
+        .unwrap_or_else(|_| target_file.clone());
     if let Some(parent) = watch_path.parent() {
         watcher.watch(parent, RecursiveMode::NonRecursive)?;
     } else {
@@ -91,13 +88,13 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         terminal.draw(|f| {
             let title = format!(
-            "Wireforge: {} | [Space] Spin | [Arrows] Rotate | [R/E] Roll | [Q] Quit | {}",
+                "Wireforge: {} | [Space] Spin | [Arrows] Rotate | [R/E] Roll | [Q] Quit | {}",
                 wrfm_data.name, status_msg
             );
 
             let current_model = ratatui_wireframe::model::Model {
                 vertices: wrfm_data.vertices.clone(),
-                edges: wrfm_data.edges.clone()
+                edges: wrfm_data.edges.clone(),
             };
 
             let widget = WireframeWidget::new(pitch, yaw, roll)
@@ -109,7 +106,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         })?;
 
         // Handle Input
-        if event::poll(Duration::from_millis(16))? && let Event::Key(key) = event::read()? {
+        if event::poll(Duration::from_millis(16))?
+            && let Event::Key(key) = event::read()?
+        {
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => break,
                 KeyCode::Char(' ') => auto_spin = !auto_spin,
@@ -119,7 +118,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 KeyCode::Right => yaw += 0.1,
                 KeyCode::Char('r') => roll += 0.1,
                 KeyCode::Char('e') => roll -= 0.1,
-                _ => {},
+                _ => {}
             }
         }
 
