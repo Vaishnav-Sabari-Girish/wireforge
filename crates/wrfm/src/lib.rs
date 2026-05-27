@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, Write};
 use std::path::Path;
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -18,25 +18,15 @@ impl WrfmModel {
         }
     }
 
-    // Load the .wrfm file
-    pub fn from_file<P: AsRef<Path>>(path: P) -> io::Result<Self> {
-        let file = File::open(&path)?;
-
-        let reader = BufReader::new(file);
-
+    /// Parses a model directly from a string (useful for include_str!)
+    pub fn from_str(name: &str, input: &str) -> io::Result<Self> {
         let mut model = WrfmModel {
-            name: path
-                .as_ref()
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("Unknown")
-                .to_string(),
+            name: name.to_string(),
             vertices: Vec::new(),
             edges: Vec::new(),
         };
 
-        for (line_num, line_result) in reader.lines().enumerate() {
-            let line = line_result?;
+        for (line_num, line) in input.lines().enumerate() {
             let trimmed = line.trim();
 
             if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -74,7 +64,6 @@ impl WrfmModel {
                         ));
                     }
                 }
-
                 _ => {
                     continue;
                 }
@@ -83,6 +72,19 @@ impl WrfmModel {
         Ok(model)
     }
 
+    /// Load the .wrfm file from a path
+    pub fn from_file<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        let content = std::fs::read_to_string(&path)?;
+        let name = path
+            .as_ref()
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Unknown");
+
+        Self::from_str(name, &content)
+    }
+
+    /// Save the model to a .wrfm file
     pub fn save_to_file<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
         let mut file = File::create(path)?;
 
