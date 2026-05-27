@@ -17,4 +17,4 @@ crossterm = "0.29.0"
 notify = "8.2.0"
 ratatui = "0.30.0"
 ratatui-wireframe = "0.4.0"
-wrfm = { version = "0.2.0", path = "crates/wrfm" }
+wrfm = { version = "0.3.0", path = "crates/wrfm" }
