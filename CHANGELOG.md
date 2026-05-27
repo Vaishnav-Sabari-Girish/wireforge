@@ -1,9 +1,10 @@
-## [unreleased]
 
-### 🚀 Features
+## Unreleased
 
-- *(initial)* Initial commit
 
-### ⚙️ Miscellaneous Tasks
 
-- *(CI)* Added github actions
+### :rocket: New features
+
+- **(initial)** Initial commit
+
+<!-- ComChan -->
