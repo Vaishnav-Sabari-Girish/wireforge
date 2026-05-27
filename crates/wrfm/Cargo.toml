@@ -1,0 +1,7 @@
+[package]
+name = "wrfm"
+version = "0.2.0"
+edition = "2024"
+description = "A fast, lightweight parser for .wrfm 3D wireframe models"
+
+[dependencies]

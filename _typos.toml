@@ -1,6 +1,7 @@
 [default.extend-words]
 ratatui = "ratatui"
 ratatui_wireframe = "ratatui_wireframe"
+wrfm = "wrfm"
 
 [files]
 extend-exclude = ["CHANGELOG.md"]
