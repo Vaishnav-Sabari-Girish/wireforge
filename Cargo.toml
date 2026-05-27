@@ -1,0 +1,15 @@
+[package]
+name = "wireforge"
+version = "0.1.0"
+edition = "2024"
+description = "TUI based editor and viewer for .wrfm files for braille-based 3D wireframes"
+readme = "README.md"
+authors = ["Vaishnav Sabari Girish <vaishnav.sabari.girish@gmail.com>"]
+license = "MIT"
+homepage = "https://github.com/Vaishnav-Sabari-Girish/wireforge"
+repository = "https://github.com/Vaishnav-Sabari-Girish/wireforge"
+keywords = ["cli", "tui", "file"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+notify = "8.2.0"
