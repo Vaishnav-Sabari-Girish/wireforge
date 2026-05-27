@@ -3,5 +3,12 @@ name = "wrfm"
 version = "0.2.0"
 edition = "2024"
 description = "A fast, lightweight parser for .wrfm 3D wireframe models"
+readme = "README.md"
+authors = ["Vaishnav Sabari Girish <vaishnav.sabari.girish@gmail.com>"]
+license = "MIT"
+homepage = "https://github.com/Vaishnav-Sabari-Girish/wireforge"
+repository = "https://github.com/Vaishnav-Sabari-Girish/wireforge"
+keywords = ["cli", "tui", "file"]
+categories = ["command-line-utilities"]
 
 [dependencies]
