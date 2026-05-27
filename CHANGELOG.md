@@ -5,6 +5,8 @@
 
 ### :rocket: New features
 
+- **(read_from_string)** Read data from string in `wrfm`
+
 - **(viewer)** The viewer has been implemented
 
 - **(initial)** Initial commit
