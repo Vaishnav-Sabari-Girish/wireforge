@@ -1,6 +1,6 @@
 [package]
 name = "wireforge"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "TUI based editor and viewer for .wrfm files for braille-based 3D wireframes"
 readme = "README.md"
