@@ -1198,11 +1198,12 @@ dependencies = [
 
 [[package]]
 name = "ratatui-wireframe"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d3a9fc710c1aa881d87837badd54ff50b4758c66382e409db874f6a19a3e0e6"
+checksum = "30158bd15b44008268c552307b656d93a5996a6737138344c6a6756b219c19af"
 dependencies = [
  "ratatui",
+ "wrfm 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -1974,7 +1975,7 @@ dependencies = [
  "notify",
  "ratatui",
  "ratatui-wireframe",
- "wrfm",
+ "wrfm 0.3.0",
 ]
 
 [[package]]
@@ -2074,6 +2075,12 @@ dependencies = [
 [[package]]
 name = "wrfm"
 version = "0.3.0"
+
+[[package]]
+name = "wrfm"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3bec53669720b4b9c2a4a40102c5b86cc0b2cb6253e6a99a5cdc77bc20ba2c81"
 
 [[package]]
 name = "zmij"

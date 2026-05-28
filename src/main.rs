@@ -100,7 +100,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let widget = WireframeWidget::new(pitch, yaw, roll)
                 .title(title)
                 .color(Color::Cyan)
-                .model(current_model);
+                .model(&current_model);
 
             f.render_widget(widget, f.area());
         })?;
