@@ -5,6 +5,8 @@
 
 ### :rocket: New features
 
+- **(no_std)** Add no_std support for wrfm
+
 - **(read_from_string)** Read data from string in `wrfm`
 
 - **(viewer)** The viewer has been implemented
