@@ -1,5 +1,16 @@
+#![cfg_attr(not(feature = "std"), no_std)]
+
+extern crate alloc;
+
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+
+#[cfg(feature = "std")]
 use std::fs::File;
+#[cfg(feature = "std")]
 use std::io::{self, Write};
+#[cfg(feature = "std")]
 use std::path::Path;
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -19,7 +30,8 @@ impl WrfmModel {
     }
 
     /// Parses a model directly from a string (useful for include_str!)
-    pub fn from_str(name: &str, input: &str) -> io::Result<Self> {
+    /// Returns a `Result<Self, String>` so it can operate in no_std environments.
+    pub fn from_str(name: &str, input: &str) -> Result<Self, String> {
         let mut model = WrfmModel {
             name: name.to_string(),
             vertices: Vec::new(),
@@ -44,10 +56,7 @@ impl WrfmModel {
                     if let (Some(x), Some(y), Some(z)) = (x, y, z) {
                         model.vertices.push((x, y, z));
                     } else {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("Invalid vertex on line {}", line_num + 1),
-                        ));
+                        return Err(format!("Invalid vertex on line {}", line_num + 1));
                     }
                 }
                 Some("e") => {
@@ -58,10 +67,7 @@ impl WrfmModel {
                     if let (Some(v1), Some(v2)) = (v1, v2) {
                         model.edges.push((v1, v2));
                     } else {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("Invalid edge data on line {}", line_num + 1),
-                        ));
+                        return Err(format!("Invalid edge data on line {}", line_num + 1));
                     }
                 }
                 _ => {
@@ -73,6 +79,7 @@ impl WrfmModel {
     }
 
     /// Load the .wrfm file from a path
+    #[cfg(feature = "std")]
     pub fn from_file<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let content = std::fs::read_to_string(&path)?;
         let name = path
@@ -81,10 +88,12 @@ impl WrfmModel {
             .and_then(|s| s.to_str())
             .unwrap_or("Unknown");
 
-        Self::from_str(name, &content)
+        // Map the String error from from_str back into an io::Error
+        Self::from_str(name, &content).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
     /// Save the model to a .wrfm file
+    #[cfg(feature = "std")]
     pub fn save_to_file<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
         let mut file = File::create(path)?;
 
