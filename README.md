@@ -19,7 +19,7 @@ crate.
 
 ## Installation
 
-### AUR 
+### AUR
 
 ```bash
 yay -S wireforge
