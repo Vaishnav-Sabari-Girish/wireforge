@@ -19,7 +19,19 @@ crate.
 
 ## Installation
 
-Currently, Wireforge is built from source.
+### AUR 
+
+```bash
+yay -S wireforge
+# OR 
+paru -S wireforge
+```
+
+### crates.io
+
+```bash
+cargo install wireforge
+```
 
 ### Build from source
 
