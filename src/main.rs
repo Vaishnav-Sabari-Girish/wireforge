@@ -8,8 +8,14 @@ use crossterm::{
 use notify::{EventKind, RecursiveMode, Watcher};
 use ratatui::{Terminal, backend::CrosstermBackend, style::Color};
 
-use ratatui_wireframe::{model::Model, WireframeWidget};
-use std::{error::Error, io, path::{Path, PathBuf}, sync::mpsc, time::Duration};
+use ratatui_wireframe::{WireframeWidget, model::Model};
+use std::{
+    error::Error,
+    io,
+    path::{Path, PathBuf},
+    sync::mpsc,
+    time::Duration,
+};
 use wrfm::WrfmModel;
 
 #[cfg(feature = "ratty")]
@@ -36,7 +42,10 @@ enum RenderMode {
 
 /// Helper to automatically route .obj and .wrfm files to the correct parser or widget
 fn load_model(target_file: &Path) -> Result<(RenderMode, String), String> {
-    let ext = target_file.extension().and_then(|s| s.to_str()).unwrap_or("");
+    let ext = target_file
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
 
     if ext.eq_ignore_ascii_case("obj") {
         let name = target_file
@@ -48,7 +57,8 @@ fn load_model(target_file: &Path) -> Result<(RenderMode, String), String> {
         #[cfg(feature = "ratty")]
         {
             // Convert to absolute path so Ratty can locate it from anywhere
-            let abs_path = std::fs::canonicalize(target_file).unwrap_or_else(|_| target_file.to_path_buf());
+            let abs_path =
+                std::fs::canonicalize(target_file).unwrap_or_else(|_| target_file.to_path_buf());
             let path_str = abs_path.to_string_lossy().into_owned();
 
             let settings = RattyGraphicSettings::new(path_str)
@@ -56,9 +66,9 @@ fn load_model(target_file: &Path) -> Result<(RenderMode, String), String> {
                 .format(ObjectFormat::Obj)
                 .scale(0.30) // Adjust this up or down depending on your specific model's export scale
                 .brightness(1.5);
-            
+
             let graphic = RattyGraphic::new(settings);
-            
+
             // Register the payload with the terminal emulator
             if let Err(e) = graphic.register() {
                 return Err(format!("Ratty Registration Error: {}", e));
@@ -69,7 +79,10 @@ fn load_model(target_file: &Path) -> Result<(RenderMode, String), String> {
         #[cfg(not(feature = "ratty"))]
         {
             // Fallback: ratatui-wireframe feature is off
-            Err("OBJ parsing requires the 'ratty' feature. Recompile with --features ratty".to_string())
+            Err(
+                "OBJ parsing requires the 'ratty' feature. Recompile with --features ratty"
+                    .to_string(),
+            )
         }
     } else {
         // Default to .wrfm legacy parser
@@ -96,9 +109,10 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let (tx, rx) = mpsc::channel();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-        if let Ok(event) = res && matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
+        if let Ok(event) = res
+            && matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_))
+        {
             let _ = tx.send(());
-
         }
     })?;
 
@@ -143,7 +157,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
 
         // Handle Input
-        if event::poll(Duration::from_millis(16))? && let Event::Key(key) = event::read()? {
+        if event::poll(Duration::from_millis(16))?
+            && let Event::Key(key) = event::read()?
+        {
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => break,
                 KeyCode::Char(' ') => auto_spin = !auto_spin,
@@ -189,7 +205,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     let block = ratatui::widgets::Block::default()
                         .borders(ratatui::widgets::Borders::ALL)
                         .title(title);
-                    
+
                     let inner_area = block.inner(f.area());
                     f.render_widget(block, f.area());
 
