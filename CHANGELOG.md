@@ -1,4 +1,13 @@
 
+## Unreleased
+
+
+
+### :rocket: New features
+
+- **(3d)** 3D objects viewing using RGP
+
+
 ## v0.5.0 - 2026-06-01
 
 
