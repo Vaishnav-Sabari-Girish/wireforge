@@ -7,7 +7,8 @@ which can be natively consumed by the
 [`ratatui-wireframe`](https://crates.io/crates/ratatui-wireframe) rendering
 crate.
 
-It also allows you to view 3D files using the `ratatui-ratty` crate in the [`ratty`](https://github.com/orhun/ratty) terminal emulator.
+It also allows you to view 3D files using the `ratatui-ratty` crate in the
+[`ratty`](https://github.com/orhun/ratty) terminal emulator.
 
 ## Features
 
@@ -66,7 +67,7 @@ wireforge path/to/model.wrfm
 wireforge cube.wrfm
 ```
 
-You can also point it to `.obj` files for 3D viewing 
+You can also point it to `.obj` files for 3D viewing
 
 ```bash
 wireforge mouse.obj
