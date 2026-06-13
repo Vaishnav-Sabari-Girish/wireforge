@@ -1,6 +1,6 @@
 [package]
 name = "wireforge"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 description = "TUI based editor and viewer for .wrfm files for braille-based 3D wireframes"
 readme = "README.md"
@@ -15,6 +15,11 @@ categories = ["command-line-utilities"]
 clap = { version = "4.6.1", features = ["derive"] }
 crossterm = "0.29.0"
 notify = "8.2.0"
-ratatui = "0.30.0"
-ratatui-wireframe = "0.5.0"
+ratatui = "0.30.1"
+ratatui-ratty = "0.3.0"
+ratatui-wireframe = "0.7.0"
 wrfm = { version = "0.4.0", path = "crates/wrfm" }
+
+[features]
+default = []
+ratty = ["ratatui-wireframe/ratty"]
