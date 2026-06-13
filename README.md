@@ -7,6 +7,8 @@ which can be natively consumed by the
 [`ratatui-wireframe`](https://crates.io/crates/ratatui-wireframe) rendering
 crate.
 
+It also allows you to view 3D files using the `ratatui-ratty` crate in the [`ratty`](https://github.com/orhun/ratty) terminal emulator.
+
 ## Features
 
 * **Instant Hot-Reloading:** Open a `.wrfm` file in your favorite text editor
@@ -22,15 +24,25 @@ crate.
 ### AUR
 
 ```bash
+# Without 3D model support
 yay -S wireforge
 # OR 
 paru -S wireforge
+
+# With 3D model support
+yay -S wireforge-ratty
+# OR 
+paru -S wireforge-ratty
 ```
 
 ### crates.io
 
 ```bash
+# Without 3D
 cargo install wireforge
+
+# With 3D model support 
+cargo install wireforge --features ratty
 ```
 
 ### Build from source
@@ -39,6 +51,8 @@ cargo install wireforge
 git clone [https://github.com/Vaishnav-Sabari-Girish/wireforge.git](https://github.com/Vaishnav-Sabari-Girish/wireforge.git)
 cd wireforge
 cargo build --release
+# For 3D model support
+cargo build --release --features ratty
 ```
 
 ## Usage
@@ -46,10 +60,16 @@ cargo build --release
 Point `wireforge` to any valid `.wrfm` file:
 
 ```bash
-cargo run --release -- path/to/model.wrfm
+wireforge path/to/model.wrfm
 
 # Example
-cargo run --release -- cube.wrfm
+wireforge cube.wrfm
+```
+
+You can also point it to `.obj` files for 3D viewing 
+
+```bash
+wireforge mouse.obj
 ```
 
 ### TUI Controls
