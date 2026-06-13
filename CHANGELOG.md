@@ -8,6 +8,11 @@
 - **(3d)** 3D objects viewing using RGP
 
 
+### :art: Styling
+
+- **(fmt)** Formatted
+
+
 ## v0.5.0 - 2026-06-01
 
 
