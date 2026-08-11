@@ -53,16 +53,12 @@ impl Query {
  }
 }
 
-/// Arguments for the parameterised queries. `range` selects the vertex indices [a, b] for `vertices` (inclusive, 0-based, global); `from`/`to`
+/// Arguments for the parameterised queries. `range` selects the vertex indices [a, b] (inclusive, 0-based, global) for `vertices` / `distance` / `connectivity` (None = all vertices for `vertices`).
 pub struct QueryArgs {
  /// Plane z value for `cross_section`.
  pub at: f64,
- /// Inclusive 0-based index range for `vertices` (None = all vertices).
+ /// Inclusive 0-based index range for `vertices` (None = all vertices); the two endpoint indices for `distance` / `connectivity`.
  pub range: Option<(usize, usize)>,
- /// First vertex for `distance` / `connectivity`.
- pub from: Option<usize>,
- /// Second vertex for `distance` / `connectivity`.
- pub to: Option<usize>,
 }
 
 fn dist(a: (f64, f64, f64), b: (f64, f64, f64)) -> f64 {
@@ -274,8 +270,11 @@ pub fn run(m: &Model, query: Query, args: &QueryArgs) -> String {
             serde_json::to_string_pretty(&json!({ "vertices": vs })).unwrap()
  }
  Query::Distance => {
- // Indices validated by the CLI (exit 2 on out of range).
- let (a, b) = (args.from.unwrap(), args.to.unwrap());
+ // Indices validated by the CLI (exit 2 on out of range; the CLI
+ // guarantees `range` is present for distance/connectivity).
+ let (a, b) = args
+ .range
+ .expect("distance requires a --range (guaranteed by cmd_query)");
  let d = dist(m.vertices[a], m.vertices[b]);
  serde_json::to_string_pretty(&json!({
                 "distance": d,
@@ -285,7 +284,9 @@ pub fn run(m: &Model, query: Query, args: &QueryArgs) -> String {
  .unwrap()
  }
  Query::Connectivity => {
- let (a, b) = (args.from.unwrap(), args.to.unwrap());
+ let (a, b) = args
+ .range
+ .expect("connectivity requires a --range (guaranteed by cmd_query)");
  let c = connected(m, a, b);
  serde_json::to_string_pretty(&json!({
                 "connected": c,
@@ -345,12 +346,7 @@ mod tests {
  let t = run(
  &cube(),
  Query::Extents,
- &QueryArgs {
- at: 0.0,
- range: None,
- from: None,
- to: None,
- },
+ &QueryArgs { at: 0.0, range: None },
  );
         assert!(t.contains("min=[-1.000,-1.000,-1.000]"));
         assert!(t.contains("max=[1.000,1.000,1.000]"));
@@ -363,12 +359,7 @@ mod tests {
  let t = run(
  &cube(),
  Query::Topology,
- &QueryArgs {
- at: 0.0,
- range: None,
- from: None,
- to: None,
- },
+ &QueryArgs { at: 0.0, range: None },
  );
         assert!(t.contains("vertices=8 edges=12"));
         assert!(t.contains("max=3"));
@@ -380,12 +371,7 @@ mod tests {
  let t = run(
  &cube(),
  Query::EdgeStats,
- &QueryArgs {
- at: 0.0,
- range: None,
- from: None,
- to: None,
- },
+ &QueryArgs { at: 0.0, range: None },
  );
         assert!(t.contains("length min=2.000 max=2.000 avg=2.000"));
  }
@@ -395,12 +381,7 @@ mod tests {
  let t = run(
  &cube(),
  Query::CrossSection,
- &QueryArgs {
- at: 0.0,
- range: None,
- from: None,
- to: None,
- },
+ &QueryArgs { at: 0.0, range: None },
  );
         assert!(t.contains("edges cross"));
         assert!(t.contains("x=[-1.000,1.000] y=[-1.000,1.000]"));
@@ -410,12 +391,7 @@ mod tests {
  }
 
  fn args() -> QueryArgs {
- QueryArgs {
- at: 0.0,
- range: None,
- from: None,
- to: None,
- }
+ QueryArgs { at: 0.0, range: None }
  }
 
  #[test]
@@ -493,8 +469,7 @@ mod tests {
  &m,
  Query::Distance,
  &QueryArgs {
- from: Some(0),
- to: Some(1),
+ range: Some((0, 1)),
  ..args()
  },
  );
@@ -518,8 +493,7 @@ mod tests {
  &m,
  Query::Connectivity,
  &QueryArgs {
- from: Some(f),
- to: Some(t),
+ range: Some((f, t)),
  ..args()
  },
  )
@@ -540,8 +514,7 @@ mod tests {
  &m,
  Query::Connectivity,
  &QueryArgs {
- from: Some(2),
- to: Some(2),
+ range: Some((2, 2)),
  ..args()
  },
  );

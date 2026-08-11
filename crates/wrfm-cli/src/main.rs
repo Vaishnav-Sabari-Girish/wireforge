@@ -5,6 +5,7 @@ mod load;
 mod query;
 mod render;
 mod transform;
+mod verify;
 mod view;
 
 use clap::{Parser, Subcommand};
@@ -62,7 +63,7 @@ Authoritative spec: FORMAT.md (wrfm crate docs).
     name = "wrfm",
  version,
     about = "Read-only streaming CLI for .wrfm 3D wireframe models",
- after_help = "Every model-input command accepts '-' for stdin. Nothing writes a file: use shell redirection.\nExit codes: 0 ok/warn · 1 result produced but check broken · 2 could not produce a result.\nCompose atomic operations with pipes, e.g.:\n  wrfm edit m.wrfm --extract-group body | wrfm transform - --scale 2 --rotate-y 45\n  wrfm transform m.wrfm --mirror x | wrfm edit - --clean\nFormat spec: wrfm format (self-contained; no source needed)."
+ after_help = "Every model-input command accepts '-' for stdin. Nothing writes a file: use shell redirection.\nExit codes: 0 clean (ok/warn/pass) · 1 result produced with an issue (check broken / verify fail) · 2 could not produce a result.\nCompose atomic operations with pipes, e.g.:\n  wrfm edit m.wrfm --extract-group body | wrfm transform - --scale 2 --rotate-y 45\n  wrfm transform m.wrfm --mirror x | wrfm edit - --clean\nFormat spec: wrfm format (self-contained; no source needed)."
 )]
 struct Cli {
  #[command(subcommand)]
@@ -82,10 +83,42 @@ enum Command {
  #[arg(long)]
  strict: bool,
  },
+ /// Verify the model against declared intent (size / center / closed / axis / symmetry / groups).
+ Verify {
+ /// Path to the .wrfm file, or '-' to read the model from stdin.
+ file: String,
+ /// Expected bounding-box size 'X,Y,Z' (within --tolerance).
+ #[arg(long)]
+ expect_size: Option<String>,
+ /// Expected bounding-box center 'X,Y,Z' (within --tolerance).
+ #[arg(long)]
+ expect_center: Option<String>,
+ /// Expect every edge to lie in a cycle (no open edges / bridges).
+ #[arg(long)]
+ expect_closed: bool,
+ /// Expect the longest axis to be x | y | z (when axes tie, the tie resolves z>y>x, matching geometry::analyze).
+ #[arg(long)]
+ expect_axis: Option<String>,
+ /// Expect mirror symmetry across the plane perpendicular to x|y|z (comma list).
+ #[arg(long)]
+ expect_symmetric: Option<String>,
+ /// Expect these named groups to exist (comma list).
+ #[arg(long)]
+ expect_groups: Option<String>,
+ /// Relative tolerance for numeric expectations (default 0.05 = 5%).
+ #[arg(long, default_value_t = 0.05)]
+ tolerance: f64,
+/// Scope the expectations to one group (the part's size/center/closed/axis/symmetry); --expect-groups still checks the whole file.
+ #[arg(long)]
+ group: Option<String>,
+ },
  /// Print model metadata (name/version/vertices/edges/groups/bounds) as JSON.
  Info {
  /// Path to the .wrfm file, or '-' to read the model from stdin.
  file: String,
+/// Scope the report to one group (counts/bounds for the part; the groups list still covers the whole file).
+ #[arg(long)]
+ group: Option<String>,
  },
  /// Describe named group(s) as structured facts (JSON).
  Group {
@@ -101,6 +134,9 @@ enum Command {
  /// Include the PCA eigenvalues (full report).
  #[arg(long)]
  full: bool,
+/// Scope the analysis to one group (its vertices + the edges touching it).
+ #[arg(long)]
+ group: Option<String>,
  },
 /// Run a safe geometric query (extents | topology | edge_stats | profile | cross_section | vertices | distance | connectivity).
  Query {
@@ -114,15 +150,9 @@ enum Command {
  /// Plane z value for cross_section.
  #[arg(long, default_value_t = 0.0)]
  at: f64,
-/// Inclusive 0-based global index range "a,b" for `vertices` (mutually exclusive with `--group`).
+/// Inclusive 0-based global index range "a,b" for `vertices` / `distance` / `connectivity` (mutually exclusive with `--group` for `vertices`).
  #[arg(long, default_value = "")]
  range: String,
- /// First global vertex index for distance / connectivity.
- #[arg(long)]
- from: Option<usize>,
- /// Second global vertex index for distance / connectivity.
- #[arg(long)]
- to: Option<usize>,
  },
 /// Exact per-view facts (visible/occluded edges, silhouette, depth order) at a camera (pitch/yaw/roll/dist/pan) as JSON.
  View {
@@ -163,7 +193,8 @@ enum Command {
 /// Comma-separated views (front,back,left,right,top,bottom,iso, side); '' = single frame with the explicit --pitch/--yaw/--roll.
  #[arg(long, default_value = "front,back,left,right,top,bottom")]
  views: String,
- /// braille | ascii | grid | both.
+ /// braille | ascii | grid | both. ascii is a per-dot #/. map — best at small canvases;
+ /// braille is the real terminal output (large canvases).
  #[arg(long, default_value = "braille")]
  format: String,
  /// Canvas width in characters.
@@ -242,7 +273,7 @@ enum Command {
  pivot: String,
 /// Pivot about the bbox centre AND move it to the origin after the transform (overrides --pivot; --translate still applies).
  #[arg(long)]
- center: bool,
+ to_origin: bool,
  /// Rotate the model's longest PCA principal axis onto x | y | z.
  #[arg(long)]
  align: Option<String>,
@@ -303,6 +334,9 @@ enum Command {
  /// text | json.
  #[arg(long, default_value = "text")]
  format: String,
+/// Scope the diff to the same-named group in BOTH models (either side missing it -> exit 2).
+ #[arg(long)]
+ group: Option<String>,
  },
 /// Print the complete .wrfm v1 format spec (magic, header, groups, precision, streams) to stdout. Learn the format from the CLI itself —
  Format,
@@ -316,18 +350,33 @@ fn main() {
  group,
  strict,
  } => cmd_check(&file, group.as_deref(), strict),
- Command::Info { file } => cmd_info(&file),
- Command::Group { file, name } => cmd_group(&file, name.as_deref()),
- Command::Geometry { file, full } => cmd_geometry(&file, full),
- Command::Query {
+ Command::Verify {
  file,
- query,
+ expect_size,
+ expect_center,
+ expect_closed,
+ expect_axis,
+ expect_symmetric,
+ expect_groups,
+ tolerance,
  group,
- at,
- range,
- from,
- to,
- } => cmd_query(&file, &query, group.as_deref(), at, &range, from, to),
+ } => cmd_verify(
+ &file,
+ expect_size.as_deref(),
+ expect_center.as_deref(),
+ expect_closed,
+ expect_axis.as_deref(),
+ expect_symmetric.as_deref(),
+ expect_groups.as_deref(),
+ tolerance,
+ group.as_deref(),
+ ),
+ Command::Info { file, group } => cmd_info(&file, group.as_deref()),
+ Command::Group { file, name } => cmd_group(&file, name.as_deref()),
+ Command::Geometry { file, full, group } => cmd_geometry(&file, full, group.as_deref()),
+ Command::Query { file, query, group, at, range } => {
+ cmd_query(&file, &query, group.as_deref(), at, &range)
+ },
  Command::View {
  file,
  pitch,
@@ -400,7 +449,7 @@ fn main() {
  shear_xz,
  shear_yz,
  pivot,
- center,
+ to_origin,
  align,
  normalize,
  rotate_x,
@@ -420,7 +469,7 @@ fn main() {
  shear_xz,
  shear_yz,
  &pivot,
- center,
+ to_origin,
  align.as_deref(),
  normalize,
  rotate_x,
@@ -448,7 +497,7 @@ fn main() {
  dedupe,
  merge.as_deref(),
  ),
- Command::Diff { a, b, format } => cmd_diff(&a, &b, &format),
+ Command::Diff { a, b, format, group } => cmd_diff(&a, &b, &format, group.as_deref()),
  Command::Format => cmd_format(),
  };
  std::process::exit(code);
@@ -704,14 +753,137 @@ fn cmd_check(file: &str, group: Option<&str>, strict: bool) -> i32 {
  1
  }
 }
-fn cmd_info(file: &str) -> i32 {
+
+#[allow(clippy::too_many_arguments)] // verify's option surface (mirrors cmd_render / cmd_transform)
+fn cmd_verify(
+ file: &str,
+ expect_size: Option<&str>,
+ expect_center: Option<&str>,
+ expect_closed: bool,
+ expect_axis: Option<&str>,
+ expect_symmetric: Option<&str>,
+ expect_groups: Option<&str>,
+ tolerance: f64,
+ group: Option<&str>,
+) -> i32 {
  let loaded = match load(file) {
  Ok(l) => l,
  Err(code) => return code,
  };
- let c = check::check(&loaded.model, false);
+ // Parse the numeric "X,Y,Z" expectations with the shared parser.
+ let expect_size = match expect_size {
+ None => None,
+ Some(s) => match parse_xyz(s, "expect_size") {
+ Ok(v) => Some(v),
+ Err(code) => return code,
+ },
+ };
+ let expect_center = match expect_center {
+ None => None,
+ Some(s) => match parse_xyz(s, "expect_center") {
+ Ok(v) => Some(v),
+ Err(code) => return code,
+ },
+ };
+ // expect_axis is a single letter.
+ let expect_axis = match expect_axis {
+ None => None,
+ Some(s) => {
+ let t = s.trim();
+ if t == "x" || t == "y" || t == "z" {
+ Some(t)
+ } else {
+                    return usage(&format!("expect_axis must be x|y|z, got '{s}'"));
+ }
+ }
+ };
+ // expect_symmetric is a comma list of x|y|z letters.
+ let expect_symmetric: Vec<&str> = match expect_symmetric {
+ None => Vec::new(),
+ Some(s) => {
+ let mut out = Vec::new();
+ for part in s.split(',') {
+ let t = part.trim();
+ if t == "x" || t == "y" || t == "z" {
+ out.push(t);
+ } else {
+                        return usage(&format!(
+                            "expect_symmetric must be a comma list of x|y|z, got '{s}'"
+ ));
+ }
+ }
+ out
+ }
+ };
+ // expect_groups is a comma list of names (empty entries tolerated).
+ let expect_groups: Vec<String> = match expect_groups {
+ None => Vec::new(),
+ Some(s) => s
+ .split(',')
+ .map(|p| p.trim().to_string())
+ .filter(|p| !p.is_empty())
+ .collect(),
+ };
+ // At least one expectation is required.
+ if expect_size.is_none()
+ && expect_center.is_none()
+ && !expect_closed
+ && expect_axis.is_none()
+ && expect_symmetric.is_empty()
+ && expect_groups.is_empty()
+ {
+        return usage("wrfm verify needs at least one --expect-* flag");
+ }
+ let opts = verify::VerifyOptions {
+ source: &loaded.source,
+ expect_size,
+ expect_center,
+ expect_closed,
+ expect_axis,
+ expect_symmetric,
+ expect_groups,
+ tolerance,
+ };
+ let model = match group {
+ Some(want) => {
+ let g = match resolve_group(&loaded.groups, want, &loaded.source) {
+ Ok(g) => g,
+ Err(code) => return code,
+ };
+ render::submodel_for_group(&loaded.model, g)
+ }
+ None => loaded.model.clone(),
+ };
+ let report = verify::verify(&model, &loaded.groups, &opts);
+ let verdict = report["verdict"].as_str().unwrap_or("fail");
+ let summary = report["summary"].as_str().unwrap_or("");
+ print_json(&report);
+ if verdict == "fail" {
+        eprintln!("[wrfm] verify: {summary}");
+ 1
+ } else {
+ 0
+ }
+}
+
+fn cmd_info(file: &str, group: Option<&str>) -> i32 {
+ let loaded = match load(file) {
+ Ok(l) => l,
+ Err(code) => return code,
+ };
+ let model = match group {
+ Some(want) => {
+ let g = match resolve_group(&loaded.groups, want, &loaded.source) {
+ Ok(g) => g,
+ Err(code) => return code,
+ };
+ render::submodel_for_group(&loaded.model, g)
+ }
+ None => loaded.model.clone(),
+ };
+ let c = check::check(&model, false);
  let (verdict, summary) = verdict_of(&c);
- let (min, max) = render::bounds(&loaded.model);
+ let (min, max) = render::bounds(&model);
  let center = [
  (min[0] + max[0]) / 2.0,
  (min[1] + max[1]) / 2.0,
@@ -732,8 +904,8 @@ fn cmd_info(file: &str) -> i32 {
         "name": loaded.name,
         "source": loaded.source,
         "version": loaded.version,
-        "vertices": loaded.model.vertices.len(),
-        "edges": loaded.model.edges.len(),
+        "vertices": model.vertices.len(),
+        "edges": model.edges.len(),
         "bytes": loaded.bytes,
         "groups": groups,
         "bounds": {
@@ -781,32 +953,34 @@ fn cmd_group(file: &str, name: Option<&str>) -> i32 {
  exit_for(verdict)
 }
 
-fn cmd_geometry(file: &str, full: bool) -> i32 {
+fn cmd_geometry(file: &str, full: bool, group: Option<&str>) -> i32 {
  let loaded = match load(file) {
  Ok(l) => l,
  Err(code) => return code,
  };
- let c = check::check(&loaded.model, false);
+ let model = match group {
+ Some(want) => {
+ let g = match resolve_group(&loaded.groups, want, &loaded.source) {
+ Ok(g) => g,
+ Err(code) => return code,
+ };
+ render::submodel_for_group(&loaded.model, g)
+ }
+ None => loaded.model.clone(),
+ };
+ let c = check::check(&model, false);
  let (verdict, summary) = verdict_of(&c);
  let g = if full {
- geometry::analyze_full(&loaded.model)
+ geometry::analyze_full(&model)
  } else {
- geometry::analyze(&loaded.model)
+ geometry::analyze(&model)
  };
  print_json(&g);
  check_note(verdict, summary, false);
  exit_for(verdict)
 }
 
-fn cmd_query(
- file: &str,
- query: &str,
- group: Option<&str>,
- at: f64,
- range: &str,
- from: Option<usize>,
- to: Option<usize>,
-) -> i32 {
+fn cmd_query(file: &str, query: &str, group: Option<&str>, at: f64, range: &str) -> i32 {
  let loaded = match load(file) {
  Ok(l) => l,
  Err(code) => return code,
@@ -818,12 +992,7 @@ fn cmd_query(
  Err(e) => return usage(&e),
  };
  let n = loaded.model.vertices.len();
- let mut args = query::QueryArgs {
- at,
- range: None,
- from,
- to,
- };
+ let mut args = query::QueryArgs { at, range: None };
  let model = match q {
  // vertices: `--range` XOR `--group` (never both). `--group` selects
  // the group's OWN vertices `[start, end)` with their GLOBAL indices
@@ -848,29 +1017,20 @@ fn cmd_query(
  }
  loaded.model.clone()
  }
- // distance / connectivity: whole model, global --from/--to.
+ // distance / connectivity: whole model, global --range "a,b".
  query::Query::Distance | query::Query::Connectivity => {
  if group.is_some() {
  return usage(&format!(
-                    "--group is not valid for '{query}' (it takes global --from/--to indices)"
+                    "--group is not valid for '{query}' (it takes a global --range \"a,b\")"
  ));
  }
- let a = match from {
- Some(i) if i < n => i,
- Some(i) => {
-                    return usage(&format!("--from index {i} out of range (vertices={n})"));
+ if range.trim().is_empty() {
+ return usage(&format!("'{query}' requires --range \"a,b\""));
  }
-                None => return usage(&format!("'{query}' requires --from <index>")),
- };
- let b = match to {
- Some(i) if i < n => i,
- Some(i) => {
-                    return usage(&format!("--to index {i} out of range (vertices={n})"));
- }
-                None => return usage(&format!("'{query}' requires --to <index>")),
- };
- args.from = Some(a);
- args.to = Some(b);
+ args.range = Some(match parse_range(range, n) {
+ Ok(r) => r,
+ Err(code) => return code,
+ });
  loaded.model.clone()
  }
  _ => match group {
@@ -1065,7 +1225,7 @@ fn cmd_transform(
  shear_xz: f64,
  shear_yz: f64,
  pivot: &str,
- center: bool,
+ to_origin: bool,
  align: Option<&str>,
  normalize: Option<f64>,
  rotate_x: f64,
@@ -1134,7 +1294,7 @@ fn cmd_transform(
  shear_xz,
  shear_yz,
  pivot,
- center,
+ to_origin,
  align,
  normalize,
  translate: match translate {
@@ -1292,7 +1452,7 @@ fn cmd_edit(
  exit_for(verdict)
 }
 
-fn cmd_diff(a: &str, b: &str, format: &str) -> i32 {
+fn cmd_diff(a: &str, b: &str, format: &str, group: Option<&str>) -> i32 {
     if a == "-" && b == "-" {
         return usage("at most one of a/b may be '-' (stdin can be consumed once)");
  }
@@ -1307,8 +1467,25 @@ fn cmd_diff(a: &str, b: &str, format: &str) -> i32 {
  Ok(l) => l,
  Err(code) => return code,
  };
+ let (ma, mb) = match group {
+ Some(want) => {
+ let ga = match resolve_group(&la.groups, want, a) {
+ Ok(g) => g,
+ Err(code) => return code,
+ };
+ let gb = match resolve_group(&lb.groups, want, b) {
+ Ok(g) => g,
+ Err(code) => return code,
+ };
+ (
+ render::submodel_for_group(&la.model, ga),
+ render::submodel_for_group(&lb.model, gb),
+ )
+ }
+ None => (la.model, lb.model),
+ };
     if format == "json" {
- print_json(&render::diff_to_json(&la.model, &lb.model, 100));
+ print_json(&render::diff_to_json(&ma, &mb, 100));
  return 0;
  }
  let opts = render::DiffOptions {
@@ -1320,7 +1497,7 @@ fn cmd_diff(a: &str, b: &str, format: &str) -> i32 {
  };
  print!(
         "{}",
- render::diff_to_text(&la.model, &lb.model, &opts, false)
+ render::diff_to_text(&ma, &mb, &opts, false)
  );
  let _ = std::io::stdout().flush();
  0

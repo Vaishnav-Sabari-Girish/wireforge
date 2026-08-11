@@ -142,6 +142,30 @@ fn has_mirror_symmetry(m: &Model, axis: usize) -> bool {
  })
 }
 
+/// Mirror-symmetry test across the plane through the model's BBOX CENTRE,
+/// perpendicular to `axis` — position-independent shape symmetry (a box
+/// anywhere in space counts as symmetric). verify --expect-symmetric uses
+/// these; the origin-plane mirror_* fields stay for reference.
+fn has_center_mirror_symmetry(m: &Model, axis: usize) -> bool {
+ let eps = 1e-6;
+ let (min, max) = bounds(m);
+ let c = [
+ (min[0] + max[0]) / 2.0,
+ (min[1] + max[1]) / 2.0,
+ (min[2] + max[2]) / 2.0,
+ ];
+ m.vertices.iter().all(|&(x, y, z)| {
+ let mir = [
+ if axis == 0 { 2.0 * c[0] - x } else { x },
+ if axis == 1 { 2.0 * c[1] - y } else { y },
+ if axis == 2 { 2.0 * c[2] - z } else { z },
+ ];
+ m.vertices.iter().any(|&(mx, my, mz)| {
+ (mx - mir[0]).abs() < eps && (my - mir[1]).abs() < eps && (mz - mir[2]).abs() < eps
+ })
+ })
+}
+
 /// One-stop structured geometry report for `m`:
 pub fn analyze(m: &Model) -> Value {
  analyze_impl(m, false)
@@ -294,6 +318,12 @@ fn analyze_impl(m: &Model, full: bool) -> Value {
             "mirror_xy": has_mirror_symmetry(m, 2),
             "mirror_xz": has_mirror_symmetry(m, 1),
             "mirror_yz": has_mirror_symmetry(m, 0),
+            // Position-independent shape symmetry about the model's OWN bbox
+            // centre (the intuitive meaning — verify --expect-symmetric uses
+            // these; the origin-plane mirror_* stay for reference).
+            "center_mirror_xy": has_center_mirror_symmetry(m, 2),
+            "center_mirror_xz": has_center_mirror_symmetry(m, 1),
+            "center_mirror_yz": has_center_mirror_symmetry(m, 0),
  },
         "alignment": {
             "axis_aligned": axis_aligned,
@@ -409,6 +439,28 @@ mod tests {
         assert_eq!(g["symmetry"]["mirror_xy"], true);
         assert_eq!(g["symmetry"]["mirror_xz"], true);
         assert_eq!(g["symmetry"]["mirror_yz"], true);
+        // The centred cube is symmetric about its own centre too.
+        assert_eq!(g["symmetry"]["center_mirror_xy"], true);
+        assert_eq!(g["symmetry"]["center_mirror_xz"], true);
+        assert_eq!(g["symmetry"]["center_mirror_yz"], true);
+ }
+
+ #[test]
+ fn off_center_cube_is_center_symmetric_but_not_origin_symmetric() {
+        // Shift the [-1,1]^3 cube +1.5 along x -> [0.5,2.5]^3: still a
+        // symmetric SHAPE (about its own bbox centre), but the origin-plane
+        // x-reflection no longer maps onto the vertex set.
+ let mut m = cube();
+ for v in m.vertices.iter_mut() {
+            v.0 += 1.5;
+ }
+ let g = analyze(&m);
+        assert_eq!(g["symmetry"]["mirror_yz"], false); // origin x-plane fails
+        assert_eq!(g["symmetry"]["mirror_xz"], true); // y/z untouched
+        assert_eq!(g["symmetry"]["mirror_xy"], true);
+        assert_eq!(g["symmetry"]["center_mirror_yz"], true); // centre plane holds
+        assert_eq!(g["symmetry"]["center_mirror_xz"], true);
+        assert_eq!(g["symmetry"]["center_mirror_xy"], true);
  }
 
  #[test]
