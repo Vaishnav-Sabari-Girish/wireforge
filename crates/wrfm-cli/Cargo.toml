@@ -1,0 +1,26 @@
+[package]
+name = "wrfm-cli"
+version = "0.1.0"
+edition = "2024"
+description = "Command-line tool for .wrfm 3D wireframe models: check / info / group / geometry / query / view / render / transform / edit / diff over streams"
+readme = "README.md"
+license = "MIT"
+authors = ["lenitain <xt.zhu@qq.com>"]
+keywords = ["wrfm", "3d", "wireframe", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+clap = { version = "4.6.1", features = ["derive"] }
+ratatui = "0.30.1"
+ratatui-wireframe = "0.7.0"
+serde_json = "1"
+wrfm = { path = "../wrfm" }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+# The tool is invoked as `wrfm <subcommand>` (docs/PLAN.md), so the installed
+# binary is named `wrfm`, not `wrfm-cli`.
+[[bin]]
+name = "wrfm"
+path = "src/main.rs"
