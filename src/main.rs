@@ -1,25 +1,69 @@
 use clap::Parser;
 use crossterm::{
-    event::{self, Event, KeyCode},
+    cursor::{Hide, Show},
+    event::{self, Event, KeyCode, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 
-use notify::{EventKind, RecursiveMode, Watcher};
-use ratatui::{Terminal, backend::CrosstermBackend, style::Color};
+use ratatui::{
+    Terminal,
+    backend::CrosstermBackend,
+    buffer::Buffer,
+    layout::Rect,
+    widgets::{Block, Borders, Paragraph, Widget},
+};
 
-use ratatui_wireframe::{WireframeWidget, model::Model};
+#[cfg(feature = "ratty")]
+use ratatui::style::Style;
+
+use ratatui_wireframe::model::Model;
 use std::{
+    collections::HashMap,
     error::Error,
-    io,
+    io::{self, Read},
     path::{Path, PathBuf},
-    sync::mpsc,
-    time::Duration,
+    sync::mpsc::{self, Sender},
+    thread,
+    time::{Duration, Instant},
 };
 use wrfm::WrfmModel;
 
+mod reload;
+mod render;
+mod view;
+use reload::{ReloadEvent, ReloadWatch};
+use view::ViewState;
+
 #[cfg(feature = "ratty")]
 use ratatui_ratty::{ObjectFormat, RattyGraphic, RattyGraphicSettings};
+
+// All speed constants below are dyadic fractions (denominator = power of
+// two), so every value is EXACTLY representable in binary floating point —
+// no rounding error. The numerators keep the ~1.3x translation / ~1.1x
+// rotation speedup over the upstream constants.
+
+/// Smooth continuous rotation rate (radians per second) while a key is held.
+const ROT_RATE: f64 = 169.0 / 128.0;
+/// Smooth continuous translation rate: fraction of the model extent moved per second.
+const MOVE_RATE: f64 = 83.0 / 128.0;
+/// One-step applied on a fresh key press (a tap does exactly this and stops).
+const PRESS_ROT_STEP: f64 = 7.0 / 128.0;
+/// Tap translation step: fraction of the model extent.
+const PRESS_MOVE_FRACTION: f64 = 33.0 / 256.0;
+
+/// How long a hot-reload status line stays on screen before it is cleared
+const STATUS_TIMEOUT: Duration = Duration::from_secs(4);
+/// Auto-spin yaw rate (radians per second). 169/256 = 0.66015625 (~1.1x
+const SPIN_RATE: f64 = 169.0 / 256.0;
+/// A held key with no repeat for this long is treated as a tap.
+const TAP_TIMEOUT: Duration = Duration::from_millis(600);
+/// Once a hold is confirmed by a repeat, a gap this long means the key was
+const HOLD_TIMEOUT: Duration = Duration::from_millis(100);
+/// How often the idle loop re-checks the terminal size (resize fallback).
+const RESIZE_CHECK_INTERVAL: Duration = Duration::from_millis(500);
+/// How long to let a file write settle before re-parsing after a change.
+const SETTLE_DELAY: Duration = Duration::from_millis(50);
 
 #[derive(Parser, Debug)]
 #[command(
@@ -33,190 +77,2095 @@ struct Args {
     file: PathBuf,
 }
 
-/// State enum to track which rendering engine we are using
+/// State enum to track which rendering engine we are using.
 enum RenderMode {
     Braille(Model),
     #[cfg(feature = "ratty")]
     Hardware3D(RattyGraphic<'static>),
 }
 
-/// Helper to automatically route .obj and .wrfm files to the correct parser or widget
+impl RenderMode {
+    fn braille(&self) -> Option<&Model> {
+        match self {
+            RenderMode::Braille(m) => Some(m),
+            #[cfg(feature = "ratty")]
+            RenderMode::Hardware3D(_) => None,
+        }
+    }
+}
+
+/// HUD folding state: `?` toggles Collapsed <-> Expanded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Hud {
+    Collapsed,
+    Expanded,
+}
+
+/// One continuous degree of freedom. Split into rotation (rotate) and
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Motion {
+    // Rotation (world-frame: fixed world axes).
+    YawLeft,
+    YawRight,
+    PitchUp,
+    PitchDown,
+    RollPlus,
+    RollMinus,
+    // Translation (absolute world coordinates).
+    MoveLeft,
+    MoveRight,
+    MoveUp,
+    MoveDown,
+    MoveForward,
+    MoveBack,
+}
+
+/// Per-motion input state: `steady` means a repeat confirmed this is a hold
+#[derive(Debug, Clone, Copy)]
+struct MotionInput {
+    steady: bool,
+    last: Instant,
+}
+
+/// Map a key (with its modifiers) to a motion. Returns `None` for keys that
+fn motion_for(code: KeyCode, shift: bool) -> Option<Motion> {
+    use KeyCode::*;
+    Some(match code {
+        // Translation: Shift + arrows / hjkl (right/up), = / - (forward).
+        Left if shift => Motion::MoveLeft,
+        Right if shift => Motion::MoveRight,
+        Up if shift => Motion::MoveUp,
+        Down if shift => Motion::MoveDown,
+        Char('h') | Char('H') if shift => Motion::MoveLeft,
+        Char('l') | Char('L') if shift => Motion::MoveRight,
+        Char('k') | Char('K') if shift => Motion::MoveUp,
+        Char('j') | Char('J') if shift => Motion::MoveDown,
+        Char('=') | Char('+') => Motion::MoveForward,
+        Char('-') => Motion::MoveBack,
+        // Rotation: arrows / hjkl (yaw, pitch), r / e (roll).
+        Left | Char('h') => Motion::YawLeft,
+        Right | Char('l') => Motion::YawRight,
+        Up | Char('k') => Motion::PitchUp,
+        Down | Char('j') => Motion::PitchDown,
+        Char('r') => Motion::RollPlus,
+        Char('e') => Motion::RollMinus,
+        _ => return None,
+    })
+}
+
+/// The single press step for a tap (click feel, then stops). Translation
+fn press_step(view: &mut ViewState, m: Motion, scale: f64) {
+    apply_motion_step(view, m, PRESS_ROT_STEP, scale * PRESS_MOVE_FRACTION);
+}
+
+/// One frame of smooth continuous motion for a held key (model follows key).
+fn continuous_step(view: &mut ViewState, m: Motion, scale: f64, dt: f64) {
+    apply_motion_step(view, m, ROT_RATE * dt, scale * MOVE_RATE * dt);
+}
+
+/// Apply one motion step. Translation moves along the view's local axes
+fn apply_motion_step(view: &mut ViewState, m: Motion, rot: f64, mv: f64) {
+    match m {
+        // World-frame rotation: yaw/pitch pre-multiply the model->world
+        // matrix with a fixed world-axis rotation, so the axes are anchored
+        // to the world and never follow the model (no gimbal collapse).
+        Motion::YawLeft => view.add_yaw(rot),
+        Motion::YawRight => view.add_yaw(-rot),
+        Motion::PitchUp => view.add_pitch(-rot),
+        Motion::PitchDown => view.add_pitch(rot),
+        Motion::RollPlus => view.roll -= rot,
+        Motion::RollMinus => view.roll += rot,
+        // Pan translates the model directly in world X/Y: pan_x shifts it
+        // horizontally on screen, pan_y vertically, at any orientation. The
+        // rotation centre is the file origin, panned with the model
+        // (see view::project_point).
+        Motion::MoveLeft => view.pan_x -= mv,
+        Motion::MoveRight => view.pan_x += mv,
+        Motion::MoveUp => view.pan_y += mv,
+        Motion::MoveDown => view.pan_y -= mv,
+        // Translation along the view axis (camera distance).
+        Motion::MoveForward => view.add_dist_delta(-mv),
+        Motion::MoveBack => view.add_dist_delta(mv),
+    }
+    // Angles are periodic; keep the displayed values in [-PI, PI].
+    view.normalize();
+}
+
+/// A file format detected by probing the file's bytes (mpv-style
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileFormat {
+    /// A v1 `.wrfm` file: line 1 is the `wrfm <version>` magic
+    Wrfm,
+    /// A Wavefront `.obj` file: `v`/`f`/`vt`/`vn` lines (rendered by ratty).
+    Obj,
+}
+
+/// How many leading bytes are probed to detect the file format.
+const PROBE_BYTES: usize = 4096;
+
+/// True when `path` is a FIFO (named pipe, e.g. bash's `<( cmd )` process
+#[cfg(unix)]
+fn is_fifo_path(path: &Path) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    std::fs::metadata(path)
+        .map(|m| m.file_type().is_fifo())
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_fifo_path(_path: &Path) -> bool {
+    false
+}
+
+/// Verify a controlling terminal is available when stdin is a pipe.
+#[cfg(unix)]
+fn ensure_keyboard_terminal() -> Result<(), String> {
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() {
+        return Ok(());
+    }
+    // stdin is not a terminal: keyboard must come from /dev/tty.
+    std::fs::OpenOptions::new()
+ .read(true)
+ .write(true)
+        .open("/dev/tty")
+ .map(|_| ())
+ .map_err(|e| {
+ format!(
+                "cannot open a terminal for keyboard input (/dev/tty): {e}\n'wireforge -' with stdin piped needs a controlling terminal to be interactive.\nUse a FIFO so the terminal stays free for keyboard:\n    wireforge <( cat model.wrfm )"
+ )
+ })
+}
+
+#[cfg(not(unix))]
+fn ensure_keyboard_terminal() -> Result<(), String> {
+    Ok(())
+}
+
+/// Probe a byte buffer for wrfm / obj markers.
+fn probe_bytes(buf: &[u8]) -> Result<FileFormat, String> {
+    // Lossy: a stray non-UTF-8 byte must never decide the format.
+    let head = String::from_utf8_lossy(buf);
+    // Strip a leading BOM like the wrfm parser does, so a BOM before the
+    // magic line does not hide it.
+    let head = head.strip_prefix('\u{feff}').unwrap_or(&head);
+
+    // Magic first: the first line of a v1 wrfm file is `wrfm <version>`.
+    // The magic is a short line, so it always fits within PROBE_BYTES.
+    let first_line = head.lines().next().unwrap_or("");
+    if first_line.split_whitespace().next() == Some("wrfm") {
+        return Ok(FileFormat::Wrfm);
+    }
+
+    // Otherwise scan for obj markers. A wrfm-style `v`/`e` file WITHOUT the
+    // magic is NOT wrfm and NOT obj — it is unrecognized (the v1 breaking
+    // change): only `v` lines with no `e` line, or a real obj marker
+    // (`f` / `vt` / `vn`), route to obj.
+    let mut has_vertex = false;
+    let mut has_wrfm_edge = false;
+    let mut has_obj_marker = false;
+    for raw in head.lines() {
+        let line = raw.trim_start();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        match line.split_whitespace().next() {
+            Some("v") => has_vertex = true,
+            Some("e") => has_wrfm_edge = true,
+            Some("f") | Some("vt") | Some("vn") => has_obj_marker = true,
+            _ => {}
+        }
+    }
+
+    if has_obj_marker || (has_vertex && !has_wrfm_edge) {
+        Ok(FileFormat::Obj)
+    } else {
+        Err(
+            "unrecognized file format: no wrfm magic line (`wrfm <version>`) or obj (`v`/`f`/`vt`/`vn`) markers"
+ .to_string(),
+ )
+    }
+}
+
+/// Probe the file's content for wrfm / obj markers.
+fn probe_format(target_file: &Path) -> Result<FileFormat, String> {
+    let mut buf = [0u8; PROBE_BYTES];
+    let mut file = std::fs::File::open(target_file)
+        .map_err(|e| format!("cannot open '{}': {e}", target_file.display()))?;
+    let n = file
+        .read(&mut buf)
+        .map_err(|e| format!("cannot read '{}': {e}", target_file.display()))?;
+    probe_bytes(&buf[..n]).map_err(|e| format!("'{}': {e}", target_file.display()))
+}
+
+/// Route a file to the correct parser or widget.
 fn load_model(target_file: &Path) -> Result<(RenderMode, String), String> {
-    let ext = target_file
-        .extension()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
+    match probe_format(target_file)? {
+        FileFormat::Wrfm => {
+            let wrfm_data = WrfmModel::from_file(target_file).map_err(|e| e.to_string())?;
+            let model = Model {
+                vertices: wrfm_data.vertices,
+                edges: wrfm_data.edges,
+            };
+            Ok((RenderMode::Braille(model), wrfm_data.name))
+        }
+        FileFormat::Obj => {
+            #[cfg(feature = "ratty")]
+            {
+                let name = target_file
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("OBJ Model")
+                    .to_string();
+                let abs_path = std::fs::canonicalize(target_file)
+                    .unwrap_or_else(|_| target_file.to_path_buf());
+                let path_str = abs_path.to_string_lossy().into_owned();
+                let settings = RattyGraphicSettings::new(path_str)
+                    .id(1)
+                    .format(ObjectFormat::Obj)
+                    .scale(0.30)
+                    .brightness(1.5);
+                let graphic = RattyGraphic::new(settings);
+                if let Err(e) = graphic.register() {
+                    return Err(format!("Ratty Registration Error: {e}"));
+                }
+                Ok((RenderMode::Hardware3D(graphic), name))
+            }
+            #[cfg(not(feature = "ratty"))]
+            {
+                Err(
+                    "OBJ parsing requires the 'ratty' feature. Recompile with --features ratty"
+                        .to_string(),
+                )
+            }
+        }
+    }
+}
 
-    if ext.eq_ignore_ascii_case("obj") {
-        let name = target_file
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("OBJ Model")
-            .to_string();
+/// Route a stream buffer (stdin / FIFO) to the correct parser or widget.
+fn load_model_from_text(name: &str, text: &str) -> Result<(RenderMode, String), String> {
+    match probe_bytes(text.as_bytes())? {
+        FileFormat::Wrfm => {
+            let wrfm_data = WrfmModel::from_str(name, text).map_err(|e| e.to_string())?;
+            let model = Model {
+                vertices: wrfm_data.vertices,
+                edges: wrfm_data.edges,
+            };
+            Ok((RenderMode::Braille(model), wrfm_data.name))
+        }
+        FileFormat::Obj => {
+            #[cfg(feature = "ratty")]
+            {
+                let settings = RattyGraphicSettings::new(format!("{name}.obj"))
+                    .id(1)
+                    .format(ObjectFormat::Obj)
+                    .scale(0.30)
+                    .brightness(1.5);
+                let graphic = RattyGraphic::new(settings);
+                if let Err(e) = graphic.register_payload(text.as_bytes()) {
+                    return Err(format!("Ratty Registration Error: {e}"));
+                }
+                Ok((RenderMode::Hardware3D(graphic), name.to_string()))
+            }
+            #[cfg(not(feature = "ratty"))]
+            {
+                Err(
+                    "OBJ parsing requires the 'ratty' feature. Recompile with --features ratty"
+                        .to_string(),
+                )
+            }
+        }
+    }
+}
 
-        #[cfg(feature = "ratty")]
-        {
-            // Convert to absolute path so Ratty can locate it from anywhere
-            let abs_path =
-                std::fs::canonicalize(target_file).unwrap_or_else(|_| target_file.to_path_buf());
-            let path_str = abs_path.to_string_lossy().into_owned();
+/// Apply a successful reload: swap in the new render and name. The user's
+fn apply_reload(
+    current: &mut RenderMode,
+    name: &mut String,
+    new_render: RenderMode,
+    new_name: String,
+) {
+    *current = new_render;
+    *name = new_name;
+}
 
-            let settings = RattyGraphicSettings::new(path_str)
-                .id(1)
-                .format(ObjectFormat::Obj)
-                .scale(0.30) // Adjust this up or down depending on your specific model's export scale
-                .brightness(1.5);
+#[cfg_attr(not(test), allow(dead_code))] // exercised by the hot-reload unit tests
+/// Apply one hot-reload poll result to the running viewer.
+fn handle_reload_event(
+    event: ReloadEvent,
+    current: &mut RenderMode,
+    name: &mut String,
+    target_file: &Path,
+) -> Option<ReloadRecord> {
+    match event {
+        ReloadEvent::Changed => {
+            // Let a half-written file settle before re-parsing it, so a
+            // mid-write read is less likely; a failed parse still keeps the
+            // last good model and retries on the next poll.
+            std::thread::sleep(SETTLE_DELAY);
+            Some(match load_model(target_file) {
+                Ok((new_render, new_name)) => {
+                    apply_reload(current, name, new_render, new_name);
+                    ReloadRecord {
+                        outcome: ReloadOutcome::Ok,
+                        detail: "model reloaded".to_string(),
+                    }
+                }
+                Err(e) => ReloadRecord {
+                    outcome: ReloadOutcome::ParseError,
+                    detail: format!("Parse Error: {e}"),
+                },
+            })
+        }
+        ReloadEvent::Missing => Some(ReloadRecord {
+            outcome: ReloadOutcome::FileRemoved,
+            detail: "file removed (deleted or renamed away); keeping last model".to_string(),
+        }),
+        ReloadEvent::Unchanged => None,
+    }
+}
 
-            let graphic = RattyGraphic::new(settings);
+/// The outcome class of a hot-reload action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReloadOutcome {
+    /// The file changed and re-parsed successfully; the model was replaced.
+    Ok,
+    /// The file changed but failed to parse; the last good model was kept.
+    ParseError,
+    /// The file disappeared (deleted or renamed away); the last model kept.
+    FileRemoved,
+}
 
-            // Register the payload with the terminal emulator
-            if let Err(e) = graphic.register() {
-                return Err(format!("Ratty Registration Error: {}", e));
+/// The most recent hot-reload action, kept for the `x` status panel. Unlike
+#[derive(Debug, Clone, PartialEq)]
+struct ReloadRecord {
+    outcome: ReloadOutcome,
+    /// The action's detail: the full parse-error report for ParseError, a
+    detail: String,
+}
+
+/// The transient HUD event line for a reload outcome — one of the four
+fn hud_status_for(outcome: ReloadOutcome) -> &'static str {
+    match outcome {
+        ReloadOutcome::Ok => "hot-reloaded",
+        ReloadOutcome::ParseError => "parse error",
+        ReloadOutcome::FileRemoved => "file removed",
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // exercised by the status-expiry unit tests
+/// True when the status line's display deadline has passed (or no deadline
+fn status_expired(deadline: Option<Instant>, now: Instant) -> bool {
+    deadline.is_some_and(|d| now >= d)
+}
+
+/// Lines for the `x` status panel: the most recent reload action and its
+fn reload_panel_lines(record: Option<&ReloadRecord>) -> Vec<String> {
+    let mut lines = vec!["=== reload status (x closes) ===".to_string()];
+    lines.push(String::new());
+    match record {
+        None => lines.push("no reload action yet".to_string()),
+        Some(r) => {
+            let outcome = match r.outcome {
+                ReloadOutcome::Ok => "ok",
+                ReloadOutcome::ParseError => "parse error",
+                ReloadOutcome::FileRemoved => "file removed",
+            };
+            lines.push(format!("outcome: {outcome}"));
+            lines.push(String::new());
+            lines.extend(r.detail.lines().map(str::to_string));
+        }
+    }
+    lines
+}
+
+/// HUD layout: Row 0 is the fixed model + view line; below it the transient event region.
+fn hud_layout(
+    name: &str,
+    view: &ViewState,
+    status: &str,
+    height: u16,
+    collapsed: bool,
+    one_shot: Option<&str>,
+) -> (String, Vec<String>, u16) {
+    // In one-shot (stdin / FIFO) mode Row 0 advertises that the preview will
+    // NOT auto-refresh, so the user is never surprised (
+    let label = one_shot.unwrap_or(name);
+    let mut row0 = format!(
+        "Wireforge: {} | yaw={:.2} pitch={:.2} roll={:.2} dist={:.2} pan=({:.2},{:.2})",
+        label, view.yaw, view.pitch, view.roll, view.dist, view.pan_x, view.pan_y
+    );
+    if collapsed {
+        row0.push_str("   [?] keys");
+    }
+    let event_lines: Vec<String> = if status.is_empty() {
+        Vec::new()
+    } else {
+        status.lines().map(str::to_string).collect()
+    };
+    // Reserve only as many rows as fit below the fixed row 0; a long Parse
+    // Error must never be squeezed into Row 0.
+    let reserved = event_lines.len().min(height.saturating_sub(1) as usize) as u16;
+    (row0, event_lines, reserved)
+}
+
+/// The full help overlay (shown when the HUD is expanded).
+const HELP: &[&str] = &[
+    "=== wireforge keys ===",
+    "",
+    "Rotate:",
+    "  yaw left  <- / h       yaw right  -> / l",
+    "  pitch up  ^ / k        pitch down v / j",
+    "  roll      r / e",
+    "",
+    "Move:",
+    "  left      Shift+<- / h  right     Shift+-> / l",
+    "  up        Shift+^ / k   down      Shift+v / j",
+    "  nearer    =             farther   -",
+    "",
+    "Keys:",
+    "  center   f          fit       Shift+f",
+    "  reset    0          spin      Space",
+    "  keys     ?          axes      Tab",
+    "  status   x          quit      q / Esc",
+    "",
+    "[?] close help",
+];
+
+// Game-engine event loop: an input thread + channel, one scheduler owned
+// by the loop, a two-mode main loop, and dirty-flag rendering.
+
+/// Events the main loop blocks on: terminal input, reload events and timer timeouts.
+pub(crate) enum LoopEvent {
+    Input(Event),
+    Reload(ReloadEvent),
+}
+
+/// The timed behaviours the loop owns, driven by ONE scheduler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimerId {
+    /// Clear the transient hot-reload status line after [`STATUS_TIMEOUT`].
+    StatusExpiry,
+    /// Wake the idle loop at the earliest held-key deadline so a tap that
+    MotionTimeout,
+    /// mtime-poll fallback (non-Linux / inotify unavailable).
+    ReloadPoll,
+    /// Parse a reloaded file after the write-settle delay.
+    ReloadParse,
+    /// Fallback terminal-size check (see [`RESIZE_CHECK_INTERVAL`]): wakes
+    ResizeCheck,
+}
+
+/// One timer scheduler owned by the loop (a small ordered set of deadlines).
+struct TimerScheduler {
+    entries: Vec<(Instant, TimerId)>,
+}
+
+impl TimerScheduler {
+    fn new() -> Self {
+        TimerScheduler {
+            entries: Vec::new(),
+        }
+    }
+
+    /// Schedule `id` at `at`, replacing any existing entry for the same id
+    fn schedule(&mut self, id: TimerId, at: Instant) {
+        self.entries.retain(|(_, tid)| *tid != id);
+        self.entries.push((at, id));
+        self.entries.sort_by_key(|(at, _)| *at);
+    }
+
+    fn cancel(&mut self, id: TimerId) {
+        self.entries.retain(|(_, tid)| *tid != id);
+    }
+
+    fn earliest(&self) -> Option<Instant> {
+        self.entries.first().map(|(at, _)| *at)
+    }
+
+    /// Pop and return every timer whose deadline has passed.
+    fn fire_due(&mut self, now: Instant) -> Vec<TimerId> {
+        let mut due = Vec::new();
+        self.entries.retain(|(at, id)| {
+            if *at <= now {
+                due.push(*id);
+                false
+            } else {
+                true
+            }
+        });
+        due
+    }
+}
+
+/// All viewer state owned by the main loop.
+struct App {
+    current: RenderMode,
+    name: String,
+    one_shot: Option<String>,
+    target_file: PathBuf,
+    view: ViewState,
+    held: HashMap<Motion, MotionInput>,
+    auto_spin: bool,
+    hud: Hud,
+    show_axes: bool,
+    status_msg: String,
+    reload_record: Option<ReloadRecord>,
+    show_reload_panel: bool,
+    /// True when the screen must be repainted before the loop blocks again.
+    dirty: bool,
+}
+
+impl App {
+    fn new(
+        current: RenderMode,
+        name: String,
+        one_shot: Option<String>,
+        target_file: PathBuf,
+    ) -> Self {
+        App {
+            current,
+            name,
+            one_shot,
+            target_file,
+            view: ViewState::default(),
+            held: HashMap::new(),
+            auto_spin: false,
+            hud: Hud::Collapsed,
+            show_axes: true,
+            status_msg: String::new(),
+            reload_record: None,
+            show_reload_panel: false,
+            dirty: true,
+        }
+    }
+
+    /// Translation speed scales with the model's geometric-mean extent.
+    fn move_scale(&self) -> f64 {
+        self.current
+            .braille()
+            .map(view::model_extent)
+            .unwrap_or(1.0)
+    }
+
+    /// Auto-fit the camera to the braille model (Shift+f).
+    fn fit_if_braille(&mut self) {
+        if let Some(m) = self.current.braille() {
+            self.view.fit_to(m);
+        }
+    }
+
+    /// Handle one terminal input event. Returns true when the loop must
+    fn handle_input(&mut self, ev: Event) -> bool {
+        // Only key events are handled: mouse capture is OFF (native terminal
+        // drag-selection works), so the app never receives mouse events;
+        // Event::Resize is handled by the loop (it needs the Engine).
+        if let Event::Key(key) = ev {
+            let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+            let now = Instant::now();
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => return true,
+                // One-shot keys: every press acts immediately — NO
+                // debounce, so a quick double-press registers both
+                // presses (a held key repeats on the terminal's
+                // auto-repeat instead of being swallowed).
+                KeyCode::Char('?') => {
+                    self.hud = match self.hud {
+                        Hud::Collapsed => Hud::Expanded,
+                        Hud::Expanded => Hud::Collapsed,
+                    };
+                    self.dirty = true;
+                }
+                KeyCode::Char('x') => {
+                    self.show_reload_panel = !self.show_reload_panel;
+                    self.dirty = true;
+                }
+                KeyCode::Char(' ') => {
+                    self.auto_spin = !self.auto_spin;
+                    self.dirty = true;
+                }
+                KeyCode::Tab => {
+                    self.show_axes = !self.show_axes;
+                    self.dirty = true;
+                }
+                // Shift+f: fit the target to an appropriate distance
+                // (dist only — angles and pan are kept). f: centre the
+                // file origin on screen (pan only).
+                KeyCode::Char('f') | KeyCode::Char('F') if shift => {
+                    self.fit_if_braille();
+                    self.dirty = true;
+                }
+                KeyCode::Char('f') | KeyCode::Char('F') => {
+                    self.view.center_origin();
+                    self.dirty = true;
+                }
+                KeyCode::Char('0') => {
+                    if let Some(m) = self.current.braille() {
+                        self.view.reset(m);
+                    }
+                    self.dirty = true;
+                }
+                // Motion keys.
+                _ => {
+                    if let Some(m) = motion_for(key.code, shift) {
+                        if let Some(st) = self.held.get_mut(&m) {
+                            // Auto-repeat: confirms a hold, back to smooth.
+                            st.steady = true;
+                            st.last = now;
+                        } else {
+                            // Fresh press: one tap step, wait for repeat.
+                            let ms = self.move_scale();
+                            press_step(&mut self.view, m, ms);
+                            self.held.insert(
+                                m,
+                                MotionInput {
+                                    steady: false,
+                                    last: now,
+                                },
+                            );
+                        }
+                        self.dirty = true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Advance held-motion state (tap -> hold -> release) and apply one
+    fn update_held(&mut self, now: Instant, dt: f64) {
+        let move_scale = self.move_scale();
+        let mut stopped: Vec<Motion> = Vec::new();
+        for (m, st) in self.held.iter_mut() {
+            let timeout = if st.steady { HOLD_TIMEOUT } else { TAP_TIMEOUT };
+            if now.duration_since(st.last) > timeout {
+                stopped.push(*m);
+            } else if st.steady {
+                continuous_step(&mut self.view, *m, move_scale, dt);
+            }
+        }
+        for m in stopped {
+            self.held.remove(&m);
+        }
+    }
+
+    /// Handle a timer that fired. Returns true when the screen changed.
+    fn handle_timer(&mut self, id: TimerId, now: Instant) -> bool {
+        match id {
+            TimerId::StatusExpiry => {
+                self.status_msg.clear();
+                self.dirty = true;
+                true
+            }
+            TimerId::MotionTimeout => {
+                self.update_held(now, 0.0);
+                false
+            }
+            TimerId::ReloadPoll | TimerId::ReloadParse | TimerId::ResizeCheck => false,
+        }
+    }
+}
+
+/// L2 engine state: the retained-mode screen and the rasterizer.
+struct Engine {
+    screen: render::Screen,
+    raster: render::Rasterizer,
+    hud_buf: Option<Buffer>,
+}
+
+impl Engine {
+    fn new(w: usize, h: usize) -> Self {
+        Engine {
+            screen: render::Screen::new(w, h),
+            raster: render::Rasterizer::new(),
+            hud_buf: None,
+        }
+    }
+
+    /// Terminal resize: reallocate the screen and drop the HUD buffer (it
+    fn resize(&mut self, w: usize, h: usize) {
+        self.screen.resize(w, h);
+        self.hud_buf = None;
+    }
+}
+
+/// The only crossterm event reader in the process (blocks on the tty).
+fn spawn_input_thread(tx: Sender<LoopEvent>) {
+    let _ = thread::Builder::new()
+        .name("wireforge-input".into())
+        .spawn(move || {
+            while let Ok(ev) = event::read() {
+                if tx.send(LoopEvent::Input(ev)).is_err() {
+                    break;
+                }
+            }
+        });
+}
+
+/// Parse and apply a reload without blocking: the loop schedules the parse
+fn handle_reload_changed(
+    current: &mut RenderMode,
+    name: &mut String,
+    target_file: &Path,
+) -> ReloadRecord {
+    match load_model(target_file) {
+        Ok((new_render, new_name)) => {
+            apply_reload(current, name, new_render, new_name);
+            ReloadRecord {
+                outcome: ReloadOutcome::Ok,
+                detail: "model reloaded".to_string(),
+            }
+        }
+        Err(e) => ReloadRecord {
+            outcome: ReloadOutcome::ParseError,
+            detail: format!("Parse Error: {e}"),
+        },
+    }
+}
+
+/// Show a reload outcome: transient HUD line (cleared after STATUS_TIMEOUT)
+fn show_reload_status(app: &mut App, timers: &mut TimerScheduler, record: ReloadRecord) {
+    let now = Instant::now();
+    app.status_msg = hud_status_for(record.outcome).to_string();
+    timers.schedule(TimerId::StatusExpiry, now + STATUS_TIMEOUT);
+    app.reload_record = Some(record);
+    app.dirty = true;
+}
+
+/// Handle a reload event from the inotify thread or the poll watch. A
+fn handle_reload_event_loop(
+    app: &mut App,
+    timers: &mut TimerScheduler,
+    event: ReloadEvent,
+) -> bool {
+    match event {
+        ReloadEvent::Changed => {
+            // Let a half-written file settle before re-parsing it. The loop
+            // schedules the parse (ReloadParse) instead of sleeping, so the
+            // loop stays non-blocking. A failed parse keeps the
+            // last good model and retries on the next event.
+            timers.schedule(TimerId::ReloadParse, Instant::now() + SETTLE_DELAY);
+            false
+        }
+        ReloadEvent::Missing => {
+            show_reload_status(
+                app,
+                timers,
+                ReloadRecord {
+                    outcome: ReloadOutcome::FileRemoved,
+                    detail: "file removed (deleted or renamed away); keeping last model"
+                        .to_string(),
+                },
+            );
+            true
+        }
+        ReloadEvent::Unchanged => false,
+    }
+}
+
+/// The ReloadParse timer fired: parse the file and show the outcome.
+fn apply_reload_parse(app: &mut App, timers: &mut TimerScheduler) {
+    let record = handle_reload_changed(&mut app.current, &mut app.name, &app.target_file);
+    show_reload_status(app, timers, record);
+}
+
+/// The ReloadPoll fallback timer fired: stat the file, handle the event,
+fn poll_reload(watch: &mut Option<ReloadWatch>, app: &mut App, timers: &mut TimerScheduler) {
+    if let Some(w) = watch.as_mut() {
+        let event = w.poll();
+        handle_reload_event_loop(app, timers, event);
+        timers.schedule(TimerId::ReloadPoll, Instant::now() + reload::POLL_INTERVAL);
+    }
+}
+
+/// Fallback resize detection (timer-driven): compare the terminal size
+fn check_resize(app: &mut App, engine: &mut Engine, timers: &mut TimerScheduler) {
+    if let Ok((cols, rows)) = crossterm::terminal::size() {
+        let (w, h) = engine.screen.size();
+        if cols as usize != w || rows as usize != h {
+            engine.resize(cols as usize, rows as usize);
+            // A resize is a visual change: the dirty flag makes the idle
+            // branch repaint right after this timer fire.
+            app.dirty = true;
+        }
+    }
+    timers.schedule(TimerId::ResizeCheck, Instant::now() + RESIZE_CHECK_INTERVAL);
+}
+
+/// Keep the idle loop's motion deadline in sync with the held-key state.
+fn sync_motion_timer(app: &App, timers: &mut TimerScheduler) {
+    timers.cancel(TimerId::MotionTimeout);
+    if let Some(deadline) = app
+        .held
+        .values()
+        .map(|st| st.last + if st.steady { HOLD_TIMEOUT } else { TAP_TIMEOUT })
+        .min()
+    {
+        timers.schedule(TimerId::MotionTimeout, deadline);
+    }
+}
+
+/// Copy rows `[y0, y1)` of the HUD buffer into the screen (chars + fg).
+fn blit_hud_rows(screen: &mut render::Screen, hud: &Buffer, y0: u16, y1: u16) {
+    let (w, _) = screen.size();
+    for y in y0..y1 {
+        for x in 0..w {
+            let cell = &hud[(x as u16, y)];
+            let ch = cell.symbol().chars().next().unwrap_or(' ');
+            screen.set(x, y as usize, ch, render::color_idx(cell.fg));
+        }
+    }
+}
+
+/// Render the current state into the terminal.
+#[cfg_attr(not(feature = "ratty"), allow(unused_variables))]
+fn render_frame(
+    app: &mut App,
+    engine: &mut Engine,
+    stdout: &mut io::Stdout,
+    terminal: &mut Option<ratatui::Terminal<CrosstermBackend<io::Stdout>>>,
+) -> Result<(), Box<dyn Error>> {
+    match &app.current {
+        RenderMode::Braille(_) => {
+            let (w, h) = engine.screen.size();
+            if w == 0 || h == 0 {
+                return Ok(());
+            }
+            let w16 = w as u16;
+            let h16 = h as u16;
+            let (row0, event_lines, event_rows) = hud_layout(
+                &app.name,
+                &app.view,
+                &app.status_msg,
+                h16,
+                app.hud == Hud::Collapsed,
+                app.one_shot.as_deref(),
+            );
+            // Row 0 is the fixed model+view line; the transient event region
+            // occupies rows 1..1+event_rows; the canvas starts below both.
+            let canvas_top = 1 + event_rows;
+            let overlay = if app.show_reload_panel {
+                Some(reload_panel_lines(app.reload_record.as_ref()))
+            } else if app.hud == Hud::Expanded {
+                Some(HELP.iter().map(|s| s.to_string()).collect())
+            } else {
+                None
+            };
+
+            // Reuse a persistent ratatui Buffer for the cold overlays.
+            let needs_realloc = engine
+                .hud_buf
+                .as_ref()
+                .is_none_or(|b| b.area.width != w16 || b.area.height != h16);
+            if needs_realloc {
+                engine.hud_buf = Some(Buffer::empty(Rect::new(0, 0, w16, h16)));
+            } else if let Some(b) = engine.hud_buf.as_mut() {
+                b.reset();
             }
 
-            Ok((RenderMode::Hardware3D(graphic), name))
+            // Row 0 + transient event rows (always present above the canvas).
+            {
+                let hud = engine.hud_buf.as_mut().unwrap();
+                Paragraph::new(row0).render(Rect::new(0, 0, w16, 1), hud);
+                for (i, line) in event_lines.iter().enumerate() {
+                    let row = 1 + i as u16;
+                    if row >= canvas_top {
+                        break;
+                    }
+                    Paragraph::new(line.as_str()).render(Rect::new(0, row, w16, 1), hud);
+                }
+            }
+
+            // The overlay (help / reload panel) or the model canvas fills
+            // everything below the HUD rows.
+            let canvas_area = if let Some(lines) = overlay {
+                let top = canvas_top;
+                let height = h16.saturating_sub(top);
+                let area = Rect::new(0, top, w16, height);
+                let block = Block::default().borders(Borders::ALL);
+                let inner = block.inner(area);
+                let hud = engine.hud_buf.as_mut().unwrap();
+                block.render(area, hud);
+                for (i, line) in lines.iter().enumerate() {
+                    if i as u16 >= inner.height {
+                        break;
+                    }
+                    Paragraph::new(line.as_str())
+                        .render(Rect::new(inner.x, inner.y + i as u16, inner.width, 1), hud);
+                }
+                None
+            } else {
+                Some(Rect::new(
+                    0,
+                    canvas_top,
+                    w16,
+                    h16.saturating_sub(canvas_top),
+                ))
+            };
+
+            // Copy the HUD rows into the screen.
+            {
+                let screen = &mut engine.screen;
+                let hud = engine.hud_buf.as_ref().unwrap();
+                blit_hud_rows(screen, hud, 0, canvas_top);
+            }
+
+            if let Some(area) = canvas_area {
+                // Model canvas: rasterize into the screen directly.
+                let cw = area.width as usize;
+                let ch = area.height as usize;
+                if cw > 0 && ch > 0 {
+                    engine.raster.resize(cw, ch);
+                    if let Some(model) = app.current.braille() {
+                        engine.raster.render(
+                            model,
+                            &app.view,
+                            (0, canvas_top as usize, cw, ch),
+                            app.show_axes,
+                            &mut engine.screen,
+                        );
+                    }
+                }
+            } else {
+                // Overlay region: copy the panel/help text from the buffer.
+                let screen = &mut engine.screen;
+                let hud = engine.hud_buf.as_ref().unwrap();
+                blit_hud_rows(screen, hud, canvas_top, h16);
+            }
+
+            // Present: packed-cell diff + one batched write.
+            engine.screen.present(stdout)?;
         }
-        #[cfg(not(feature = "ratty"))]
-        {
-            // Fallback: ratatui-wireframe feature is off
-            Err(
-                "OBJ parsing requires the 'ratty' feature. Recompile with --features ratty"
-                    .to_string(),
-            )
+        #[cfg(feature = "ratty")]
+        RenderMode::Hardware3D(_) => {
+            // Push the accumulated angles to the ratty emulator (best-effort).
+            if let RenderMode::Hardware3D(graphic) = &mut app.current {
+                graphic.settings_mut().rotation = [
+                    app.view.pitch as f32,
+                    app.view.yaw as f32,
+                    app.view.roll as f32,
+                ];
+                let _ = graphic.update();
+            }
+            // The ratty path keeps using ratatui's Terminal untouched
+            // (the .obj path is unchanged at every level).
+            if let Some(t) = terminal.as_mut() {
+                t.draw(|f| {
+                    let area = f.area();
+                    let title = format!(
+                        "Wireforge: {} | yaw={:.2} pitch={:.2} roll={:.2} dist={:.2}",
+                        app.name, app.view.yaw, app.view.pitch, app.view.roll, app.view.dist
+                    );
+                    let block = Block::default().borders(Borders::ALL).title(title);
+                    let inner = block.inner(area);
+                    let (_, event_lines, event_rows) = hud_layout(
+                        &app.name,
+                        &app.view,
+                        &app.status_msg,
+                        inner.height,
+                        false,
+                        app.one_shot.as_deref(),
+                    );
+                    for (i, line) in event_lines.iter().enumerate() {
+                        if i as u16 >= event_rows {
+                            break;
+                        }
+                        f.render_widget(
+                            Paragraph::new(line.as_str()).style(Style::default()),
+                            Rect::new(inner.x, inner.y + i as u16, inner.width, 1),
+                        );
+                    }
+                    let graphic_area = Rect::new(
+                        inner.x,
+                        inner.y + event_rows,
+                        inner.width,
+                        inner.height.saturating_sub(event_rows),
+                    );
+                    f.render_widget(block, area);
+                    if let RenderMode::Hardware3D(graphic) = &app.current {
+                        f.render_widget(graphic, graphic_area);
+                    }
+                })?;
+            }
         }
-    } else {
-        // Default to .wrfm legacy parser
-        let wrfm_data = WrfmModel::from_file(target_file).map_err(|e| e.to_string())?;
-        let model = Model {
-            vertices: wrfm_data.vertices,
-            edges: wrfm_data.edges,
-        };
-        Ok((RenderMode::Braille(model), wrfm_data.name))
     }
+    Ok(())
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
     let target_file = args.file.clone();
 
-    // Initial Load
-    let (mut current_render, mut model_name) = load_model(&target_file).unwrap_or_else(|e| {
-        eprintln!("Failed to load '{}': {}", target_file.display(), e);
-        std::process::exit(1);
-    });
-
-    let mut status_msg = format!("Loaded {}", target_file.display());
-
-    let (tx, rx) = mpsc::channel();
-    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-        if let Ok(event) = res
-            && matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_))
-        {
-            let _ = tx.send(());
-        }
-    })?;
-
-    let watch_path = target_file
-        .canonicalize()
-        .unwrap_or_else(|_| target_file.clone());
-    if let Some(parent) = watch_path.parent() {
-        watcher.watch(parent, RecursiveMode::NonRecursive)?;
+    // Input mode ( a regular file loads by probing its
+    // first PROBE_BYTES and keeps the event-driven hot-reload; `-` (stdin)
+    // and FIFO paths (`<( cmd )`) read the whole stream ONCE, probe the
+    // BUFFER, and are one-shot previews with NO hot-reload.
+    let is_stdin = target_file == Path::new("-");
+    let is_fifo = !is_stdin && is_fifo_path(&target_file);
+    // Row 0 label for one-shot mode ("stdin preview (no hot-reload)" or the
+    // FIFO path); None for regular files (hot-reload stays on).
+    let one_shot: Option<String> = if is_stdin {
+        Some("stdin preview (no hot-reload)".to_string())
+    } else if is_fifo {
+        Some(format!("{} (no hot-reload)", target_file.display()))
     } else {
-        watcher.watch(&watch_path, RecursiveMode::NonRecursive)?;
+        None
+    };
+
+    // When stdin is a pipe the keyboard comes from the controlling terminal;
+    // fail fast (before consuming the model) with a clear message if there
+    // is none — never a cryptic ENXIO from raw-mode setup.
+    if let Err(e) = ensure_keyboard_terminal() {
+        eprintln!("{e}");
+        std::process::exit(1);
     }
 
-    // Setup terminal
+    let (current_render, model_name) = if one_shot.is_some() {
+        // Stream path: read all of stdin (or the FIFO) once, probe the
+        // whole BUFFER (not the path), parse, and never poll.
+        let mut buf = String::new();
+        if is_stdin {
+            io::stdin()
+                .read_to_string(&mut buf)
+                .map_err(|e| format!("cannot read stdin: {e}"))?;
+        } else {
+            std::fs::File::open(&target_file)
+                .map_err(|e| format!("cannot open '{}': {e}", target_file.display()))?
+                .read_to_string(&mut buf)
+                .map_err(|e| format!("cannot read '{}': {e}", target_file.display()))?;
+        }
+        let name = if is_stdin {
+            "stdin".to_string()
+        } else {
+            target_file
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("fifo")
+                .to_string()
+        };
+        load_model_from_text(&name, &buf).unwrap_or_else(|e| {
+            eprintln!(
+                "Failed to load '{}': {e}",
+                one_shot.as_deref().unwrap_or("-")
+            );
+            std::process::exit(1);
+        })
+    } else {
+        load_model(&target_file).unwrap_or_else(|e| {
+            eprintln!("Failed to load '{}': {}", target_file.display(), e);
+            std::process::exit(1);
+        })
+    };
+
+    // The event queue: one channel, one blocking consumer. The
+    // input thread is the only crossterm reader; the inotify reload thread
+    // (Linux) pushes reload events into the same channel.
+    let (tx, rx) = mpsc::channel::<LoopEvent>();
+
+    // File hot-reload: inotify on Linux (true event-driven),
+    // otherwise the mtime+length poll on a 200 ms timer. One-shot
+    // (stdin/FIFO) previews get NO watch — they load once and never poll.
+    let mut watch: Option<ReloadWatch> = None;
+    if one_shot.is_none() {
+        #[cfg(target_os = "linux")]
+        {
+            if reload::spawn_inotify(&target_file, tx.clone()).is_none() {
+                // inotify unavailable: fall back to the mtime-poll watch.
+                let mut w = ReloadWatch::new(target_file.clone());
+                w.baseline();
+                watch = Some(w);
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let mut w = ReloadWatch::new(target_file.clone());
+            w.baseline();
+            watch = Some(w);
+        }
+    }
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    // Mouse capture is deliberately OFF so the terminal's native
+    // mouse drag-selection keeps working (it was enabled in commit 9becd88,
+    // which killed selection; removing it restores the pre-9becd88 behavior).
+    // Hide the terminal cursor for the whole session: the old braille path
+    // went through ratatui's `Terminal`, which hides the cursor after every
+    // frame; the L2 direct-write present never did, so without this the
+    // visible cursor would jump to every changed cell on every redraw.
+    execute!(stdout, EnterAlternateScreen, Hide)?;
 
-    // Viewports state
-    let mut pitch: f64 = 0.0;
-    let mut yaw: f64 = 0.0;
-    let mut roll: f64 = 0.0;
-    let mut auto_spin: bool = true;
+    // Input thread: block in the kernel on the tty, push events through the
+    // channel. Started after raw mode so the tty is in the expected state.
+    spawn_input_thread(tx.clone());
 
-    loop {
-        // Hot-reloading logic
-        if rx.try_recv().is_ok() {
-            while rx.try_recv().is_ok() {} // Clear queue
-            std::thread::sleep(Duration::from_millis(15));
+    // L2 engine + viewer state.
+    let (cols, rows) = crossterm::terminal::size()?;
+    let mut app = App::new(current_render, model_name, one_shot, target_file.clone());
+    app.fit_if_braille();
+    let mut engine = Engine::new(cols as usize, rows as usize);
+    let mut terminal: Option<ratatui::Terminal<CrosstermBackend<io::Stdout>>> =
+        Some(Terminal::new(CrosstermBackend::new(io::stdout()))?);
 
-            match load_model(&target_file) {
-                Ok((new_render, new_name)) => {
-                    current_render = new_render;
-                    model_name = new_name;
-                    status_msg = "Hot-reload successful!".to_string();
-                }
-                Err(e) => {
-                    status_msg = format!("Parse Error: {}", e);
-                }
-            }
-        }
+    let mut timers = TimerScheduler::new();
+    let mut last = Instant::now();
 
-        // Handle Input
-        if event::poll(Duration::from_millis(16))?
-            && let Event::Key(key) = event::read()?
-        {
-            match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => break,
-                KeyCode::Char(' ') => auto_spin = !auto_spin,
-                KeyCode::Up => pitch += 0.1,
-                KeyCode::Down => pitch -= 0.1,
-                KeyCode::Left => yaw -= 0.1,
-                KeyCode::Right => yaw += 0.1,
-                KeyCode::Char('r') => roll += 0.1,
-                KeyCode::Char('e') => roll -= 0.1,
-                _ => {}
-            }
-        }
+    // Initial frame: the previous screen is all-space, so the first present
+    // writes every non-space cell (same first-frame semantics as before).
+    render_frame(&mut app, &mut engine, &mut stdout, &mut terminal)?;
+    app.dirty = false;
+    if watch.is_some() {
+        timers.schedule(TimerId::ReloadPoll, Instant::now() + reload::POLL_INTERVAL);
+    }
+    timers.schedule(TimerId::ResizeCheck, Instant::now() + RESIZE_CHECK_INTERVAL);
 
-        if auto_spin {
-            yaw += 0.02;
-            pitch += 0.01;
-        }
+    'main: loop {
+        let now = Instant::now();
+        let dt = (now - last).as_secs_f64().min(0.1);
+        last = now;
 
-        // RGP Update Step: Push mutated rotation directly to the emulator
-        #[cfg(feature = "ratty")]
-        if let RenderMode::Hardware3D(ref mut graphic) = current_render {
-            graphic.settings_mut().rotation = [pitch as f32, yaw as f32, roll as f32];
-            let _ = graphic.update(); // Fire escape sequence
-        }
+        // The two SDL-style loop modes: animating = drain +
+        // update + render as fast as possible, no waiting; idle = block in
+        // the channel until the earliest timer or an event.
+        let animating = app.auto_spin || app.held.values().any(|st| st.steady);
 
-        terminal.draw(|f| {
-            let title = format!(
-                "Wireforge: {} | [Space] Spin | [Arrows] Rotate | [R/E] Roll | [Q] Quit | {}",
-                model_name, status_msg
-            );
-
-            match &current_render {
-                RenderMode::Braille(model) => {
-                    let widget = WireframeWidget::new(pitch, yaw, roll)
-                        .title(title)
-                        .color(Color::Cyan)
-                        .model(model);
-                    f.render_widget(widget, f.area());
-                }
-                #[cfg(feature = "ratty")]
-                RenderMode::Hardware3D(graphic) => {
-                    // Draw our custom UI frame
-                    let block = ratatui::widgets::Block::default()
-                        .borders(ratatui::widgets::Borders::ALL)
-                        .title(title);
-
-                    let inner_area = block.inner(f.area());
-                    f.render_widget(block, f.area());
-
-                    // Render the pre-registered 3D graphic strictly inside the frame
-                    f.render_widget(graphic, inner_area);
+        if animating {
+            // Drain the event backlog (no waiting, no cap).
+            while let Ok(ev) = rx.try_recv() {
+                match ev {
+                    LoopEvent::Input(Event::Resize(cols, rows)) => {
+                        engine.resize(cols as usize, rows as usize);
+                        app.dirty = true;
+                    }
+                    LoopEvent::Input(ev) => {
+                        if app.handle_input(ev) {
+                            break 'main;
+                        }
+                    }
+                    LoopEvent::Reload(rel) => {
+                        handle_reload_event_loop(&mut app, &mut timers, rel);
+                    }
                 }
             }
-        })?;
+            // Timers can fire mid-animation too (status expiry, reload).
+            for id in timers.fire_due(now) {
+                match id {
+                    TimerId::ReloadParse => apply_reload_parse(&mut app, &mut timers),
+                    TimerId::ReloadPoll => poll_reload(&mut watch, &mut app, &mut timers),
+                    TimerId::ResizeCheck => check_resize(&mut app, &mut engine, &mut timers),
+                    other => {
+                        app.handle_timer(other, now);
+                    }
+                }
+            }
+            // One frame of smooth motion + tap/hold/release timeouts.
+            app.update_held(now, dt);
+            if app.auto_spin {
+                // Space auto-spin: rotate the model around its own (local) Y
+                // axis (view::ViewState::spin_local) — a globe turning in
+                // place, however it is pitched/rolled.
+                app.view.spin_local(SPIN_RATE * dt);
+                app.view.normalize();
+            }
+            sync_motion_timer(&app, &mut timers);
+            render_frame(&mut app, &mut engine, &mut stdout, &mut terminal)?;
+        } else {
+            // Idle: block until the earliest pending timer or an event —
+            // the thread is parked in the kernel (0% CPU).
+            sync_motion_timer(&app, &mut timers);
+            let wait = timers
+                .earliest()
+                .map(|d| d.saturating_duration_since(Instant::now()));
+            let msg: Result<LoopEvent, mpsc::RecvTimeoutError> = match wait {
+                Some(t) => rx.recv_timeout(t),
+                None => match rx.recv() {
+                    Ok(e) => Ok(e),
+                    Err(_) => Err(mpsc::RecvTimeoutError::Disconnected),
+                },
+            };
+            match msg {
+                Ok(ev) => match ev {
+                    LoopEvent::Input(Event::Resize(cols, rows)) => {
+                        engine.resize(cols as usize, rows as usize);
+                        app.dirty = true;
+                    }
+                    LoopEvent::Input(ev) => {
+                        if app.handle_input(ev) {
+                            break 'main;
+                        }
+                    }
+                    LoopEvent::Reload(rel) => {
+                        handle_reload_event_loop(&mut app, &mut timers, rel);
+                    }
+                },
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // The kernel woke us exactly at the earliest deadline.
+                    for id in timers.fire_due(now) {
+                        match id {
+                            TimerId::ReloadParse => apply_reload_parse(&mut app, &mut timers),
+                            TimerId::ReloadPoll => poll_reload(&mut watch, &mut app, &mut timers),
+                            TimerId::ResizeCheck => {
+                                check_resize(&mut app, &mut engine, &mut timers)
+                            }
+                            other => {
+                                app.handle_timer(other, now);
+                            }
+                        }
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break 'main,
+            }
+            // Clean up stale held entries (a tap that never confirmed, or a
+            // released hold) without spinning.
+            app.update_held(now, dt);
+            // Redraw only when something actually changed (dirty-flag).
+            if app.dirty {
+                render_frame(&mut app, &mut engine, &mut stdout, &mut terminal)?;
+                app.dirty = false;
+            }
+        }
     }
 
+    execute!(stdout, Show, LeaveAlternateScreen)?;
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyEvent;
+    use std::fs;
+
+    /// The speed constants are dyadic fractions (exact in binary).
+    #[test]
+    fn speed_constants_are_dyadic_and_exact() {
+        assert_eq!(ROT_RATE * 128.0, 169.0);
+        assert_eq!(MOVE_RATE * 128.0, 83.0);
+        assert_eq!(PRESS_ROT_STEP * 128.0, 7.0);
+        assert_eq!(PRESS_MOVE_FRACTION * 256.0, 33.0);
+        assert_eq!(SPIN_RATE * 256.0, 169.0);
+    }
+
+    /// Write `content` to a uniquely named temp file and return its path.
+    fn temp_file(name: &str, content: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("wrfm-main-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        fs::write(&path, content).unwrap();
+        path
+    }
+
+    /// Write `content` to a uniquely named temp `.wrfm` file.
+    fn temp_wrfm(name: &str, content: &str) -> PathBuf {
+        temp_file(&format!("{name}.wrfm"), content)
+    }
+
+    // --- Content-first open detection ---
+
+    #[test]
+    fn load_model_accepts_valid_wrfm() {
+        // A valid v1 file: `wrfm 1` magic, `vertices <N> edges <M>` counts
+        // header, then `v` / `e` lines.
+        let p = temp_wrfm(
+            "valid",
+            "wrfm 1\nvertices 2   edges 1\n\nv 0 0 0\nv 1 1 1\ne 0 1\n",
+        );
+        let (mode, name) = load_model(&p).expect("valid wrfm must load");
+        let m = mode.braille().expect("wrfm loads as a braille model");
+        assert_eq!(m.vertices.len(), 2);
+        assert_eq!(m.edges.len(), 1);
+        assert_eq!(
+            name,
+            p.file_stem().unwrap().to_str().unwrap(),
+            "model name comes from the file stem"
+        );
+    }
+
+    #[test]
+    fn open_detection_txt_with_wrfm_content_opens() {
+        // A `.txt` holding v1 wrfm content must open as wrfm — the extension
+        // is only a hint, the content is authoritative.
+        let p = temp_file(
+            "model.txt",
+            "wrfm 1\nvertices 2   edges 1\n\nv 0 0 0\nv 1 1 1\ne 0 1\n",
+        );
+        let (mode, name) = load_model(&p).expect("wrfm content in a .txt must open");
+        let m = mode.braille().expect("wrfm loads as a braille model");
+        assert_eq!(m.vertices.len(), 2);
+        assert_eq!(m.edges.len(), 1);
+        assert_eq!(name, "model");
+    }
+
+    #[test]
+    fn open_detection_wrfm_with_garbage_is_unrecognized() {
+        // A `.wrfm` holding garbage must be rejected as "unrecognized" —
+        // never an Ok empty model (the old extension-only routing silently
+        // parsed garbage into a blank screen). The magic line decides the
+        // route: a garbage FIRST line (no magic) is unrecognized, while a
+        // file STARTING with `wrfm 1` is a LOAD (parse) error, NOT
+        // "unrecognized" .
+        let p = temp_wrfm("garbage", "this is not a wireframe\nno markers here\n");
+        let err = load_model(&p).err().expect("garbage must fail to load");
+        assert!(
+            err.contains("unrecognized"),
+            "error should say 'unrecognized': {err}"
+        );
+
+        // Magic present, garbage after it: routed to the wrfm parser, which
+        // must fail on the missing counts header — never "unrecognized".
+        let p2 = temp_wrfm("magic-garbage", "wrfm 1\nthis is garbage after the magic\n");
+        let err2 = load_model(&p2)
+            .err()
+            .expect("magic+garbage must fail to load");
+        assert!(
+            !err2.contains("unrecognized"),
+            "a wrfm magic line must route to the wrfm parser: {err2}"
+        );
+    }
+
+    #[test]
+    fn open_detection_obj_content_probes_as_obj() {
+        // Real obj content probes as obj regardless of the feature flag;
+        // loading it requires the ratty feature (spec: "or 'requires ratty'
+        // without the feature").
+        let p = temp_file("cube.obj", "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n");
+        assert_eq!(probe_format(&p).unwrap(), FileFormat::Obj);
+        #[cfg(not(feature = "ratty"))]
+        {
+            let err = load_model(&p).err().expect("obj without ratty must fail");
+            assert!(err.contains("ratty"), "error should mention ratty: {err}");
+        }
+    }
+
+    #[test]
+    fn open_detection_vertex_only_probes_as_obj() {
+        // A file with only `v ` lines (no `e `) still probes as obj
+        // (v-only is an obj marker, not a wrfm without the magic).
+        let p = temp_wrfm("vertex-only", "v 0 0 0\nv 1 1 1\n");
+        assert_eq!(probe_format(&p).unwrap(), FileFormat::Obj);
+    }
+
+    #[test]
+    fn wrfm_style_without_magic_is_unrecognized() {
+        // The v1 breaking change: a file with wrfm-style
+        // `v`/`e` lines but NO `wrfm <version>` magic is NOT wrfm and NOT
+        // obj — it is "unrecognized".
+        let v_e = temp_wrfm("v-e", "v 0 0 0\nv 1 1 1\ne 0 1\n");
+        assert!(
+            !matches!(probe_format(&v_e), Ok(FileFormat::Wrfm)),
+            "v/e without magic must not probe as wrfm"
+        );
+        assert!(
+            !matches!(probe_format(&v_e), Ok(FileFormat::Obj)),
+            "v/e without magic must not probe as obj"
+        );
+        let err = load_model(&v_e).err().expect("v/e without magic must fail");
+        assert!(err.contains("unrecognized"), "error: {err}");
+
+        // Edge-only or marker-less content is likewise never wrfm.
+        let edge_only = temp_wrfm("edge-only", "e 0 1\n");
+        assert!(
+            !matches!(probe_format(&edge_only), Ok(FileFormat::Wrfm)),
+            "an edge-only file is not wrfm by the detection contract"
+        );
+        let comment_only = temp_wrfm("comment-only", "# just a comment\n");
+        assert!(probe_format(&comment_only).is_err());
+    }
+
+    #[test]
+    fn wrfm_magic_beats_obj_markers() {
+        // The magic test comes FIRST: a file starting with `wrfm 1` is
+        // wrfm even if later lines look obj-ish (`f` is an unknown directive
+        // that lenient parsing skips).
+        let p = temp_wrfm(
+            "magic-obj",
+            "wrfm 1\nvertices 2   edges 1\n\nv 0 0 0\nv 1 0 0\ne 0 1\nf 1 2 3\n",
+        );
+        assert_eq!(probe_format(&p).unwrap(), FileFormat::Wrfm);
+        let (mode, _) = load_model(&p).expect("magic must win over obj markers");
+        let m = mode.braille().expect("wrfm loads as a braille model");
+        assert_eq!(m.vertices.len(), 2);
+        assert_eq!(m.edges.len(), 1);
+    }
+
+    #[test]
+    fn empty_file_is_unrecognized() {
+        // An empty file has no first line -> no magic -> unrecognized
+        // — never an Ok empty model.
+        let p = temp_wrfm("empty", "");
+        assert!(probe_format(&p).is_err());
+        let err = load_model(&p).err().expect("empty file must fail to load");
+        assert!(
+            err.contains("unrecognized"),
+            "error should say 'unrecognized': {err}"
+        );
+    }
+
+    #[test]
+    fn load_model_rejects_half_written_file() {
+        // Half-written v1 .wrfm (truncated vertex line): it still carries
+        // the magic + `v `/`e ` markers, so it probes as wrfm and the parser
+        // must fail — the caller keeps the last good model instead of
+        // crashing.
+        let p = temp_wrfm(
+            "half",
+            "wrfm 1\nvertices 2   edges 1\n\nv 0 0 0\nv 1 1\ne 0 1\n",
+        );
+        assert!(load_model(&p).is_err());
+    }
+
+    #[test]
+    fn load_model_rejects_bad_edge() {
+        // An edge line missing its second index must fail to parse.
+        let p = temp_wrfm(
+            "bad-edge",
+            "wrfm 1\nvertices 2   edges 1\n\nv 0 0 0\nv 1 1 1\ne 0",
+        );
+        assert!(load_model(&p).is_err());
+    }
+
+    #[test]
+    fn load_model_error_reports_line() {
+        // The TUI must surface the parser's structured error: the message
+        // carries the line number and the offending source line, so the
+        // user/agent can locate the problem.
+        // The magic routes the content to the wrfm parser (a bare
+        // "v 1.0 2.0 abc" line alone would probe as obj).
+        let p = temp_wrfm(
+            "bad-num",
+            "wrfm 1\nvertices 1   edges 1\n\nv 1.0 2.0 abc\ne 0 0\n",
+        );
+        let err = load_model(&p).err().expect("bad-num must fail to load");
+        assert!(err.contains("line"), "error should mention the line: {err}");
+        assert!(
+            err.contains("v 1.0 2.0 abc"),
+            "error should carry the offending source line: {err}"
+        );
+    }
+
+    #[test]
+    fn load_model_rejects_deleted_file() {
+        let p = temp_wrfm("gone", "wrfm 1\nvertices 1   edges 1\n\nv 0 0 0\ne 0 0\n");
+        fs::remove_file(&p).unwrap();
+        assert!(load_model(&p).is_err(), "a deleted file must fail to load");
+    }
+
+    // --- Hot-reload invariant ( /) ---
+
+    #[test]
+    fn reload_preserves_view() {
+        // Two models of very different sizes: after a reload the camera
+        // keeps its distance and rotation by default ...
+        let small = temp_wrfm(
+            "small",
+            "wrfm 1\nvertices 2   edges 1\n\nv 0 0 0\nv 1 0 0\ne 0 1\n",
+        );
+        let big = temp_wrfm(
+            "big",
+            "wrfm 1\nvertices 4   edges 3\n\nv 0 0 0\nv 100 0 0\nv 0 100 0\nv 0 0 100\ne 0 1\ne 0 2\ne 0 3\n",
+        );
+        let (mut current, mut name) = load_model(&small).unwrap();
+        let mut view = ViewState::default();
+        view.fit_to(current.braille().unwrap());
+        view.add_yaw(1.0); // user turned the model
+        let dist_before = view.dist;
+
+        let (new_render, new_name) = load_model(&big).unwrap();
+        apply_reload(&mut current, &mut name, new_render, new_name);
+        assert_eq!(view.dist, dist_before, "distance must be preserved");
+        assert!((view.yaw - 1.0).abs() < 1e-9, "rotation must be preserved");
+        assert_eq!(name, big.file_stem().unwrap().to_str().unwrap());
+    }
+
+    #[test]
+    fn reload_failure_keeps_old_render() {
+        // A failed reload must not touch the current render: the swap only
+        // happens inside apply_reload, which the caller invokes on success.
+        let valid = temp_wrfm("valid2", "wrfm 1\nvertices 1   edges 1\n\nv 0 0 0\ne 0 0\n");
+        let (current, _) = load_model(&valid).unwrap();
+        let bad = temp_wrfm("bad", "wrfm 1\nvertices 1   edges 1\n\nv 0 0 0\ne 0 1\n");
+        assert!(load_model(&bad).is_err());
+        assert_eq!(
+            current.braille().unwrap().vertices.len(),
+            1,
+            "the old model must still be held"
+        );
+    }
+
+    #[test]
+    fn hot_reload_changed_garbage_keeps_model_and_reports_parse_error() {
+        // after a successful reload, write garbage -> the screen KEEPS
+        // the last model + the event shows Parse Error.
+        let p = temp_wrfm(
+            "inv-garbage",
+            "wrfm 1\nvertices 2   edges 1\n\nv 0 0 0\nv 1 0 0\ne 0 1\n",
+        );
+        let (mut current, mut name) = load_model(&p).unwrap();
+        let mut view = ViewState::default();
+        view.fit_to(current.braille().unwrap());
+        let vertices_before = current.braille().unwrap().vertices.len();
+
+        fs::write(&p, "this is garbage\n").unwrap();
+        let record = handle_reload_event(ReloadEvent::Changed, &mut current, &mut name, &p)
+            .expect("Changed must produce a reload record");
+        assert_eq!(
+            record.outcome,
+            ReloadOutcome::ParseError,
+            "garbage must record a parse-error outcome"
+        );
+        assert!(
+            record.detail.contains("Parse Error"),
+            "record: {:?}",
+            record.detail
+        );
+        assert_eq!(
+            current.braille().unwrap().vertices.len(),
+            vertices_before,
+            "garbage must never replace the on-screen model"
+        );
+    }
+
+    #[test]
+    fn hot_reload_missing_keeps_model_and_reports_file_removed() {
+        // delete the file -> keeps the model + "file removed".
+        let p = temp_wrfm(
+            "inv-deleted",
+            "wrfm 1\nvertices 2   edges 1\n\nv 0 0 0\nv 1 0 0\ne 0 1\n",
+        );
+        let (mut current, mut name) = load_model(&p).unwrap();
+        let mut view = ViewState::default();
+        view.fit_to(current.braille().unwrap());
+        let vertices_before = current.braille().unwrap().vertices.len();
+
+        fs::remove_file(&p).unwrap();
+        let record = handle_reload_event(ReloadEvent::Missing, &mut current, &mut name, &p)
+            .expect("Missing must produce a reload record");
+        assert_eq!(
+            record.outcome,
+            ReloadOutcome::FileRemoved,
+            "deletion must record a file-removed outcome"
+        );
+        assert!(
+            record.detail.contains("file removed"),
+            "record: {:?}",
+            record.detail
+        );
+        assert_eq!(
+            current.braille().unwrap().vertices.len(),
+            vertices_before,
+            "deletion must never replace the on-screen model"
+        );
+    }
+
+    #[test]
+    fn hot_reload_fixed_file_replaces_with_success() {
+        // fix the file -> replaces + success (the only path that may
+        // swap the model — the invariant).
+        let p = temp_wrfm(
+            "inv-fixed",
+            "wrfm 1\nvertices 2   edges 1\n\nv 0 0 0\nv 1 0 0\ne 0 1\n",
+        );
+        let (mut current, mut name) = load_model(&p).unwrap();
+        let mut view = ViewState::default();
+        view.fit_to(current.braille().unwrap());
+
+        // First break it: garbage -> Parse Error, model kept.
+        fs::write(&p, "garbage\n").unwrap();
+        let record =
+            handle_reload_event(ReloadEvent::Changed, &mut current, &mut name, &p).unwrap();
+        assert_eq!(record.outcome, ReloadOutcome::ParseError);
+        let kept = current.braille().unwrap().vertices.len();
+
+        // Then fix it: replaces + success.
+        fs::write(
+ &p,
+            "wrfm 1\nvertices 4   edges 3\n\nv 0 0 0\nv 1 0 0\nv 0 1 0\nv 0 0 1\ne 0 1\ne 0 2\ne 0 3\n",
+ )
+ .unwrap();
+        let record =
+            handle_reload_event(ReloadEvent::Changed, &mut current, &mut name, &p).unwrap();
+        assert_eq!(record.outcome, ReloadOutcome::Ok);
+        assert_eq!(
+            record.detail, "model reloaded",
+            "record: {:?}",
+            record.detail
+        );
+        assert_eq!(
+            current.braille().unwrap().vertices.len(),
+            4,
+            "a fixed file must replace the model (was {kept})"
+        );
+    }
+
+    #[test]
+    fn hot_reload_unchanged_produces_no_event() {
+        // Unchanged -> no event line (the previous event stays until
+        // the next one replaces it).
+        let p = temp_wrfm(
+            "inv-unchanged",
+            "wrfm 1\nvertices 1   edges 1\n\nv 0 0 0\ne 0 0\n",
+        );
+        let (mut current, mut name) = load_model(&p).unwrap();
+        let mut view = ViewState::default();
+        view.fit_to(current.braille().unwrap());
+        assert_eq!(
+            handle_reload_event(ReloadEvent::Unchanged, &mut current, &mut name, &p,),
+            None,
+            "Unchanged must not emit an event line"
+        );
+    }
+
+    // --- HUD layout ( /) ---
+
+    #[test]
+    fn status_expired_after_timeout() {
+        // The status line is transient: no deadline -> never expires; a
+        // future deadline -> still shown; a passed deadline -> cleared so
+        // the event region's rows return to the model canvas.
+        let now = Instant::now();
+        assert!(
+            !status_expired(None, now),
+            "no deadline must never be treated as expired"
+        );
+        assert!(
+            !status_expired(Some(now + STATUS_TIMEOUT), now),
+            "a deadline in the future must keep the status on screen"
+        );
+        assert!(
+            status_expired(Some(now), now + STATUS_TIMEOUT),
+            "a passed deadline must clear the status"
+        );
+    }
+
+    #[test]
+    fn hud_status_for_maps_all_four_states() {
+        // Every reload outcome has a HUD line (transient 4 s); the four
+        // states are ok / parse error / file removed (Unchanged shows
+        // nothing — it never produces a record).
+        assert_eq!(hud_status_for(ReloadOutcome::Ok), "hot-reloaded");
+        assert_eq!(hud_status_for(ReloadOutcome::ParseError), "parse error");
+        assert_eq!(hud_status_for(ReloadOutcome::FileRemoved), "file removed");
+    }
+
+    #[test]
+    fn reload_panel_lines_show_outcome_and_persistent_detail() {
+        // The `x` panel shows the most recent action + its full detail
+        // (not transient): Ok / ParseError / no-action-yet all render.
+        let ok = ReloadRecord {
+            outcome: ReloadOutcome::Ok,
+            detail: "model reloaded".to_string(),
+        };
+        let lines = reload_panel_lines(Some(&ok));
+        assert!(lines.iter().any(|l| l == "outcome: ok"), "{lines:?}");
+        assert!(lines.iter().any(|l| l == "model reloaded"), "{lines:?}");
+
+        let err = ReloadRecord {
+            outcome: ReloadOutcome::ParseError,
+            detail: "Parse Error: error: invalid vertex at line 4, column 1\n 4 | v 1 1\n   |   ^^"
+                .to_string(),
+        };
+        let lines = reload_panel_lines(Some(&err));
+        assert!(
+            lines.iter().any(|l| l == "outcome: parse error"),
+            "{lines:?}"
+        );
+        // The detail is kept line by line so a multiline parse report
+        // renders fully in the panel.
+        assert!(
+            lines.iter().any(|l| l.contains("invalid vertex")),
+            "{lines:?}"
+        );
+
+        let none = reload_panel_lines(None);
+        assert!(
+            none.iter().any(|l| l.contains("no reload action yet")),
+            "{none:?}"
+        );
+    }
+
+    #[test]
+    fn hud_fixed_row_always_present_and_quiet_has_no_event_region() {
+        // The fixed Row 0 is always present; with no event the event region
+        // is absent and the canvas starts at row 1.
+        let view = ViewState::default();
+        let (row0, events, reserved) = hud_layout("cube", &view, "", 24, true, None);
+        assert!(
+            row0.starts_with("Wireforge: cube | yaw="),
+            "fixed row must carry the model name and view: {row0}"
+        );
+        assert!(
+            row0.contains("dist=") && row0.contains("pan=("),
+            "row0: {row0}"
+        );
+        assert!(events.is_empty(), "no event -> no event lines");
+        assert_eq!(reserved, 0, "quiet -> canvas starts at row 1");
+    }
+
+    #[test]
+    fn hud_event_rows_appear_and_reserve_canvas_rows() {
+        // On an event the event region renders below Row 0 (multiline for a
+        // Parse Error) and the canvas loses those rows.
+        let view = ViewState::default();
+        let msg = "Parse Error: error: invalid vertex at line 2, column 1\n   |\n 2 | v 1 1\n   |   ^^\nexpected a number for the z coordinate, got `2`";
+        let (row0, events, reserved) = hud_layout("cube", &view, msg, 24, true, None);
+        assert_eq!(events.len(), 5, "multiline event splits into lines");
+        assert_eq!(reserved, 5, "event region reserves its rows below row 0");
+        assert!(
+            !row0.contains("Parse Error"),
+            "event text must never be squeezed into Row 0"
+        );
+        assert!(events[0].starts_with("Parse Error:"), "{}", events[0]);
+    }
+
+    #[test]
+    fn hud_event_region_clamped_to_available_rows() {
+        // A very long Parse Error must not push the canvas off screen: the
+        // event region is clamped to height - 1.
+        let view = ViewState::default();
+        let msg = (0..40)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (_, events, reserved) = hud_layout("cube", &view, &msg, 5, true, None);
+        assert_eq!(reserved, 4, "event region clamps to height - 1");
+        assert_eq!(events.len(), 40, "all lines are kept for rendering");
+    }
+
+    // ---------- stream input ( ----------
+
+    #[test]
+    fn probe_bytes_wrfm_magic() {
+        // The buffer probe (used by stdin/FIFO) is the same content-first
+        // authority as the file probe: `wrfm <version>` first line -> wrfm.
+        let buf = b"wrfm 1\nvertices 2   edges 1\n\nv 0 0 0\nv 1 1 1\ne 0 1\n";
+        assert_eq!(probe_bytes(buf).unwrap(), FileFormat::Wrfm);
+        // The magic wins even with obj-looking markers later.
+        let buf2 = b"wrfm 1\nf 1 2 3\n";
+        assert_eq!(probe_bytes(buf2).unwrap(), FileFormat::Wrfm);
+    }
+
+    #[test]
+    fn probe_bytes_obj_markers() {
+        assert_eq!(
+            probe_bytes(b"v 0 0 0\nv 1 0 0\nf 1 2 3\n").unwrap(),
+            FileFormat::Obj
+        );
+        // v-only (no `e` line) is an obj marker too.
+        assert_eq!(probe_bytes(b"v 0 0 0\nv 1 1 1\n").unwrap(), FileFormat::Obj);
+    }
+
+    #[test]
+    fn probe_bytes_garbage_is_unrecognized() {
+        // A stream of garbage (no magic, no obj markers) is "unrecognized" —
+        // never an empty model; a magic-less `v`/`e` stream is likewise not
+        // wrfm (the v1 breaking change).
+        let err = probe_bytes(b"this is not a wireframe\n").unwrap_err();
+        assert!(err.contains("unrecognized"), "error: {err}");
+        assert!(probe_bytes(b"v 0 0 0\nv 1 1 1\ne 0 1\n").is_err());
+        assert!(probe_bytes(b"").is_err(), "empty stream is unrecognized");
+    }
+
+    #[test]
+    fn load_model_from_text_wrfm_parses() {
+        let (mode, name) = load_model_from_text(
+            "stream",
+            "wrfm 1\nvertices 2   edges 1\n\nv 0 0 0\nv 1 1 1\ne 0 1\n",
+        )
+        .expect("wrfm stream must load");
+        let m = mode.braille().expect("wrfm loads as a braille model");
+        assert_eq!(m.vertices.len(), 2);
+        assert_eq!(m.edges.len(), 1);
+        assert_eq!(name, "stream");
+    }
+
+    #[test]
+    fn load_model_from_text_garbage_fails() {
+        let err = load_model_from_text("stream", "garbage here\nno markers\n")
+            .err()
+            .expect("garbage stream must fail");
+        assert!(err.contains("unrecognized"), "error: {err}");
+    }
+
+    #[test]
+    fn load_model_from_text_obj_routes_to_ratty() {
+        // With the ratty feature a real obj stream routes to the Hardware3D
+        // path (register_payload, no temp file); without it, it must fail
+        // with the feature hint.
+        let text = "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n";
+        #[cfg(feature = "ratty")]
+        {
+            let (mode, name) = load_model_from_text("cube", text).expect("obj stream must load");
+            assert!(
+                matches!(mode, RenderMode::Hardware3D(_)),
+                "obj routes to ratty"
+            );
+            assert_eq!(name, "cube");
+        }
+        #[cfg(not(feature = "ratty"))]
+        {
+            let err = load_model_from_text("cube", text)
+                .err()
+                .expect("obj without ratty must fail");
+            assert!(err.contains("ratty"), "error: {err}");
+        }
+    }
+
+    #[test]
+    fn hud_one_shot_label_in_row_zero() {
+        // In one-shot mode Row 0 advertises the no-hot-reload preview so the
+        // user is never surprised (
+        let view = ViewState::default();
+        let (row0, _, _) = hud_layout(
+            "stdin",
+            &view,
+            "",
+            24,
+            true,
+            Some("stdin preview (no hot-reload)"),
+        );
+        assert!(
+            row0.starts_with("Wireforge: stdin preview (no hot-reload) |"),
+            "row0: {row0}"
+        );
+        // A regular file passes None and keeps the model name.
+        let (row0b, _, _) = hud_layout("cube", &view, "", 24, true, None);
+        assert!(row0b.starts_with("Wireforge: cube |"), "row0: {row0b}");
+    }
+
+    // ---------- event loop ( ----------
+
+    #[test]
+    fn timer_scheduler_fires_in_order() {
+        let mut t = TimerScheduler::new();
+        let now = Instant::now();
+        assert_eq!(t.earliest(), None, "empty scheduler has no deadline");
+        t.schedule(TimerId::StatusExpiry, now + Duration::from_millis(4000));
+        t.schedule(TimerId::MotionTimeout, now + Duration::from_millis(100));
+        assert_eq!(t.earliest(), Some(now + Duration::from_millis(100)));
+        // Nothing due yet.
+        assert!(t.fire_due(now + Duration::from_millis(50)).is_empty());
+        // The motion timer fires first.
+        let due = t.fire_due(now + Duration::from_millis(100));
+        assert_eq!(due, vec![TimerId::MotionTimeout]);
+        // The status timer remains.
+        assert_eq!(t.earliest(), Some(now + Duration::from_millis(4000)));
+        let due2 = t.fire_due(now + Duration::from_secs(10));
+        assert_eq!(due2, vec![TimerId::StatusExpiry]);
+        assert_eq!(t.earliest(), None);
+    }
+
+    #[test]
+    fn timer_scheduler_same_id_replaces() {
+        let mut t = TimerScheduler::new();
+        let now = Instant::now();
+        t.schedule(TimerId::StatusExpiry, now + Duration::from_millis(4000));
+        // Re-showing a status line replaces the deadline.
+        t.schedule(TimerId::StatusExpiry, now + Duration::from_millis(8000));
+        let due = t.fire_due(now + Duration::from_secs(5));
+        assert!(due.is_empty(), "old deadline must be replaced");
+        let due = t.fire_due(now + Duration::from_secs(9));
+        assert_eq!(due, vec![TimerId::StatusExpiry]);
+        // Cancel removes the entry entirely.
+        t.schedule(TimerId::MotionTimeout, now + Duration::from_millis(1));
+        t.cancel(TimerId::MotionTimeout);
+        assert_eq!(t.earliest(), None);
+    }
+
+    #[test]
+    fn app_handle_input_toggles() {
+        let mut app = App::new(
+            RenderMode::Braille(Model {
+                vertices: vec![(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)],
+                edges: vec![(0, 1)],
+            }),
+            "cube".to_string(),
+            None,
+            PathBuf::from("cube.wrfm"),
+        );
+        app.dirty = false;
+
+        // '?' toggles the help overlay and marks the screen dirty.
+        assert!(!app.handle_input(Event::Key(KeyEvent::new(
+            KeyCode::Char('?'),
+            KeyModifiers::NONE
+        ))));
+        assert_eq!(app.hud, Hud::Expanded);
+        assert!(app.dirty);
+
+        app.dirty = false;
+        app.handle_input(Event::Key(KeyEvent::new(
+            KeyCode::Char('?'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.hud, Hud::Collapsed);
+
+        // Space toggles auto-spin.
+        app.handle_input(Event::Key(KeyEvent::new(
+            KeyCode::Char(' '),
+            KeyModifiers::NONE,
+        )));
+        assert!(app.auto_spin);
+        app.handle_input(Event::Key(KeyEvent::new(
+            KeyCode::Char(' '),
+            KeyModifiers::NONE,
+        )));
+        assert!(!app.auto_spin);
+
+        // Tab toggles the axes.
+        let before = app.show_axes;
+        app.handle_input(Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+        assert_ne!(app.show_axes, before);
+
+        // 'x' toggles the reload panel.
+        app.handle_input(Event::Key(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+        )));
+        assert!(app.show_reload_panel);
+        app.handle_input(Event::Key(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+        )));
+        assert!(!app.show_reload_panel);
+
+        // q / Esc quit.
+        assert!(app.handle_input(Event::Key(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE
+        ))));
+        assert!(app.handle_input(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))));
+    }
+
+    #[test]
+    fn app_handle_input_motion_tap_applies_one_step() {
+        let mut app = App::new(
+            RenderMode::Braille(Model {
+                vertices: vec![(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)],
+                edges: vec![(0, 1)],
+            }),
+            "cube".to_string(),
+            None,
+            PathBuf::from("cube.wrfm"),
+        );
+        app.view.fit_to(app.current.braille().unwrap());
+        let yaw0 = app.view.yaw;
+        // A fresh right-arrow press applies one tap step.
+        app.handle_input(Event::Key(KeyEvent::new(
+            KeyCode::Right,
+            KeyModifiers::NONE,
+        )));
+        assert_ne!(app.view.yaw, yaw0, "tap must rotate the view");
+        assert_eq!(app.held.len(), 1, "the tap waits for an auto-repeat");
+        assert!(!app.held.values().next().unwrap().steady);
+        // A repeat confirms the hold (smooth motion from then on).
+        app.handle_input(Event::Key(KeyEvent::new(
+            KeyCode::Right,
+            KeyModifiers::NONE,
+        )));
+        let st = app.held.get(&Motion::YawRight).unwrap();
+        assert!(st.steady, "repeat confirms a hold");
+    }
+
+    #[test]
+    fn app_update_held_expires_stale_entries() {
+        let mut app = App::new(
+            RenderMode::Braille(Model {
+                vertices: vec![(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)],
+                edges: vec![(0, 1)],
+            }),
+            "cube".to_string(),
+            None,
+            PathBuf::from("cube.wrfm"),
+        );
+        // A tap that never confirms a hold is removed after TAP_TIMEOUT.
+        let now = Instant::now();
+        app.handle_input(Event::Key(KeyEvent::new(
+            KeyCode::Right,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.held.len(), 1);
+        app.update_held(now + TAP_TIMEOUT + Duration::from_millis(1), 0.016);
+        assert!(app.held.is_empty(), "stale tap must expire");
+        // A confirmed hold is removed after HOLD_TIMEOUT once repeats stop.
+        app.handle_input(Event::Key(KeyEvent::new(
+            KeyCode::Right,
+            KeyModifiers::NONE,
+        )));
+        app.handle_input(Event::Key(KeyEvent::new(
+            KeyCode::Right,
+            KeyModifiers::NONE,
+        )));
+        assert!(app.held.get(&Motion::YawRight).unwrap().steady);
+        app.update_held(now + HOLD_TIMEOUT + Duration::from_millis(1), 0.016);
+        assert!(app.held.is_empty(), "stale hold must expire");
+    }
+
+    #[test]
+    fn sync_motion_timer_tracks_held_deadlines() {
+        let mut timers = TimerScheduler::new();
+        let mut app = App::new(
+            RenderMode::Braille(Model {
+                vertices: vec![(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)],
+                edges: vec![(0, 1)],
+            }),
+            "cube".to_string(),
+            None,
+            PathBuf::from("cube.wrfm"),
+        );
+        sync_motion_timer(&app, &mut timers);
+        assert_eq!(timers.earliest(), None, "no held keys -> no motion timer");
+        app.handle_input(Event::Key(KeyEvent::new(
+            KeyCode::Right,
+            KeyModifiers::NONE,
+        )));
+        sync_motion_timer(&app, &mut timers);
+        let deadline = timers.earliest().expect("held tap must arm a timer");
+        assert!(deadline > Instant::now());
+        // The deadline equals last + TAP_TIMEOUT.
+        let last = app.held.get(&Motion::YawRight).unwrap().last;
+        assert_eq!(deadline, last + TAP_TIMEOUT);
+    }
+
+    #[test]
+    fn reload_event_loop_schedules_deferred_parse() {
+        let mut timers = TimerScheduler::new();
+        let mut app = App::new(
+            RenderMode::Braille(Model {
+                vertices: vec![(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)],
+                edges: vec![(0, 1)],
+            }),
+            "cube".to_string(),
+            None,
+            PathBuf::from("cube.wrfm"),
+        );
+        // Changed -> no immediate status, but a deferred parse is scheduled.
+        let changed = handle_reload_event_loop(&mut app, &mut timers, ReloadEvent::Changed);
+        assert!(!changed);
+        let parse_deadline = timers
+            .earliest()
+            .expect("a change must arm the deferred parse");
+        let expected = Instant::now() + SETTLE_DELAY;
+        let diff = if parse_deadline > expected {
+            parse_deadline - expected
+        } else {
+            expected - parse_deadline
+        };
+        assert!(
+            diff <= Duration::from_millis(50),
+            "deferred parse deadline should be ~SETTLE_DELAY from now"
+        );
+        // Missing -> immediate status + StatusExpiry timer.
+        let missing = handle_reload_event_loop(&mut app, &mut timers, ReloadEvent::Missing);
+        assert!(missing);
+        assert!(app.status_msg.contains("removed"));
+        assert!(app.reload_record.is_some());
+        // The status expiry timer is now the earliest (SETTLE_DELAY < 4 s
+        // was replaced by the status timer? No: both are pending; the
+        // earliest is the SETTLE_DELAY parse. Clear it to check the status
+        // timer exists.
+        timers.cancel(TimerId::ReloadParse);
+        assert!(timers.earliest().is_some(), "status expiry must be armed");
+        assert!(app.dirty);
+    }
 }

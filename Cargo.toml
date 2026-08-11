@@ -14,12 +14,18 @@ categories = ["command-line-utilities"]
 [dependencies]
 clap = { version = "4.6.1", features = ["derive"] }
 crossterm = "0.29.0"
-notify = "8.2.0"
 ratatui = "0.30.1"
-ratatui-ratty = "0.3.0"
+ratatui-ratty = "0.4.0"
 ratatui-wireframe = "0.7.0"
+rayon = "1.10"
 wrfm = { version = "0.4.0", path = "crates/wrfm" }
+
+[dev-dependencies]
+libc = "0.2"
 
 [features]
 default = []
 ratty = ["ratatui-wireframe/ratty"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+inotify = { version = "0.11", default-features = false }

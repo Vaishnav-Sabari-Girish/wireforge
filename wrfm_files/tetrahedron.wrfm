@@ -1,3 +1,6 @@
+wrfm 1
+vertices 4   edges 6
+
 # Name: Regular Tetrahedron
 v 1.0 1.0 1.0
 v 1.0 -1.0 -1.0
