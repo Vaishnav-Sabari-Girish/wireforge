@@ -60,7 +60,7 @@ cargo install wireforge --features ratty
 ### Build from source
 
 ```bash
-git clone [https://github.com/Vaishnav-Sabari-Girish/wireforge.git](https://github.com/Vaishnav-Sabari-Girish/wireforge.git)
+git clone https://github.com/Vaishnav-Sabari-Girish/wireforge.git
 cd wireforge
 cargo build --release
 # For 3D model support
