@@ -67,3 +67,15 @@ respect-gitignore = true
 # [MD044]
 # names = ["rumdl", "Markdown", "GitHub"]  # Proper names that should be capitalized correctly
 # code-blocks = false  # Check code blocks for proper names (default: false, skips code blocks)
+
+# Rule-specific configurations (project intent, merged from rumdl.toml so
+# the local rumdl 0.2.x (which prefers .rumdl.toml) matches the CI config).
+[MD013]
+line-length = 120
+reflow = true
+code-blocks = false
+tables = false
+headings = false
+
+[MD033]
+enabled = false

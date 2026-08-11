@@ -14,11 +14,22 @@ It also allows you to view 3D files using the `ratatui-ratty` crate in the
 
 * **Instant Hot-Reloading:** Open a `.wrfm` file in your favorite text editor
   (Neovim, VSCode, etc.) and run `wireforge` in an adjacent terminal pane.
-  Every time you save the file, the 3D model instantly updates on screen.
-* **Interactive 3D Viewport:** Freely rotate and inspect your wireframe models
-  using your keyboard.
+  Every time the file changes on disk the 3D model instantly updates on
+  screen. The file is watched by polling its modification time and length,
+  so atomic-rename saves and file re-creation are caught too; a half-written
+  or deleted file keeps the last good model on screen and recovers
+  automatically. The camera is preserved across reloads.
+* **Interactive 6-DOF Viewport:** Freely rotate (yaw / pitch / roll) and
+  move (Shift + arrows, `=` / `-`) the model with your keyboard, toggle
+  auto-spin with `Space`, center or fit with `f`, and read the current
+  camera from the HUD line. XYZ axes can be toggled with `Tab`.
+* **Stream input:** `wireforge -` reads a model from stdin (or a FIFO such
+  as `<( cat model.wrfm )`) as a one-shot preview with no hot-reload.
+  Keyboard input still works via the controlling terminal.
 * **Zero-Dependency CPU Rendering:** Uses mathematical projection and braille
-  characters to render 3D shapes in any standard terminal emulator.
+  characters to render 3D shapes in any standard terminal emulator. The
+  render loop is event-driven: it is fully idle (0% CPU) when nothing
+  changes and redraws uncapped while you animate.
 
 ## Installation
 
@@ -58,7 +69,8 @@ cargo build --release --features ratty
 
 ## Usage
 
-Point `wireforge` to any valid `.wrfm` file:
+Point `wireforge` to any `.wrfm` file (the format is detected from the file's
+content, so the extension does not matter):
 
 ```bash
 wireforge path/to/model.wrfm
@@ -73,6 +85,19 @@ You can also point it to `.obj` files for 3D viewing
 wireforge mouse.obj
 ```
 
+Or pipe a model in for a one-shot preview (no hot-reload):
+
+```bash
+cat model.wrfm | wireforge -
+wireforge <( cat model.wrfm )
+```
+
+You can also build a transform with `wrfm-cli` and view it directly:
+
+```bash
+wrfm edit model.wrfm --extract-group cabinet | wrfm transform - --scale 2 | wireforge -
+```
+
 ### TUI Controls
 
 | Key | Action |
@@ -81,21 +106,36 @@ wireforge mouse.obj
 | `↑` / `↓` | Rotate Pitch (X-axis) |
 | `←` / `→` | Rotate Yaw (Y-axis) |
 | `r` / `e` | Rotate Roll (Z-axis) |
+| `Shift` + `←` / `→` / `↑` / `↓` | Move the model |
+| `=` / `-` | Move nearer / farther |
+| `f` | Center the file origin |
+| `Shift` + `f` | Fit the model to the view |
+| `0` | Reset rotation and distance |
+| `?` | Toggle the key help overlay |
+| `Tab` | Toggle the XYZ axes |
+| `x` | Toggle the reload-status panel |
 | `q` / `Esc` | Quit the application |
 
 ## The `.wrfm` Format
 
-The `.wrfm` format is a dead-simple, human-readable text format for defining
-3D vertices and the edges that connect them.
+The `.wrfm` format (v1) is a dead-simple, human-readable text format for
+defining 3D vertices and the edges that connect them.
 
+* The first line is the magic and version: `wrfm 1`.
+* The second line is a counts header: `vertices <N>   edges <M>` (the
+  declared counts must match the lines that follow).
 * `v <x> <y> <z>` defines a vertex in 3D space.
 * `e <index1> <index2>` defines an edge connecting two vertices (0-indexed
   based on the order they appear).
-* Lines starting with `#` are comments.
+* Lines starting with `#` are comments; `group <name>` opens a named
+  section (optional).
 
 **Example: `tetrahedron.wrfm`**
 
 ```text
+wrfm 1
+vertices 4   edges 6
+
 # Name: Regular Tetrahedron
 v 1.0 1.0 1.0
 v 1.0 -1.0 -1.0

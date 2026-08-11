@@ -1,2 +1,5 @@
 /target
 /crates/wrfm/target
+/crates/wrfm-cli/target
+
+__pycache__/
