@@ -5,6 +5,8 @@
 
 ### :rocket: New features
 
+- Add wrfm-cli — streaming check/info/group/geometry/query/view/render/transform/edit/diff tool
+
 - **(wireforge)** 6-DOF camera, HUD, stream input, event-driven render loop
 
 - Add wrfm-cli — streaming check/info/group/geometry/query/view/render/transform/edit/diff tool
