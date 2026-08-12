@@ -23,31 +23,114 @@ same numbers.
   with pipes, verify with `wrfm check`.
 * **Compare:** `wrfm diff` shows exactly what changed between two models (density-grid or structured JSON).
 
-## Usage
+## Getting started
+
+The repo ships sample models in `wrfm_files/`. Every subcommand takes a
+path — or `-` for stdin — and prints its result to stdout; nothing is
+ever written to disk, so you keep a result with shell redirection.
 
 ```bash
-wrfm check model.wrfm          # health check (ok / warn / broken) + quality diagnostics
-wrfm verify model.wrfm --expect-size 2,3,4 --expect-closed   # intent assertions (pass / fail)
-wrfm info model.wrfm           # metadata: counts, groups, bounding box
-wrfm geometry model.wrfm       # structured geometry facts (bounds/PCA/topology/symmetry)
-wrfm query model.wrfm topology # safe geometric queries (extents/cross_section/vertices/...)
-wrfm group model.wrfm          # per-part (group) facts
-wrfm view model.wrfm --yaw 45  # exact per-view facts (occlusion, silhouette, depth)
-wrfm render model.wrfm         # braille render (six views by default)
-wrfm transform a --scale 2 > big.wrfm   # rigid transforms, printed to stdout
-wrfm edit model.wrfm --delete-vertices 0,1 > cleaned.wrfm
-wrfm diff a.wrfm b.wrfm        # structured or density-grid diff
+# health check: ok / warn / broken
+wrfm check wrfm_files/cube.wrfm
+# ok: cube (8 vertices, 12 edges)
+
+# braille render straight to the terminal (six views by default)
+wrfm render wrfm_files/cube.wrfm
+wrfm render wrfm_files/cube.wrfm --views top
 ```
 
-`wrfm check` also reports informational QUALITY diagnostics (open edges,
-proportion, Y-up orientation) that never affect the verdict. `wrfm verify`
-asserts DECLARED intent (size / center / closed / axis / symmetry / groups)
-and returns per-expectation pass/fail with the delta and an actionable fix
-command (e.g. `wrfm transform - --scale-y 2`).
+## Inspect a model
 
-Every command accepts `-` for stdin, and nothing ever writes a file — save
-with shell redirection. See `wrfm --help` and `wrfm format` for the
-complete command set and the `.wrfm` v1 format spec.
+`wrfm info` / `wrfm geometry` / `wrfm query` print structured facts —
+JSON for scripting, plain text for reading:
+
+```bash
+wrfm info wrfm_files/cube.wrfm
+```
+
+```json
+{
+  "name": "cube",
+  "version": 1,
+  "vertices": 8,
+  "edges": 12,
+  "groups": [],
+  "bytes": 227,
+  "bounds": { "center": [0.0, 0.0, 0.0], "max": [1.0, 1.0, 1.0], "min": [-1.0, -1.0, -1.0] }
+}
+```
+
+```bash
+wrfm query wrfm_files/cube.wrfm extents
+```
+
+```text
+extents:
+  min=[-1.000,-1.000,-1.000] max=[1.000,1.000,1.000] center=[0.000,0.000,0.000]
+  span x=2.000 y=2.000 z=2.000  (longest axis: z = 2.000)
+  proportions x:y:z = 1.00:1.00:1.00
+```
+
+Queries: `extents | topology | edge_stats | profile | cross_section |
+vertices | distance | connectivity`. For bounds, centroid, PCA axes,
+symmetry and alignment add `wrfm geometry wrfm_files/cube.wrfm`.
+
+## Verify intent
+
+Assert what a model *should* be — size, center, closedness, axis,
+symmetry or groups — and get pass/fail with deltas and a fix command:
+
+```bash
+wrfm verify wrfm_files/tetrahedron.wrfm --expect-size 2,2,2 --expect-closed
+# verdict: pass   (exit code 0)
+
+wrfm verify wrfm_files/tetrahedron.wrfm --expect-size 1,1,1
+# verdict: fail   (exit code 1)
+# suggestion: wrfm transform - --scale-x 0.5 && wrfm transform - --scale-y 0.5 && wrfm transform - --scale-z 0.5
+```
+
+## Transform and edit over stdio
+
+Rigid transforms (`wrfm transform`) and topology edits (`wrfm edit`) print
+the resulting `.wrfm` text to stdout, so the original file is never
+touched:
+
+```bash
+wrfm transform wrfm_files/cube.wrfm --scale 2 --rotate-y 45 > cube-2x.wrfm
+wrfm edit wrfm_files/cube.wrfm --delete-vertices 0,1 > trimmed.wrfm
+wrfm edit model.wrfm --extract-group cabinet > cabinet.wrfm
+```
+
+## Compare models
+
+`wrfm diff` shows exactly what changed — a density-grid in the terminal,
+or structured JSON with displacement vectors:
+
+```bash
+wrfm diff wrfm_files/cube.wrfm cube-2x.wrfm
+# vertices: 8 -> 8 (+0)    edges: 12 -> 12 (+0)
+# bbox:  min[-1.00,-1.00,-1.00] max[1.00,1.00,1.00]  ->  min[-2.00,-2.00,-2.00] max[2.00,2.00,2.00]
+
+wrfm diff wrfm_files/cube.wrfm cube-2x.wrfm --format json
+# moved vertices with per-vertex displacement and distance, added/removed edges
+```
+
+## Command reference
+
+```bash
+wrfm check model.wrfm                  # health: ok / warn / broken + quality diagnostics
+wrfm verify model.wrfm --expect-closed # intent assertions (pass / fail)
+wrfm info model.wrfm                   # metadata: counts, groups, bounding box
+wrfm geometry model.wrfm               # bounds, PCA, topology, symmetry, alignment
+wrfm query model.wrfm extents          # extents | topology | edge_stats | profile | ...
+wrfm group model.wrfm                  # per-part (group) facts
+wrfm view model.wrfm --yaw 45          # exact per-view facts (occlusion, silhouette, depth)
+wrfm render model.wrfm --views top     # braille / ascii / grid
+wrfm transform model.wrfm --scale 2    # affine transforms, printed to stdout
+wrfm edit model.wrfm --delete-vertices 0,1   # topology edits, printed to stdout
+wrfm diff a.wrfm b.wrfm --format json  # structured or density-grid diff
+wrfm format                            # print the .wrfm v1 spec itself
+```
 
 ## Composing commands with pipes
 
