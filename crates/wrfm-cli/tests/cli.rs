@@ -212,6 +212,35 @@ e 2 6
 e 3 7
 ";
 
+/// A valid v1 cube spanning [-1,1]^3 — mirror-symmetric about every
+/// origin plane (unlike the [0,1]^3 `CUBE`, whose symmetry plane does not
+/// pass through the origin). bbox SIZE is [2,2,2].
+const CUBE_CENTERED: &str = "\
+wrfm 1
+vertices 8   edges 12
+
+v -1 -1 -1
+v 1 -1 -1
+v 1 1 -1
+v -1 1 -1
+v -1 -1 1
+v 1 -1 1
+v 1 1 1
+v -1 1 1
+e 0 1
+e 1 2
+e 2 3
+e 3 0
+e 4 5
+e 5 6
+e 6 7
+e 7 4
+e 0 4
+e 1 5
+e 2 6
+e 3 7
+";
+
 /// A valid v1 1x1x4 box stretched along +z (z-span 4, x/y-span 1) — the
 /// PLAN §5.2 "long-z model" (PCA longest axis exactly +z).
 const LONG_Z: &str = "\
@@ -589,6 +618,33 @@ fn info_reports_groups_in_json() {
 }
 
 #[test]
+fn info_group_scopes_counts_and_bounds() {
+    let dir = scratch("info_group_scopes_counts_and_bounds");
+    let path = write(&dir, "two.wrfm", TWO_GROUPS);
+    let out = run(&["info", path.to_str().unwrap(), "--group", "body"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let j = stdout_json(&out);
+    // The body triangle: 3 vertices, 3 edges, bbox [0,1]^2 at z=0.
+    assert_eq!(j["vertices"], 3);
+    assert_eq!(j["edges"], 3);
+    assert_eq!(j["bounds"]["min"][0], 0.0);
+    assert_eq!(j["bounds"]["max"][0], 1.0);
+    assert_eq!(j["bounds"]["max"][1], 1.0);
+    assert_eq!(j["bounds"]["max"][2], 0.0);
+    // The groups list still covers the whole file.
+    assert_eq!(j["groups"].as_array().unwrap().len(), 2);
+    // A missing group is a usage error.
+    let out = run(&["info", path.to_str().unwrap(), "--group", "nope"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        stderr(&out).contains("group 'nope' not found"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn info_broken_exit_one_with_stderr_note() {
     let dir = scratch("info_broken_exit_one");
     let path = write(&dir, "broken.wrfm", BROKEN);
@@ -775,6 +831,28 @@ fn geometry_broken_exit_one() {
     fs::remove_dir_all(&dir).ok();
 }
 
+#[test]
+fn geometry_group_scopes_topology() {
+    let dir = scratch("geometry_group_scopes_topology");
+    let path = write(&dir, "two.wrfm", TWO_GROUPS);
+    let out = run(&["geometry", path.to_str().unwrap(), "--group", "body"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let j = stdout_json(&out);
+    // The body triangle: 3 vertices, 3 edges, bbox size [1,1,0].
+    assert_eq!(j["topology"]["vertices"], 3);
+    assert_eq!(j["topology"]["edges"], 3);
+    assert_eq!(j["bounds"]["size"], serde_json::json!([1.0, 1.0, 0.0]));
+    // A missing group is a usage error.
+    let out = run(&["geometry", path.to_str().unwrap(), "--group", "nope"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        stderr(&out).contains("group 'nope' not found"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
 // ---------------------------------------------------------------------------
 // query
 // ---------------------------------------------------------------------------
@@ -950,10 +1028,8 @@ fn query_distance() {
         "query",
         path.to_str().unwrap(),
         "distance",
-        "--from",
-        "0",
-        "--to",
-        "1",
+        "--range",
+        "0,1",
     ]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
     let j = stdout_json(&out);
@@ -973,10 +1049,8 @@ fn query_distance_out_of_range() {
         "query",
         path.to_str().unwrap(),
         "distance",
-        "--from",
-        "99",
-        "--to",
-        "1",
+        "--range",
+        "0,99",
     ]);
     assert_eq!(out.status.code(), Some(2));
     assert!(stdout(&out).is_empty());
@@ -992,10 +1066,10 @@ fn query_distance_out_of_range() {
 fn query_distance_missing_args() {
     let dir = scratch("query_distance_missing_args");
     let path = write(&dir, "cube.wrfm", CUBE);
-    let out = run(&["query", path.to_str().unwrap(), "distance", "--from", "0"]);
+    let out = run(&["query", path.to_str().unwrap(), "distance"]);
     assert_eq!(out.status.code(), Some(2));
     assert!(
-        stderr(&out).contains("requires --to"),
+        stderr(&out).contains("requires --range"),
         "stderr: {}",
         stderr(&out)
     );
@@ -1010,10 +1084,8 @@ fn query_connectivity_connected_and_not() {
         "query",
         path.to_str().unwrap(),
         "connectivity",
-        "--from",
-        "0",
-        "--to",
-        "2",
+        "--range",
+        "0,2",
     ]);
     // The chain fixture is L2-broken (dangling + isolated) -> exit 1, but
     // the JSON result is still emitted.
@@ -1023,10 +1095,8 @@ fn query_connectivity_connected_and_not() {
         "query",
         path.to_str().unwrap(),
         "connectivity",
-        "--from",
-        "0",
-        "--to",
-        "3",
+        "--range",
+        "0,3",
     ]);
     assert_eq!(no.status.code(), Some(1), "stderr: {}", stderr(&no));
     assert_eq!(stdout_json(&no)["connected"], false);
@@ -1035,10 +1105,8 @@ fn query_connectivity_connected_and_not() {
         "query",
         path.to_str().unwrap(),
         "connectivity",
-        "--from",
-        "3",
-        "--to",
-        "3",
+        "--range",
+        "3,3",
     ]);
     assert_eq!(stdout_json(&same)["connected"], true);
     fs::remove_dir_all(&dir).ok();
@@ -1339,10 +1407,10 @@ fn transform_pivot_center_rotate() {
 }
 
 #[test]
-fn transform_center_end_to_end() {
-    let dir = scratch("transform_center_end_to_end");
+fn transform_to_origin_end_to_end() {
+    let dir = scratch("transform_to_origin_end_to_end");
     let path = write(&dir, "cube13.wrfm", CUBE_X13);
-    let out = run(&["transform", path.to_str().unwrap(), "--center"]);
+    let out = run(&["transform", path.to_str().unwrap(), "--to-origin"]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
     let back = wrfm::WrfmModel::from_str("centered", &stdout(&out)).expect("output parses");
     let (min, max) = bbox_of(&back);
@@ -1765,6 +1833,68 @@ fn diff_bad_format_exit_two() {
     fs::remove_dir_all(&dir).ok();
 }
 
+#[test]
+fn diff_group_scopes_to_part() {
+    let dir = scratch("diff_group_scopes_to_part");
+    let a = write(&dir, "a.wrfm", TWO_GROUPS);
+    // Only the body triangle's vertex (1,0,0) moves to (2,0,0); head
+    // (which has its own "v 1 0 1") is untouched.
+    let b = write(&dir, "b.wrfm", &TWO_GROUPS.replace("v 1 0 0", "v 2 0 0"));
+    // Whole-model diff sees the moved vertex too.
+    let whole = run(&[
+        "diff",
+        a.to_str().unwrap(),
+        b.to_str().unwrap(),
+        "--format",
+        "json",
+    ]);
+    assert_eq!(whole.status.code(), Some(0), "stderr: {}", stderr(&whole));
+    assert_eq!(stdout_json(&whole)["vertices"]["moved_count"], 1);
+    // Scoped to the body part: still one moved vertex, 3 each side.
+    let out = run(&[
+        "diff",
+        a.to_str().unwrap(),
+        b.to_str().unwrap(),
+        "--group",
+        "body",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let j = stdout_json(&out);
+    assert_eq!(j["a"]["vertices"], 3);
+    assert_eq!(j["b"]["vertices"], 3);
+    assert_eq!(j["vertices"]["moved_count"], 1);
+    // Scoped to the head part: nothing moved.
+    let out = run(&[
+        "diff",
+        a.to_str().unwrap(),
+        b.to_str().unwrap(),
+        "--group",
+        "head",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert_eq!(stdout_json(&out)["vertices"]["moved_count"], 0);
+    // A group missing from EITHER side is a usage error (exit 2).
+    let c = write(&dir, "c.wrfm", CUBE);
+    let out = run(&[
+        "diff",
+        a.to_str().unwrap(),
+        c.to_str().unwrap(),
+        "--group",
+        "body",
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        stderr(&out).contains("group 'body' not found"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
 // ---------------------------------------------------------------------------
 // three-channel contract + pipelines
 // ---------------------------------------------------------------------------
@@ -1903,4 +2033,184 @@ fn help_mentions_format() {
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
     let so = stdout(&out);
     assert!(so.contains("wrfm format"), "stdout:\n{so}");
+}
+
+// ---------------------------------------------------------------------------
+// verify
+// ---------------------------------------------------------------------------
+
+#[test]
+fn verify_pass_exit_zero() {
+    let dir = scratch("verify_pass_exit_zero");
+    let path = write(&dir, "cube.wrfm", CUBE);
+    let out = run(&[
+        "verify",
+        path.to_str().unwrap(),
+        "--expect-size",
+        "1,1,1",
+        "--expect-closed",
+    ]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let v = stdout_json(&out);
+    assert_eq!(v["verdict"], "pass");
+    assert_eq!(v["summary"], "2 of 2 expectations met");
+    // A passing run reports nothing on stderr.
+    assert!(stderr(&out).is_empty(), "stderr: {}", stderr(&out));
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn verify_fail_exit_one() {
+    let dir = scratch("verify_fail_exit_one");
+    let path = write(&dir, "cube.wrfm", CUBE);
+    let out = run(&["verify", path.to_str().unwrap(), "--expect-size", "3,3,3"]);
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    let v = stdout_json(&out);
+    assert_eq!(v["verdict"], "fail");
+    let e = &v["expectations"][0];
+    assert_eq!(e["name"], "size");
+    assert_eq!(e["pass"], false);
+    assert_eq!(e["delta"], serde_json::json!([-2.0, -2.0, -2.0]));
+    let s = e["suggestion"].as_str().unwrap();
+    assert!(s.contains("--scale-x 3"), "suggestion: {s}");
+    // The fail summary is mirrored on stderr.
+    assert!(
+        stderr(&out).contains("[wrfm] verify: 0 of 1 expectations met"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn verify_no_expectations_exit_two() {
+    let dir = scratch("verify_no_expectations_exit_two");
+    let path = write(&dir, "cube.wrfm", CUBE);
+    let out = run(&["verify", path.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("needs at least one --expect-* flag"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn verify_parse_error_exit_two() {
+    let dir = scratch("verify_parse_error_exit_two");
+    let path = write(&dir, "cube.wrfm", CUBE);
+    let out = run(&[
+        "verify",
+        path.to_str().unwrap(),
+        "--expect-size",
+        "1,,2",
+    ]);
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("expect_size must be 'x,y,z'"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn verify_missing_file_exit_two() {
+    let dir = scratch("verify_missing_file_exit_two");
+    let missing = dir.join("nope.wrfm");
+    let out = run(&[
+        "verify",
+        missing.to_str().unwrap(),
+        "--expect-size",
+        "1,1,1",
+    ]);
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("cannot read"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn verify_symmetric_centered_cube_passes() {
+    let dir = scratch("verify_symmetric_centered_cube_passes");
+    let path = write(&dir, "ccube.wrfm", CUBE_CENTERED);
+    let out = run(&[
+        "verify",
+        path.to_str().unwrap(),
+        "--expect-size",
+        "2,2,2",
+        "--expect-closed",
+        "--expect-symmetric",
+        "x,y,z",
+    ]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let v = stdout_json(&out);
+    assert_eq!(v["verdict"], "pass");
+    assert_eq!(v["summary"], "5 of 5 expectations met");
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn verify_group_scopes_expectations() {
+    let dir = scratch("verify_group_scopes_expectations");
+    let path = write(&dir, "two.wrfm", TWO_GROUPS);
+    // size/center/closed/axis/symmetry apply to the body part only: the
+    // body triangle is [0,1]^2 at z=0, so size 1,1,0 passes...
+    let out = run(&[
+        "verify",
+        path.to_str().unwrap(),
+        "--group",
+        "body",
+        "--expect-size",
+        "1,1,0",
+    ]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let v = stdout_json(&out);
+    assert_eq!(v["verdict"], "pass");
+    // ...while the whole-model size 1,1,1 fails against the part.
+    let out = run(&[
+        "verify",
+        path.to_str().unwrap(),
+        "--group",
+        "body",
+        "--expect-size",
+        "1,1,1",
+    ]);
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    let v = stdout_json(&out);
+    assert_eq!(v["verdict"], "fail");
+    // --expect-groups still checks the FULL group list (head exists even
+    // though the expectations are scoped to the body part).
+    let out = run(&[
+        "verify",
+        path.to_str().unwrap(),
+        "--group",
+        "body",
+        "--expect-groups",
+        "head",
+    ]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let v = stdout_json(&out);
+    assert_eq!(v["verdict"], "pass");
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn verify_symmetric_off_center_cube_passes() {
+    // The [0,1]^3 CUBE is symmetric about its own bbox centre, so the
+    // symmetry expectation PASSES regardless of position — verify uses the
+    // centre-plane semantics (position-independent shape symmetry).
+    let dir = scratch("verify_symmetric_off_center_cube_passes");
+    let path = write(&dir, "cube.wrfm", CUBE);
+    let out = run(&["verify", path.to_str().unwrap(), "--expect-symmetric", "x"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let v = stdout_json(&out);
+    assert_eq!(v["verdict"], "pass");
+    assert_eq!(v["expectations"][0]["name"], "symmetric_x");
+    assert_eq!(v["expectations"][0]["pass"], true);
+    fs::remove_dir_all(&dir).ok();
 }

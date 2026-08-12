@@ -44,12 +44,12 @@ pub struct Transform {
  /// The point the transform is applied about (default origin).
  pub pivot: Pivot,
 /// Shorthand: pivot about the bbox centre AND translate by −centre, so the result's bbox centre lands at the origin (overrides `pivot`).
- pub center: bool,
+ pub to_origin: bool,
  /// Rotate the model's longest PCA principal axis onto this world axis.
  pub align: Option<AlignAxis>,
 /// Uniformly scale so the ORIGINAL model's largest bbox span equals `SIZE` (must be > 0). `None` = no normalize step.
  pub normalize: Option<f64>,
- /// Translation offset (applied last; `--center` appends −pivot here).
+ /// Translation offset (applied last; `--to-origin` appends −pivot here).
  pub translate: [f64; 3],
 /// Mirror axis: 0 = x (x -> -x), 1 = y, 2 = z (applied after the linear part, still in the `(v−P)` frame).
  pub mirror: Option<usize>,
@@ -71,7 +71,7 @@ impl Default for Transform {
  shear_xz: 0.0,
  shear_yz: 0.0,
  pivot: Pivot::Origin,
- center: false,
+ to_origin: false,
  align: None,
  normalize: None,
  translate: [0.0; 3],
@@ -202,9 +202,9 @@ fn align_rot(m: &Model, axis: AlignAxis) -> [[f64; 3]; 3] {
 
 /// Apply the transform to every vertex; edges (indices) are unchanged.
 pub fn apply(model: &Model, t: &Transform) -> Model {
- // 1. Pivot point; `--center` overrides it to the bbox centre and adds
+ // 1. Pivot point; `--to-origin` overrides it to the bbox centre and adds
  // `-P` to the final translation.
- let (p, t_extra) = if t.center {
+ let (p, t_extra) = if t.to_origin {
  let c = bbox_center(&model.vertices);
  (c, [-c[0], -c[1], -c[2]])
  } else {
@@ -617,7 +617,7 @@ mod tests {
  }
 
  // ------------------------------------------------------------------
- // pivot / center
+ // pivot / to_origin
  // ------------------------------------------------------------------
 
  #[test]
@@ -664,7 +664,7 @@ mod tests {
  #[test]
  fn center_moves_bbox_center_to_origin() {
  let t = Transform {
- center: true,
+ to_origin: true,
  ..Transform::default()
  };
  let out = apply(&cube_at_x_1_3(), &t);
@@ -725,7 +725,7 @@ mod tests {
  #[test]
  fn normalize_center_keeps_bbox_center() {
  let t = Transform {
- center: true,
+ to_origin: true,
  normalize: Some(1.0),
  ..Transform::default()
  };
