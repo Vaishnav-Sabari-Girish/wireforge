@@ -1,7 +1,10 @@
 use clap::Parser;
 use crossterm::{
     cursor::{Hide, Show},
-    event::{self, Event, KeyCode, KeyModifiers},
+    event::{
+        self, Event, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -19,7 +22,7 @@ use ratatui::style::Style;
 
 use ratatui_wireframe::model::Model;
 use std::{
-    collections::HashMap,
+    collections::HashSet,
     error::Error,
     io::{self, Read},
     path::{Path, PathBuf},
@@ -31,35 +34,27 @@ use wrfm::WrfmModel;
 
 mod reload;
 mod render;
+mod timer;
 mod view;
 use reload::{ReloadEvent, ReloadWatch};
+use timer::{TimerId, TimerScheduler};
 use view::ViewState;
 
 #[cfg(feature = "ratty")]
 use ratatui_ratty::{ObjectFormat, RattyGraphic, RattyGraphicSettings};
 
-// All speed constants below are dyadic fractions (denominator = power of
-// two), so every value is EXACTLY representable in binary floating point —
-// no rounding error. The numerators keep the ~1.3x translation / ~1.1x
-// rotation speedup over the upstream constants.
+// Speed constants are dyadic fractions (exact in binary) with ~1.3x
+// translation / ~1.1x rotation speedup over the upstream values.
 
 /// Smooth continuous rotation rate (radians per second) while a key is held.
 const ROT_RATE: f64 = 169.0 / 128.0;
 /// Smooth continuous translation rate: fraction of the model extent moved per second.
 const MOVE_RATE: f64 = 83.0 / 128.0;
-/// One-step applied on a fresh key press (a tap does exactly this and stops).
-const PRESS_ROT_STEP: f64 = 7.0 / 128.0;
-/// Tap translation step: fraction of the model extent.
-const PRESS_MOVE_FRACTION: f64 = 33.0 / 256.0;
 
 /// How long a hot-reload status line stays on screen before it is cleared
 const STATUS_TIMEOUT: Duration = Duration::from_secs(4);
 /// Auto-spin yaw rate (radians per second). 169/256 = 0.66015625 (~1.1x
 const SPIN_RATE: f64 = 169.0 / 256.0;
-/// A held key with no repeat for this long is treated as a tap.
-const TAP_TIMEOUT: Duration = Duration::from_millis(600);
-/// Once a hold is confirmed by a repeat, a gap this long means the key was
-const HOLD_TIMEOUT: Duration = Duration::from_millis(100);
 /// How often the idle loop re-checks the terminal size (resize fallback).
 const RESIZE_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 /// How long to let a file write settle before re-parsing after a change.
@@ -120,18 +115,11 @@ enum Motion {
     MoveBack,
 }
 
-/// Per-motion input state: `steady` means a repeat confirmed this is a hold
-#[derive(Debug, Clone, Copy)]
-struct MotionInput {
-    steady: bool,
-    last: Instant,
-}
-
 /// Map a key (with its modifiers) to a motion. Returns `None` for keys that
 fn motion_for(code: KeyCode, shift: bool) -> Option<Motion> {
     use KeyCode::*;
     Some(match code {
-        // Translation: Shift + arrows / hjkl (right/up), = / - (forward).
+        // Translation: Shift + ←→↑↓ / hjkl (right/up), = / - (forward).
         Left if shift => Motion::MoveLeft,
         Right if shift => Motion::MoveRight,
         Up if shift => Motion::MoveUp,
@@ -142,7 +130,7 @@ fn motion_for(code: KeyCode, shift: bool) -> Option<Motion> {
         Char('j') | Char('J') if shift => Motion::MoveDown,
         Char('=') | Char('+') => Motion::MoveForward,
         Char('-') => Motion::MoveBack,
-        // Rotation: arrows / hjkl (yaw, pitch), r / e (roll).
+        // Rotation: ←→↑↓ / hjkl (yaw, pitch), r / e (roll).
         Left | Char('h') => Motion::YawLeft,
         Right | Char('l') => Motion::YawRight,
         Up | Char('k') => Motion::PitchUp,
@@ -151,11 +139,6 @@ fn motion_for(code: KeyCode, shift: bool) -> Option<Motion> {
         Char('e') => Motion::RollMinus,
         _ => return None,
     })
-}
-
-/// The single press step for a tap (click feel, then stops). Translation
-fn press_step(view: &mut ViewState, m: Motion, scale: f64) {
-    apply_motion_step(view, m, PRESS_ROT_STEP, scale * PRESS_MOVE_FRACTION);
 }
 
 /// One frame of smooth continuous motion for a held key (model follows key).
@@ -175,10 +158,8 @@ fn apply_motion_step(view: &mut ViewState, m: Motion, rot: f64, mv: f64) {
         Motion::PitchDown => view.add_pitch(rot),
         Motion::RollPlus => view.roll -= rot,
         Motion::RollMinus => view.roll += rot,
-        // Pan translates the model directly in world X/Y: pan_x shifts it
-        // horizontally on screen, pan_y vertically, at any orientation. The
-        // rotation centre is the file origin, panned with the model
-        // (see view::project_point).
+        // Pan shifts the model in world X/Y at any orientation; the rotation
+        // centre is the panned file origin (see view::project_point).
         Motion::MoveLeft => view.pan_x -= mv,
         Motion::MoveRight => view.pan_x += mv,
         Motion::MoveUp => view.pan_y += mv,
@@ -257,10 +238,9 @@ fn probe_bytes(buf: &[u8]) -> Result<FileFormat, String> {
         return Ok(FileFormat::Wrfm);
     }
 
-    // Otherwise scan for obj markers. A wrfm-style `v`/`e` file WITHOUT the
-    // magic is NOT wrfm and NOT obj — it is unrecognized (the v1 breaking
-    // change): only `v` lines with no `e` line, or a real obj marker
-    // (`f` / `vt` / `vn`), route to obj.
+    // Otherwise scan for obj markers: a magic-less `v`/`e` file is
+    // unrecognized; only `v`-without-`e` or real obj markers (`f`/`vt`/`vn`)
+    // route to obj.
     let mut has_vertex = false;
     let mut has_wrfm_edge = false;
     let mut has_obj_marker = false;
@@ -514,13 +494,13 @@ const HELP: &[&str] = &[
     "=== wireforge keys ===",
     "",
     "Rotate:",
-    "  yaw left  <- / h       yaw right  -> / l",
-    "  pitch up  ^ / k        pitch down v / j",
+    "  yaw left  ← / h       yaw right  → / l",
+    "  pitch up  ↑ / k        pitch down ↓ / j",
     "  roll      r / e",
     "",
     "Move:",
-    "  left      Shift+<- / h  right     Shift+-> / l",
-    "  up        Shift+^ / k   down      Shift+v / j",
+    "  left      Shift+← / h  right     Shift+→ / l",
+    "  up        Shift+↑ / k   down      Shift+↓ / j",
     "  nearer    =             farther   -",
     "",
     "Keys:",
@@ -541,63 +521,6 @@ pub(crate) enum LoopEvent {
     Reload(ReloadEvent),
 }
 
-/// The timed behaviours the loop owns, driven by ONE scheduler.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TimerId {
-    /// Clear the transient hot-reload status line after [`STATUS_TIMEOUT`].
-    StatusExpiry,
-    /// Wake the idle loop at the earliest held-key deadline so a tap that
-    MotionTimeout,
-    /// mtime-poll fallback (non-Linux / inotify unavailable).
-    ReloadPoll,
-    /// Parse a reloaded file after the write-settle delay.
-    ReloadParse,
-    /// Fallback terminal-size check (see [`RESIZE_CHECK_INTERVAL`]): wakes
-    ResizeCheck,
-}
-
-/// One timer scheduler owned by the loop (a small ordered set of deadlines).
-struct TimerScheduler {
-    entries: Vec<(Instant, TimerId)>,
-}
-
-impl TimerScheduler {
-    fn new() -> Self {
-        TimerScheduler {
-            entries: Vec::new(),
-        }
-    }
-
-    /// Schedule `id` at `at`, replacing any existing entry for the same id
-    fn schedule(&mut self, id: TimerId, at: Instant) {
-        self.entries.retain(|(_, tid)| *tid != id);
-        self.entries.push((at, id));
-        self.entries.sort_by_key(|(at, _)| *at);
-    }
-
-    fn cancel(&mut self, id: TimerId) {
-        self.entries.retain(|(_, tid)| *tid != id);
-    }
-
-    fn earliest(&self) -> Option<Instant> {
-        self.entries.first().map(|(at, _)| *at)
-    }
-
-    /// Pop and return every timer whose deadline has passed.
-    fn fire_due(&mut self, now: Instant) -> Vec<TimerId> {
-        let mut due = Vec::new();
-        self.entries.retain(|(at, id)| {
-            if *at <= now {
-                due.push(*id);
-                false
-            } else {
-                true
-            }
-        });
-        due
-    }
-}
-
 /// All viewer state owned by the main loop.
 struct App {
     current: RenderMode,
@@ -605,7 +528,7 @@ struct App {
     one_shot: Option<String>,
     target_file: PathBuf,
     view: ViewState,
-    held: HashMap<Motion, MotionInput>,
+    held: HashSet<Motion>,
     auto_spin: bool,
     hud: Hud,
     show_axes: bool,
@@ -629,7 +552,7 @@ impl App {
             one_shot,
             target_file,
             view: ViewState::default(),
-            held: HashMap::new(),
+            held: HashSet::new(),
             auto_spin: false,
             hud: Hud::Collapsed,
             show_axes: true,
@@ -662,13 +585,17 @@ impl App {
         // Event::Resize is handled by the loop (it needs the Engine).
         if let Event::Key(key) = ev {
             let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-            let now = Instant::now();
+            // Kitty keyboard protocol: a Release event stops the motion immediately.
+            if key.kind == KeyEventKind::Release {
+                if let Some(m) = motion_for(key.code, shift) {
+                    self.held.remove(&m);
+                    self.dirty = true;
+                }
+                return false;
+            }
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => return true,
-                // One-shot keys: every press acts immediately — NO
-                // debounce, so a quick double-press registers both
-                // presses (a held key repeats on the terminal's
-                // auto-repeat instead of being swallowed).
+                // One-shot keys act immediately (no debounce).
                 KeyCode::Char('?') => {
                     self.hud = match self.hud {
                         Hud::Collapsed => Hud::Expanded,
@@ -708,22 +635,9 @@ impl App {
                 // Motion keys.
                 _ => {
                     if let Some(m) = motion_for(key.code, shift) {
-                        if let Some(st) = self.held.get_mut(&m) {
-                            // Auto-repeat: confirms a hold, back to smooth.
-                            st.steady = true;
-                            st.last = now;
-                        } else {
-                            // Fresh press: one tap step, wait for repeat.
-                            let ms = self.move_scale();
-                            press_step(&mut self.view, m, ms);
-                            self.held.insert(
-                                m,
-                                MotionInput {
-                                    steady: false,
-                                    last: now,
-                                },
-                            );
-                        }
+                        // Press/Repeat: the key is held. Continuous motion is applied by
+                        // update_held each frame with dt; Release is handled above.
+                        self.held.insert(m);
                         self.dirty = true;
                     }
                 }
@@ -733,33 +647,22 @@ impl App {
     }
 
     /// Advance held-motion state (tap -> hold -> release) and apply one
-    fn update_held(&mut self, now: Instant, dt: f64) {
+    /// Apply continuous motion to every held key each frame (dt-scaled).
+    /// Keys are added on Press/Repeat and removed on Release (Kitty protocol).
+    fn update_held(&mut self, dt: f64) {
         let move_scale = self.move_scale();
-        let mut stopped: Vec<Motion> = Vec::new();
-        for (m, st) in self.held.iter_mut() {
-            let timeout = if st.steady { HOLD_TIMEOUT } else { TAP_TIMEOUT };
-            if now.duration_since(st.last) > timeout {
-                stopped.push(*m);
-            } else if st.steady {
-                continuous_step(&mut self.view, *m, move_scale, dt);
-            }
-        }
-        for m in stopped {
-            self.held.remove(&m);
+        for m in &self.held {
+            continuous_step(&mut self.view, *m, move_scale, dt);
         }
     }
 
     /// Handle a timer that fired. Returns true when the screen changed.
-    fn handle_timer(&mut self, id: TimerId, now: Instant) -> bool {
+    fn handle_timer(&mut self, id: TimerId, _now: Instant) -> bool {
         match id {
             TimerId::StatusExpiry => {
                 self.status_msg.clear();
                 self.dirty = true;
                 true
-            }
-            TimerId::MotionTimeout => {
-                self.update_held(now, 0.0);
-                false
             }
             TimerId::ReloadPoll | TimerId::ReloadParse | TimerId::ResizeCheck => false,
         }
@@ -840,10 +743,8 @@ fn handle_reload_event_loop(
 ) -> bool {
     match event {
         ReloadEvent::Changed => {
-            // Let a half-written file settle before re-parsing it. The loop
-            // schedules the parse (ReloadParse) instead of sleeping, so the
-            // loop stays non-blocking. A failed parse keeps the
-            // last good model and retries on the next event.
+            // Settle half-written files; the loop schedules ReloadParse
+            // (non-blocking) and keeps the last good model on failure.
             timers.schedule(TimerId::ReloadParse, Instant::now() + SETTLE_DELAY);
             false
         }
@@ -890,19 +791,6 @@ fn check_resize(app: &mut App, engine: &mut Engine, timers: &mut TimerScheduler)
         }
     }
     timers.schedule(TimerId::ResizeCheck, Instant::now() + RESIZE_CHECK_INTERVAL);
-}
-
-/// Keep the idle loop's motion deadline in sync with the held-key state.
-fn sync_motion_timer(app: &App, timers: &mut TimerScheduler) {
-    timers.cancel(TimerId::MotionTimeout);
-    if let Some(deadline) = app
-        .held
-        .values()
-        .map(|st| st.last + if st.steady { HOLD_TIMEOUT } else { TAP_TIMEOUT })
-        .min()
-    {
-        timers.schedule(TimerId::MotionTimeout, deadline);
-    }
 }
 
 /// Copy rows `[y0, y1)` of the HUD buffer into the screen (chars + fg).
@@ -1096,10 +984,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
     let target_file = args.file.clone();
 
-    // Input mode ( a regular file loads by probing its
-    // first PROBE_BYTES and keeps the event-driven hot-reload; `-` (stdin)
-    // and FIFO paths (`<( cmd )`) read the whole stream ONCE, probe the
-    // BUFFER, and are one-shot previews with NO hot-reload.
+    // Regular files probe PROBE_BYTES and keep hot-reload; `-`/FIFO read the
+    // whole stream once as one-shot previews (no hot-reload).
     let is_stdin = target_file == Path::new("-");
     let is_fifo = !is_stdin && is_fifo_path(&target_file);
     // Row 0 label for one-shot mode ("stdin preview (no hot-reload)" or the
@@ -1186,14 +1072,20 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    // Mouse capture is deliberately OFF so the terminal's native
-    // mouse drag-selection keeps working (it was enabled in commit 9becd88,
-    // which killed selection; removing it restores the pre-9becd88 behavior).
-    // Hide the terminal cursor for the whole session: the old braille path
-    // went through ratatui's `Terminal`, which hides the cursor after every
-    // frame; the L2 direct-write present never did, so without this the
-    // visible cursor would jump to every changed cell on every redraw.
+    // Mouse capture stays OFF (native drag-selection) and the cursor is
+    // hidden for the session (the L2 direct-write present does not hide it).
     execute!(stdout, EnterAlternateScreen, Hide)?;
+    // Enable the Kitty keyboard protocol for Press/Repeat/Release key events.
+    // Keyboard enhancement (kitty protocol) is optional: terminals that don't
+    // support it (e.g. the legacy Windows console API) run without it.
+    let _ = execute!(
+        stdout,
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+                | KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        )
+    );
 
     // Input thread: block in the kernel on the tty, push events through the
     // channel. Started after raw mode so the tty is in the expected state.
@@ -1227,7 +1119,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         // The two SDL-style loop modes: animating = drain +
         // update + render as fast as possible, no waiting; idle = block in
         // the channel until the earliest timer or an event.
-        let animating = app.auto_spin || app.held.values().any(|st| st.steady);
+        let animating = app.auto_spin || !app.held.is_empty();
 
         if animating {
             // Drain the event backlog (no waiting, no cap).
@@ -1259,7 +1151,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
             // One frame of smooth motion + tap/hold/release timeouts.
-            app.update_held(now, dt);
+            app.update_held(dt);
             if app.auto_spin {
                 // Space auto-spin: rotate the model around its own (local) Y
                 // axis (view::ViewState::spin_local) — a globe turning in
@@ -1267,12 +1159,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 app.view.spin_local(SPIN_RATE * dt);
                 app.view.normalize();
             }
-            sync_motion_timer(&app, &mut timers);
             render_frame(&mut app, &mut engine, &mut stdout, &mut terminal)?;
         } else {
             // Idle: block until the earliest pending timer or an event —
             // the thread is parked in the kernel (0% CPU).
-            sync_motion_timer(&app, &mut timers);
             let wait = timers
                 .earliest()
                 .map(|d| d.saturating_duration_since(Instant::now()));
@@ -1317,7 +1207,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             // Clean up stale held entries (a tap that never confirmed, or a
             // released hold) without spinning.
-            app.update_held(now, dt);
+            app.update_held(dt);
             // Redraw only when something actually changed (dirty-flag).
             if app.dirty {
                 render_frame(&mut app, &mut engine, &mut stdout, &mut terminal)?;
@@ -1326,6 +1216,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
+    let _ = execute!(stdout, PopKeyboardEnhancementFlags);
     execute!(stdout, Show, LeaveAlternateScreen)?;
     disable_raw_mode()?;
     Ok(())
@@ -1342,8 +1233,6 @@ mod tests {
     fn speed_constants_are_dyadic_and_exact() {
         assert_eq!(ROT_RATE * 128.0, 169.0);
         assert_eq!(MOVE_RATE * 128.0, 83.0);
-        assert_eq!(PRESS_ROT_STEP * 128.0, 7.0);
-        assert_eq!(PRESS_MOVE_FRACTION * 256.0, 33.0);
         assert_eq!(SPIN_RATE * 256.0, 169.0);
     }
 
@@ -1399,12 +1288,8 @@ mod tests {
 
     #[test]
     fn open_detection_wrfm_with_garbage_is_unrecognized() {
-        // A `.wrfm` holding garbage must be rejected as "unrecognized" —
-        // never an Ok empty model (the old extension-only routing silently
-        // parsed garbage into a blank screen). The magic line decides the
-        // route: a garbage FIRST line (no magic) is unrecognized, while a
-        // file STARTING with `wrfm 1` is a LOAD (parse) error, NOT
-        // "unrecognized" .
+        // Garbage is "unrecognized" (never an Ok empty model); a file
+        // starting with `wrfm 1` is a parse (load) error instead.
         let p = temp_wrfm("garbage", "this is not a wireframe\nno markers here\n");
         let err = load_model(&p).err().expect("garbage must fail to load");
         assert!(
@@ -1504,10 +1389,8 @@ mod tests {
 
     #[test]
     fn load_model_rejects_half_written_file() {
-        // Half-written v1 .wrfm (truncated vertex line): it still carries
-        // the magic + `v `/`e ` markers, so it probes as wrfm and the parser
-        // must fail — the caller keeps the last good model instead of
-        // crashing.
+        // Truncated v1 .wrfm still carries magic + `v`/`e` markers: the
+        // parser fails and the caller keeps the last good model.
         let p = temp_wrfm(
             "half",
             "wrfm 1\nvertices 2   edges 1\n\nv 0 0 0\nv 1 1\ne 0 1\n",
@@ -1527,11 +1410,8 @@ mod tests {
 
     #[test]
     fn load_model_error_reports_line() {
-        // The TUI must surface the parser's structured error: the message
-        // carries the line number and the offending source line, so the
-        // user/agent can locate the problem.
-        // The magic routes the content to the wrfm parser (a bare
-        // "v 1.0 2.0 abc" line alone would probe as obj).
+        // Surface the parser's structured error (line number + offending
+        // line); magic routes content to the wrfm parser.
         let p = temp_wrfm(
             "bad-num",
             "wrfm 1\nvertices 1   edges 1\n\nv 1.0 2.0 abc\ne 0 0\n",
@@ -1936,43 +1816,6 @@ mod tests {
     // ---------- event loop ( ----------
 
     #[test]
-    fn timer_scheduler_fires_in_order() {
-        let mut t = TimerScheduler::new();
-        let now = Instant::now();
-        assert_eq!(t.earliest(), None, "empty scheduler has no deadline");
-        t.schedule(TimerId::StatusExpiry, now + Duration::from_millis(4000));
-        t.schedule(TimerId::MotionTimeout, now + Duration::from_millis(100));
-        assert_eq!(t.earliest(), Some(now + Duration::from_millis(100)));
-        // Nothing due yet.
-        assert!(t.fire_due(now + Duration::from_millis(50)).is_empty());
-        // The motion timer fires first.
-        let due = t.fire_due(now + Duration::from_millis(100));
-        assert_eq!(due, vec![TimerId::MotionTimeout]);
-        // The status timer remains.
-        assert_eq!(t.earliest(), Some(now + Duration::from_millis(4000)));
-        let due2 = t.fire_due(now + Duration::from_secs(10));
-        assert_eq!(due2, vec![TimerId::StatusExpiry]);
-        assert_eq!(t.earliest(), None);
-    }
-
-    #[test]
-    fn timer_scheduler_same_id_replaces() {
-        let mut t = TimerScheduler::new();
-        let now = Instant::now();
-        t.schedule(TimerId::StatusExpiry, now + Duration::from_millis(4000));
-        // Re-showing a status line replaces the deadline.
-        t.schedule(TimerId::StatusExpiry, now + Duration::from_millis(8000));
-        let due = t.fire_due(now + Duration::from_secs(5));
-        assert!(due.is_empty(), "old deadline must be replaced");
-        let due = t.fire_due(now + Duration::from_secs(9));
-        assert_eq!(due, vec![TimerId::StatusExpiry]);
-        // Cancel removes the entry entirely.
-        t.schedule(TimerId::MotionTimeout, now + Duration::from_millis(1));
-        t.cancel(TimerId::MotionTimeout);
-        assert_eq!(t.earliest(), None);
-    }
-
-    #[test]
     fn app_handle_input_toggles() {
         let mut app = App::new(
             RenderMode::Braille(Model {
@@ -2038,7 +1881,7 @@ mod tests {
     }
 
     #[test]
-    fn app_handle_input_motion_tap_applies_one_step() {
+    fn app_handle_input_motion_press_starts_continuous() {
         let mut app = App::new(
             RenderMode::Braille(Model {
                 vertices: vec![(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)],
@@ -2050,25 +1893,35 @@ mod tests {
         );
         app.view.fit_to(app.current.braille().unwrap());
         let yaw0 = app.view.yaw;
-        // A fresh right-arrow press applies one tap step.
+        // Press: enter continuous state (motion applied by update_held)
         app.handle_input(Event::Key(KeyEvent::new(
             KeyCode::Right,
             KeyModifiers::NONE,
         )));
-        assert_ne!(app.view.yaw, yaw0, "tap must rotate the view");
-        assert_eq!(app.held.len(), 1, "the tap waits for an auto-repeat");
-        assert!(!app.held.values().next().unwrap().steady);
-        // A repeat confirms the hold (smooth motion from then on).
+        assert!(
+            app.held.contains(&Motion::YawRight),
+            "press must enter continuous state"
+        );
+        // Auto-repeat: must not add a new entry
         app.handle_input(Event::Key(KeyEvent::new(
             KeyCode::Right,
             KeyModifiers::NONE,
         )));
-        let st = app.held.get(&Motion::YawRight).unwrap();
-        assert!(st.steady, "repeat confirms a hold");
+        assert_eq!(
+            app.held.len(),
+            1,
+            "auto-repeat must not accumulate held entries"
+        );
+        // Continuous motion is applied by update_held
+        app.update_held(0.016);
+        assert_ne!(
+            app.view.yaw, yaw0,
+            "held key must rotate continuously immediately"
+        );
     }
 
     #[test]
-    fn app_update_held_expires_stale_entries() {
+    fn app_key_release_removes_held_entry() {
         let mut app = App::new(
             RenderMode::Braille(Model {
                 vertices: vec![(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)],
@@ -2078,53 +1931,14 @@ mod tests {
             None,
             PathBuf::from("cube.wrfm"),
         );
-        // A tap that never confirms a hold is removed after TAP_TIMEOUT.
-        let now = Instant::now();
-        app.handle_input(Event::Key(KeyEvent::new(
-            KeyCode::Right,
-            KeyModifiers::NONE,
-        )));
+        // Press -> held; Release -> removed immediately (Kitty protocol).
+        let press = Event::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        app.handle_input(press);
         assert_eq!(app.held.len(), 1);
-        app.update_held(now + TAP_TIMEOUT + Duration::from_millis(1), 0.016);
-        assert!(app.held.is_empty(), "stale tap must expire");
-        // A confirmed hold is removed after HOLD_TIMEOUT once repeats stop.
-        app.handle_input(Event::Key(KeyEvent::new(
-            KeyCode::Right,
-            KeyModifiers::NONE,
-        )));
-        app.handle_input(Event::Key(KeyEvent::new(
-            KeyCode::Right,
-            KeyModifiers::NONE,
-        )));
-        assert!(app.held.get(&Motion::YawRight).unwrap().steady);
-        app.update_held(now + HOLD_TIMEOUT + Duration::from_millis(1), 0.016);
-        assert!(app.held.is_empty(), "stale hold must expire");
-    }
-
-    #[test]
-    fn sync_motion_timer_tracks_held_deadlines() {
-        let mut timers = TimerScheduler::new();
-        let mut app = App::new(
-            RenderMode::Braille(Model {
-                vertices: vec![(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)],
-                edges: vec![(0, 1)],
-            }),
-            "cube".to_string(),
-            None,
-            PathBuf::from("cube.wrfm"),
-        );
-        sync_motion_timer(&app, &mut timers);
-        assert_eq!(timers.earliest(), None, "no held keys -> no motion timer");
-        app.handle_input(Event::Key(KeyEvent::new(
-            KeyCode::Right,
-            KeyModifiers::NONE,
-        )));
-        sync_motion_timer(&app, &mut timers);
-        let deadline = timers.earliest().expect("held tap must arm a timer");
-        assert!(deadline > Instant::now());
-        // The deadline equals last + TAP_TIMEOUT.
-        let last = app.held.get(&Motion::YawRight).unwrap().last;
-        assert_eq!(deadline, last + TAP_TIMEOUT);
+        let mut release = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        release.kind = KeyEventKind::Release;
+        app.handle_input(Event::Key(release));
+        assert!(app.held.is_empty(), "release must stop motion immediately");
     }
 
     #[test]
@@ -2160,10 +1974,7 @@ mod tests {
         assert!(missing);
         assert!(app.status_msg.contains("removed"));
         assert!(app.reload_record.is_some());
-        // The status expiry timer is now the earliest (SETTLE_DELAY < 4 s
-        // was replaced by the status timer? No: both are pending; the
-        // earliest is the SETTLE_DELAY parse. Clear it to check the status
-        // timer exists.
+        // Clear the pending parse so the status-expiry timer is the earliest.
         timers.cancel(TimerId::ReloadParse);
         assert!(timers.earliest().is_some(), "status expiry must be armed");
         assert!(app.dirty);

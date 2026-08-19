@@ -1,7 +1,12 @@
 use ratatui_wireframe::model::Model;
+use rayon::prelude::*;
 
 /// Vertical field of view in degrees.
 pub const FOV_DEG: f64 = 60.0;
+
+/// Above this vertex count, projection and bounds switch to the rayon
+/// parallel path (measured crossover ~72k; typical models stay serial).
+const PARALLEL_THRESHOLD: usize = 100_000;
 
 /// Auto-fit headroom: the model fills 1/FIT_MARGIN of the screen height.
 pub const FIT_MARGIN: f64 = 2.0;
@@ -137,17 +142,39 @@ impl ViewState {
 
 /// Bounding box of the model: `(min, max)` corners.
 pub fn bounds(m: &Model) -> ([f64; 3], [f64; 3]) {
-    let mut min = [f64::INFINITY; 3];
-    let mut max = [f64::NEG_INFINITY; 3];
-    for &(x, y, z) in &m.vertices {
-        min[0] = min[0].min(x);
-        min[1] = min[1].min(y);
-        min[2] = min[2].min(z);
-        max[0] = max[0].max(x);
-        max[1] = max[1].max(y);
-        max[2] = max[2].max(z);
+    if m.vertices.len() >= PARALLEL_THRESHOLD {
+        // rayon: per-vertex min/max is an independent reduction (large models).
+        let init = || ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+        m.vertices
+            .par_iter()
+            .fold(init, |(mut mn, mut mx), &(x, y, z)| {
+                mn[0] = mn[0].min(x);
+                mn[1] = mn[1].min(y);
+                mn[2] = mn[2].min(z);
+                mx[0] = mx[0].max(x);
+                mx[1] = mx[1].max(y);
+                mx[2] = mx[2].max(z);
+                (mn, mx)
+            })
+            .reduce(init, |(a1, a2), (b1, b2)| {
+                (
+                    [a1[0].min(b1[0]), a1[1].min(b1[1]), a1[2].min(b1[2])],
+                    [a2[0].max(b2[0]), a2[1].max(b2[1]), a2[2].max(b2[2])],
+                )
+            })
+    } else {
+        let mut min = [f64::INFINITY; 3];
+        let mut max = [f64::NEG_INFINITY; 3];
+        for &(x, y, z) in &m.vertices {
+            min[0] = min[0].min(x);
+            min[1] = min[1].min(y);
+            min[2] = min[2].min(z);
+            max[0] = max[0].max(x);
+            max[1] = max[1].max(y);
+            max[2] = max[2].max(z);
+        }
+        (min, max)
     }
-    (min, max)
 }
 
 /// The model's geometric-mean length (cbrt of the bounding-box dimensions).
@@ -178,12 +205,8 @@ pub fn project_point(p: (f64, f64, f64), v: &ViewState, px_h: usize) -> Option<(
         return None;
     }
 
-    // Roll around the view axis through the model's pivot (the panned
-    // origin): rotate the camera-frame (rx, ry) around (pan_x, pan_y) before
-    // the divide, so rolling spins the model in place exactly like yaw/pitch
-    // do - the pivot stays fixed on screen even after panning. At pan = 0
-    // this reduces to rotating the projected point around the screen centre,
-    // which was the previous (correct-at-pan-0) behaviour.
+    // Roll the camera frame about the panned origin so the pivot stays fixed
+    // (reduces to screen-centre roll at pan = 0).
     let (sr, cr) = v.roll.sin_cos();
     let (dx, dy) = (rx - v.pan_x, ry - v.pan_y);
     let (rxr, ryr) = (v.pan_x + dx * cr - dy * sr, v.pan_y + dx * sr + dy * cr);
@@ -204,6 +227,30 @@ pub fn project_batch(
     let px = v.pan_x;
     let py = v.pan_y;
     let dist = v.dist;
+    if verts.len() >= PARALLEL_THRESHOLD {
+        // rayon: vertex projections are independent of each other (the render vertex bottleneck).
+        // Map each vertex to its result (pure function, no shared mutable state), then write back in order.
+        verts
+            .par_iter()
+            .zip(out.par_iter_mut())
+            .zip(ok.par_iter_mut())
+            .for_each(|((p, o), ok_slot)| {
+                let rx = r[0][0] * p.0 + r[0][1] * p.1 + r[0][2] * p.2 + px;
+                let ry = r[1][0] * p.0 + r[1][1] * p.1 + r[1][2] * p.2 + py;
+                let rz = r[2][0] * p.0 + r[2][1] * p.1 + r[2][2] * p.2;
+                let z = dist - rz;
+                if z <= 0.1 {
+                    *ok_slot = false;
+                    return;
+                }
+                let (dx, dy) = (rx - px, ry - py);
+                let rxr = px + dx * cr - dy * sr;
+                let ryr = py + dx * sr + dy * cr;
+                *o = [f * rxr / z, f * ryr / z];
+                *ok_slot = true;
+            });
+        return;
+    }
     for (i, p) in verts.iter().enumerate() {
         let rx = r[0][0] * p.0 + r[0][1] * p.1 + r[0][2] * p.2 + px;
         let ry = r[1][0] * p.0 + r[1][1] * p.1 + r[1][2] * p.2 + py;
@@ -240,6 +287,31 @@ pub fn project_batch_f32(
     let px = v.pan_x as f32;
     let py = v.pan_y as f32;
     let dist = v.dist as f32;
+    if verts.len() >= PARALLEL_THRESHOLD {
+        verts
+            .par_iter()
+            .zip(out.par_iter_mut())
+            .zip(ok.par_iter_mut())
+            .for_each(|((p, o), ok_slot)| {
+                let p0 = p.0 as f32;
+                let p1 = p.1 as f32;
+                let p2 = p.2 as f32;
+                let rx = r[0][0] * p0 + r[0][1] * p1 + r[0][2] * p2 + px;
+                let ry = r[1][0] * p0 + r[1][1] * p1 + r[1][2] * p2 + py;
+                let rz = r[2][0] * p0 + r[2][1] * p1 + r[2][2] * p2;
+                let z = dist - rz;
+                if z <= 0.1 {
+                    *ok_slot = false;
+                    return;
+                }
+                let (dx, dy) = (rx - px, ry - py);
+                let rxr = px + dx * cr - dy * sr;
+                let ryr = py + dx * sr + dy * cr;
+                *o = [f * rxr / z, f * ryr / z];
+                *ok_slot = true;
+            });
+        return;
+    }
     for (i, p) in verts.iter().enumerate() {
         let p0 = p.0 as f32;
         let p1 = p.1 as f32;
@@ -402,10 +474,7 @@ mod tests {
 
     #[test]
     fn rotation_centre_is_file_origin() {
-        // The rotation centre is the wrfm file's coordinate origin (0,0,0),
-        // not the bounding-box centre. An off-centre box must still be
-        // rotated around the origin: the origin itself projects to the view
-        // centre, and a yaw turn swings the whole model around it.
+        // Rotation is about the file origin (0,0,0), not the box centre.
         let m = Model {
             vertices: vec![
                 (9.0, 19.0, -1.0),
@@ -496,10 +565,8 @@ mod tests {
 
     #[test]
     fn yaw_is_world_frame_at_pitch_90() {
-        // When the model's Y axis points at the viewer (pitch = 90), yawing
-        // must still turn the model around the world vertical axis (a
-        // turntable spin) - the model Y axis swings toward screen-right -
-        // instead of photo-spinning around the model's own Y axis.
+        // Yaw is a world-frame turntable even at pitch = 90, not a spin
+        // about the model's own Y axis.
         let mut v = view();
         v.add_pitch(90.0f64.to_radians());
         // Model Y axis points at the camera before yawing: it projects to the
@@ -527,12 +594,8 @@ mod tests {
 
     #[test]
     fn local_spin_rotates_around_model_y_axis() {
-        // The Space auto-spin must spin the model around its own (local) Y
-        // axis, not the world vertical axis: at pitch 90 the model's Y axis
-        // points at the camera and stays there under local spin (the model
-        // rotates on its own axle), while a point off the axis moves.
-        // This is the counterpart to `yaw_is_world_frame_at_pitch_90`: the
-        // arrow-key yaw is a world-frame turntable, the auto-spin is local.
+        // Space auto-spin is about the model's own (local) Y axis, the
+        // opposite of arrow-key yaw (world-frame; see yaw_is_world_frame_at_pitch_90).
         let mut v = view();
         v.add_pitch(90.0f64.to_radians());
         let (y0x, y0y) = project_point((0.0, 1.0, 0.0), &v, 100).unwrap();
@@ -618,6 +681,75 @@ mod tests {
         assert!(
             near > far,
             "zooming in should enlarge the projection, far={far} near={near}"
+        );
+    }
+
+    #[test]
+    fn parallel_projection_and_bounds_match_serial() {
+        // 110k verts: exercises the parallel path (>= PARALLEL_THRESHOLD).
+        let verts: Vec<(f64, f64, f64)> = (0..110_000)
+            .map(|i| {
+                let t = i as f64;
+                (t % 100.0, (t * 1.7) % 100.0, (t * 0.3) % 100.0)
+            })
+            .collect();
+        let model = Model {
+            vertices: verts.clone(),
+            edges: vec![],
+        };
+        let v = ViewState::default();
+
+        // bounds: parallel must match the serial reduction exactly.
+        let b_par = bounds(&model);
+        let b_ser = {
+            let mut min = [f64::INFINITY; 3];
+            let mut max = [f64::NEG_INFINITY; 3];
+            for &(x, y, z) in &verts {
+                min[0] = min[0].min(x);
+                min[1] = min[1].min(y);
+                min[2] = min[2].min(z);
+                max[0] = max[0].max(x);
+                max[1] = max[1].max(y);
+                max[2] = max[2].max(z);
+            }
+            (min, max)
+        };
+        assert_eq!(b_par, b_ser, "parallel bounds must match serial");
+
+        // projection: parallel (project_batch) vs a serial reference, bitwise.
+        let mut out_par = vec![[0.0; 2]; verts.len()];
+        let mut ok_par = vec![false; verts.len()];
+        project_batch(&verts, &v, 120, &mut out_par, &mut ok_par);
+        let mut out_ser = vec![[0.0; 2]; verts.len()];
+        let mut ok_ser = vec![false; verts.len()];
+        let f = (120.0 / 2.0) / (FOV_DEG / 2.0).to_radians().tan();
+        let (sr, cr) = v.roll.sin_cos();
+        let r = v.rot;
+        let px = v.pan_x;
+        let py = v.pan_y;
+        let dist = v.dist;
+        for (i, p) in verts.iter().enumerate() {
+            let rx = r[0][0] * p.0 + r[0][1] * p.1 + r[0][2] * p.2 + px;
+            let ry = r[1][0] * p.0 + r[1][1] * p.1 + r[1][2] * p.2 + py;
+            let rz = r[2][0] * p.0 + r[2][1] * p.1 + r[2][2] * p.2;
+            let z = dist - rz;
+            if z <= 0.1 {
+                ok_ser[i] = false;
+                continue;
+            }
+            let (dx, dy) = (rx - px, ry - py);
+            let rxr = px + dx * cr - dy * sr;
+            let ryr = py + dx * sr + dy * cr;
+            out_ser[i] = [f * rxr / z, f * ryr / z];
+            ok_ser[i] = true;
+        }
+        assert_eq!(
+            out_par, out_ser,
+            "parallel projection output must match serial bitwise"
+        );
+        assert_eq!(
+            ok_par, ok_ser,
+            "parallel projection ok flags must match serial"
         );
     }
 }
