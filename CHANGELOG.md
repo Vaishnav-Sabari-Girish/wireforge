@@ -14,6 +14,16 @@
 - **(wrfm)** .wrfm v1 format — magic line, counts header, groups, structured errors
 
 
+### :zap: Performance
+
+- Parallel projection/bounds, timer module, unified motion
+
+
+### :art: Styling
+
+- **(hud)** Revert help overlay arrows to ASCII for terminal compatibility
+
+
 ## v0.6.0 - 2026-06-13
 
 
