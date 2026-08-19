@@ -119,7 +119,7 @@ enum Motion {
 fn motion_for(code: KeyCode, shift: bool) -> Option<Motion> {
     use KeyCode::*;
     Some(match code {
-        // Translation: Shift + ←→↑↓ / hjkl (right/up), = / - (forward).
+        // Translation: Shift + arrows / hjkl (right/up), = / - (forward).
         Left if shift => Motion::MoveLeft,
         Right if shift => Motion::MoveRight,
         Up if shift => Motion::MoveUp,
@@ -130,7 +130,7 @@ fn motion_for(code: KeyCode, shift: bool) -> Option<Motion> {
         Char('j') | Char('J') if shift => Motion::MoveDown,
         Char('=') | Char('+') => Motion::MoveForward,
         Char('-') => Motion::MoveBack,
-        // Rotation: ←→↑↓ / hjkl (yaw, pitch), r / e (roll).
+        // Rotation: arrows / hjkl (yaw, pitch), r / e (roll).
         Left | Char('h') => Motion::YawLeft,
         Right | Char('l') => Motion::YawRight,
         Up | Char('k') => Motion::PitchUp,
@@ -494,13 +494,13 @@ const HELP: &[&str] = &[
     "=== wireforge keys ===",
     "",
     "Rotate:",
-    "  yaw left  ← / h       yaw right  → / l",
-    "  pitch up  ↑ / k        pitch down ↓ / j",
+    "  yaw left  <- / h       yaw right  -> / l",
+    "  pitch up  ^ / k        pitch down v / j",
     "  roll      r / e",
     "",
     "Move:",
-    "  left      Shift+← / h  right     Shift+→ / l",
-    "  up        Shift+↑ / k   down      Shift+↓ / j",
+    "  left      Shift+<- / h  right     Shift+-> / l",
+    "  up        Shift+^ / k   down      Shift+v / j",
     "  nearer    =             farther   -",
     "",
     "Keys:",
