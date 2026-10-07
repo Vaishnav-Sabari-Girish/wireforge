@@ -3,17 +3,21 @@
 //! contract, so these tests assert EXIT CODES and stream purity, not just
 //! output text.
 //!
-//! Exit codes: 0 = ok/warn (result on stdout) · 1 = result produced but L2
-//! check `broken` · 2 = no result (L1 parse / usage / I/O / unknown
-//! argument). stdout carries the pure result; stderr carries `[wrfm]
-//! check:` diagnostics (never mixed into stdout).
+//! Exit codes — FOUR tiers, larger = more severe: 0 = ok (clean result /
+//! verify pass) · 1 = warn (a warning-level health issue; `check` only) ·
+//! 2 = broken (repair required: `check` broken, an unmet `verify`
+//! declaration, or `--strict` upgrading a warn) · 3 = no result (L1 parse /
+//! usage / I/O / unknown argument — clap's own argument errors are mapped
+//! onto 3 as well). stdout carries the pure result;
+//! stderr carries diagnostics and errors only — never a health note, never
+//! mixed into stdout (the verdict travels on the exit code).
 //!
 //! Fixtures are FORMAT.md v1: a `wrfm 1` magic line and a
 //! `vertices <V>   edges <M>` counts header.
 
 use serde_json::Value;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
@@ -50,7 +54,7 @@ e 3 7
 
 /// A valid v1 file with two groups: `body` (global vertices 0..3, a
 /// triangle) and `head` (3..6, a triangle) — 6 vertices, 6 edges, every
-/// vertex degree 2 (a `warn`-level health verdict, so these commands exit 0
+/// vertex degree 2 (a `warn`-level health verdict, so these commands exit 1
 /// and only print a stderr note).
 const TWO_GROUPS: &str = "\
 wrfm 1
@@ -444,11 +448,11 @@ fn check_warn_exit_one() {
 }
 
 #[test]
-fn check_broken_exit_one() {
-    let dir = scratch("check_broken_exit_one");
+fn check_broken_exit_two() {
+    let dir = scratch("check_broken_exit_two");
     let path = write(&dir, "broken.wrfm", BROKEN);
     let out = run(&["check", path.to_str().unwrap()]);
-    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
     let so = stdout(&out);
     assert!(
         so.starts_with("broken: broken (8 vertices, 13 edges)"),
@@ -460,16 +464,16 @@ fn check_broken_exit_one() {
 }
 
 #[test]
-fn check_parse_error_exit_two() {
-    // NEW contract (PLAN §3): L1 parse failure → exit 2, no stdout result.
-    let dir = scratch("check_parse_error_exit_two");
+fn check_parse_error_exit_three() {
+    // NEW contract: L1 parse failure → exit 3 (no result), no stdout result.
+    let dir = scratch("check_parse_error_exit_three");
     let path = write(
         &dir,
         "bad.wrfm",
         "wrfm 1\nvertices 1   edges 0\n\nv 1.0 2.0 abc\n",
     );
     let out = run(&["check", path.to_str().unwrap()]);
-    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert_eq!(out.status.code(), Some(3), "stderr: {}", stderr(&out));
     assert!(stdout(&out).is_empty(), "no result on L1 failure");
     let se = stderr(&out);
     assert!(se.contains("line") && se.contains("column"), "stderr: {se}");
@@ -477,16 +481,16 @@ fn check_parse_error_exit_two() {
 }
 
 #[test]
-fn check_out_of_range_exit_two() {
-    // Out-of-range edges are L1 (parser) failures now → exit 2.
-    let dir = scratch("check_out_of_range_exit_two");
+fn check_out_of_range_exit_three() {
+    // Out-of-range edges are L1 (parser) failures now → exit 3.
+    let dir = scratch("check_out_of_range_exit_three");
     let path = write(
         &dir,
         "oor.wrfm",
         "wrfm 1\nvertices 2   edges 1\n\nv 0 0 0\nv 1 1 1\ne 0 5\n",
     );
     let out = run(&["check", path.to_str().unwrap()]);
-    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert_eq!(out.status.code(), Some(3), "stderr: {}", stderr(&out));
     assert!(
         stderr(&out).contains("out of range"),
         "stderr: {}",
@@ -496,12 +500,12 @@ fn check_out_of_range_exit_two() {
 }
 
 #[test]
-fn check_io_error_exit_two() {
+fn check_io_error_exit_three() {
     let missing =
         std::env::temp_dir().join(format!("wrfm-cli-missing-{}.wrfm", std::process::id()));
     let _ = fs::remove_file(&missing);
     let out = run(&["check", missing.to_str().unwrap()]);
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(3));
     assert!(
         stderr(&out).contains("cannot read"),
         "stderr: {}",
@@ -523,16 +527,16 @@ fn check_stdin() {
 }
 
 #[test]
-fn check_stdin_garbage_exit_two() {
+fn check_stdin_garbage_exit_three() {
     let out = run_stdin(&["check", "-"], "not a wrfm file at all\n");
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(3));
     assert!(stdout(&out).is_empty());
 }
 
 #[test]
-fn check_usage_exit_two() {
+fn check_usage_exit_three() {
     let out = run(&["check"]);
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(3));
     assert!(!stderr(&out).is_empty(), "clap prints a usage error");
 }
 
@@ -564,7 +568,7 @@ fn check_strict_upgrades_warn_to_broken() {
     let so = stdout(&out);
     assert!(so.starts_with("warn: dup"), "normal: {so}");
     let out2 = run(&["check", path.to_str().unwrap(), "--strict"]);
-    assert_eq!(out2.status.code(), Some(1), "strict broken still exits 1");
+    assert_eq!(out2.status.code(), Some(2), "--strict upgrades warn to 2");
     let so2 = stdout(&out2);
     assert!(
         so2.starts_with("broken: dup"),
@@ -602,7 +606,7 @@ fn info_reports_groups_in_json() {
     let dir = scratch("info_reports_groups_in_json");
     let path = write(&dir, "two.wrfm", TWO_GROUPS);
     let out = run(&["info", path.to_str().unwrap()]);
-    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
     let j = stdout_json(&out);
     assert_eq!(j["version"], 1);
     assert_eq!(j["vertices"], 6);
@@ -622,7 +626,7 @@ fn info_group_scopes_counts_and_bounds() {
     let dir = scratch("info_group_scopes_counts_and_bounds");
     let path = write(&dir, "two.wrfm", TWO_GROUPS);
     let out = run(&["info", path.to_str().unwrap(), "--group", "body"]);
-    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
     let j = stdout_json(&out);
     // The body triangle: 3 vertices, 3 edges, bbox [0,1]^2 at z=0.
     assert_eq!(j["vertices"], 3);
@@ -635,7 +639,7 @@ fn info_group_scopes_counts_and_bounds() {
     assert_eq!(j["groups"].as_array().unwrap().len(), 2);
     // A missing group is a usage error.
     let out = run(&["info", path.to_str().unwrap(), "--group", "nope"]);
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(3));
     assert!(
         stderr(&out).contains("group 'nope' not found"),
         "stderr: {}",
@@ -645,34 +649,30 @@ fn info_group_scopes_counts_and_bounds() {
 }
 
 #[test]
-fn info_broken_exit_one_with_stderr_note() {
-    let dir = scratch("info_broken_exit_one");
+fn info_broken_exit_two_with_pure_stdout() {
+    let dir = scratch("info_broken_exit_two");
     let path = write(&dir, "broken.wrfm", BROKEN);
     let out = run(&["info", path.to_str().unwrap()]);
-    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
     // The JSON result is STILL emitted on stdout.
     let j = stdout_json(&out);
     assert_eq!(j["vertices"], 8);
-    // The check report goes to stderr, never stdout.
-    let se = stderr(&out);
-    assert!(se.contains("[wrfm] check: broken"), "stderr: {se}");
-    assert!(
-        !stdout(&out).contains("[wrfm] check:"),
-        "stdout must stay pure"
-    );
+    // No health note anywhere: stdout stays pure JSON, stderr carries only
+    // real errors (this run has none) — the verdict is the exit code.
+    assert!(stderr(&out).is_empty(), "stderr: {}", stderr(&out));
     fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
-fn info_parse_error_exit_two() {
-    let dir = scratch("info_parse_error_exit_two");
+fn info_parse_error_exit_three() {
+    let dir = scratch("info_parse_error_exit_three");
     let path = write(
         &dir,
         "bad.wrfm",
         "wrfm 1\nvertices 1   edges 0\n\nv 1.0 2.0 abc\n",
     );
     let out = run(&["info", path.to_str().unwrap()]);
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(3));
     assert!(stdout(&out).is_empty());
     assert!(stderr(&out).contains("line"), "stderr: {}", stderr(&out));
     fs::remove_dir_all(&dir).ok();
@@ -698,7 +698,7 @@ fn group_all_groups_json() {
     let dir = scratch("group_all_groups_json");
     let path = write(&dir, "two.wrfm", TWO_GROUPS);
     let out = run(&["group", path.to_str().unwrap()]);
-    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
     let j = stdout_json(&out);
     assert_eq!(j["name"], "two");
     let g = j["groups"].as_array().unwrap();
@@ -715,7 +715,7 @@ fn group_named() {
     let dir = scratch("group_named");
     let path = write(&dir, "two.wrfm", TWO_GROUPS);
     let out = run(&["group", path.to_str().unwrap(), "head"]);
-    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
     let j = stdout_json(&out);
     let g = j["groups"].as_array().unwrap();
     assert_eq!(g.len(), 1);
@@ -725,11 +725,11 @@ fn group_named() {
 }
 
 #[test]
-fn group_unknown_exit_two() {
-    let dir = scratch("group_unknown_exit_two");
+fn group_unknown_exit_three() {
+    let dir = scratch("group_unknown_exit_three");
     let path = write(&dir, "two.wrfm", TWO_GROUPS);
     let out = run(&["group", path.to_str().unwrap(), "nope"]);
-    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert_eq!(out.status.code(), Some(3), "stderr: {}", stderr(&out));
     assert!(stdout(&out).is_empty());
     assert!(
         stderr(&out).contains("not found"),
@@ -744,7 +744,7 @@ fn group_reports_adjacent_groups() {
     let dir = scratch("group_reports_adjacent_groups");
     let path = write(&dir, "bh.wrfm", BODY_HEAD);
     let out = run(&["group", path.to_str().unwrap()]);
-    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
     let j = stdout_json(&out);
     let g = j["groups"].as_array().unwrap();
     assert_eq!(g[0]["name"], "body");
@@ -759,7 +759,7 @@ fn group_adjacent_groups_empty_without_cross_edges() {
     let dir = scratch("group_adjacent_groups_empty_without_cross_edges");
     let path = write(&dir, "two.wrfm", TWO_GROUPS);
     let out = run(&["group", path.to_str().unwrap(), "body"]);
-    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
     let j = stdout_json(&out);
     assert_eq!(j["groups"][0]["adjacent_groups"], serde_json::json!({}));
     fs::remove_dir_all(&dir).ok();
@@ -816,18 +816,15 @@ fn geometry_full_has_eigenvalues() {
 }
 
 #[test]
-fn geometry_broken_exit_one() {
-    let dir = scratch("geometry_broken_exit_one");
+fn geometry_broken_exit_two() {
+    let dir = scratch("geometry_broken_exit_two");
     let path = write(&dir, "broken.wrfm", BROKEN);
     let out = run(&["geometry", path.to_str().unwrap()]);
-    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
     let j = stdout_json(&out); // result still emitted
     assert_eq!(j["topology"]["edges"], 13);
-    assert!(
-        stderr(&out).contains("[wrfm] check: broken"),
-        "stderr: {}",
-        stderr(&out)
-    );
+    // No health note: the verdict travels on exit 2, stderr stays clean.
+    assert!(stderr(&out).is_empty(), "stderr: {}", stderr(&out));
     fs::remove_dir_all(&dir).ok();
 }
 
@@ -836,7 +833,7 @@ fn geometry_group_scopes_topology() {
     let dir = scratch("geometry_group_scopes_topology");
     let path = write(&dir, "two.wrfm", TWO_GROUPS);
     let out = run(&["geometry", path.to_str().unwrap(), "--group", "body"]);
-    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
     let j = stdout_json(&out);
     // The body triangle: 3 vertices, 3 edges, bbox size [1,1,0].
     assert_eq!(j["topology"]["vertices"], 3);
@@ -844,7 +841,7 @@ fn geometry_group_scopes_topology() {
     assert_eq!(j["bounds"]["size"], serde_json::json!([1.0, 1.0, 0.0]));
     // A missing group is a usage error.
     let out = run(&["geometry", path.to_str().unwrap(), "--group", "nope"]);
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(3));
     assert!(
         stderr(&out).contains("group 'nope' not found"),
         "stderr: {}",
@@ -858,27 +855,26 @@ fn geometry_group_scopes_topology() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn query_extents_of_cube() {
-    let dir = scratch("query_extents_of_cube");
+fn query_summary_modes_moved_to_geometry() {
+    let dir = scratch("query_summary_modes_moved_to_geometry");
     let path = write(&dir, "cube.wrfm", CUBE);
-    let out = run(&["query", path.to_str().unwrap(), "extents"]);
-    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
-    let so = stdout(&out);
-    assert!(so.contains("min=[0.000,0.000,0.000]"), "stdout: {so}");
-    assert!(so.contains("max=[1.000,1.000,1.000]"), "stdout: {so}");
-    assert!(so.contains("span x=1.000 y=1.000 z=1.000"), "stdout: {so}");
-    fs::remove_dir_all(&dir).ok();
-}
-
-#[test]
-fn query_topology_of_cube() {
-    let dir = scratch("query_topology_of_cube");
-    let path = write(&dir, "cube.wrfm", CUBE);
-    let out = run(&["query", path.to_str().unwrap(), "topology"]);
-    assert_eq!(out.status.code(), Some(0));
-    let so = stdout(&out);
-    assert!(so.contains("vertices=8 edges=12"), "stdout: {so}");
-    assert!(so.contains("connected_components=1"), "stdout: {so}");
+    let f = path.to_str().unwrap();
+    for (old, field) in [
+        ("extents", "bounds"),
+        ("topology", "topology"),
+        ("edge_stats", "edge_lengths"),
+    ] {
+        let out = run(&["query", f, old]);
+        assert_eq!(out.status.code(), Some(3), "{old} must be a usage error");
+        let e = stderr(&out);
+        assert!(
+            e.contains("wrfm geometry") && e.contains(field),
+            "{old} must name its replacement: {e}"
+        );
+        // The replacement really carries the numbers (no information loss).
+        let j = stdout_json(&run(&["geometry", f]));
+        assert!(j.get(field).is_some(), "geometry must expose .{field}");
+    }
     fs::remove_dir_all(&dir).ok();
 }
 
@@ -906,16 +902,12 @@ fn query_cross_section() {
 fn query_group_scope() {
     let dir = scratch("query_group_scope");
     let path = write(&dir, "two.wrfm", TWO_GROUPS);
-    let out = run(&[
-        "query",
-        path.to_str().unwrap(),
-        "topology",
-        "--group",
-        "body",
-    ]);
-    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let out = run(&["query", path.to_str().unwrap(), "profile", "--group", "body"]);
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
     let so = stdout(&out);
-    assert!(so.contains("vertices=3"), "group-scoped query: {so}");
+    // The `body` triangle spans x = 0..1 (the whole model spans 0..1 too,
+    // but the head group's vertices are excluded from the submodel).
+    assert!(so.contains("x: span=1.000"), "group-scoped query: {so}");
     fs::remove_dir_all(&dir).ok();
 }
 
@@ -965,7 +957,7 @@ fn query_vertices_group() {
         "--group",
         "body",
     ]);
-    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
     let j = stdout_json(&out);
     let vs = j["vertices"].as_array().unwrap();
     let idx: Vec<usize> = vs
@@ -993,7 +985,7 @@ fn query_vertices_range_and_group_errors() {
         "--group",
         "body",
     ]);
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(3));
     assert!(stdout(&out).is_empty());
     assert!(stderr(&out).contains("OR"), "stderr: {}", stderr(&out));
     fs::remove_dir_all(&dir).ok();
@@ -1010,7 +1002,7 @@ fn query_vertices_range_out_of_range_errors() {
         "--range",
         "0,99",
     ]);
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(3));
     assert!(
         stderr(&out).contains("out of range"),
         "stderr: {}",
@@ -1052,7 +1044,7 @@ fn query_distance_out_of_range() {
         "--range",
         "0,99",
     ]);
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(3));
     assert!(stdout(&out).is_empty());
     assert!(
         stderr(&out).contains("out of range"),
@@ -1067,7 +1059,7 @@ fn query_distance_missing_args() {
     let dir = scratch("query_distance_missing_args");
     let path = write(&dir, "cube.wrfm", CUBE);
     let out = run(&["query", path.to_str().unwrap(), "distance"]);
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(3));
     assert!(
         stderr(&out).contains("requires --range"),
         "stderr: {}",
@@ -1087,9 +1079,9 @@ fn query_connectivity_connected_and_not() {
         "--range",
         "0,2",
     ]);
-    // The chain fixture is L2-broken (dangling + isolated) -> exit 1, but
+    // The chain fixture is L2-broken (isolated vertex) -> exit 2, but
     // the JSON result is still emitted.
-    assert_eq!(yes.status.code(), Some(1), "stderr: {}", stderr(&yes));
+    assert_eq!(yes.status.code(), Some(2), "stderr: {}", stderr(&yes));
     assert_eq!(stdout_json(&yes)["connected"], true);
     let no = run(&[
         "query",
@@ -1098,7 +1090,7 @@ fn query_connectivity_connected_and_not() {
         "--range",
         "0,3",
     ]);
-    assert_eq!(no.status.code(), Some(1), "stderr: {}", stderr(&no));
+    assert_eq!(no.status.code(), Some(2), "stderr: {}", stderr(&no));
     assert_eq!(stdout_json(&no)["connected"], false);
     // A == B is trivially connected.
     let same = run(&[
@@ -1113,11 +1105,11 @@ fn query_connectivity_connected_and_not() {
 }
 
 #[test]
-fn query_unknown_exit_two() {
-    let dir = scratch("query_unknown_exit_two");
+fn query_unknown_exit_three() {
+    let dir = scratch("query_unknown_exit_three");
     let path = write(&dir, "cube.wrfm", CUBE);
     let out = run(&["query", path.to_str().unwrap(), "nope"]);
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(3));
     assert!(stdout(&out).is_empty());
     assert!(
         stderr(&out).contains("unknown query"),
@@ -1166,9 +1158,51 @@ fn view_group_scope() {
     let dir = scratch("view_group_scope");
     let path = write(&dir, "two.wrfm", TWO_GROUPS);
     let out = run(&["view", path.to_str().unwrap(), "--group", "body"]);
-    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
     let j = stdout_json(&out);
     assert_eq!(j["totals"]["edges"], 3); // the body triangle
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn view_json_is_never_truncated() {
+    // 150 disjoint vertical segments (300 vertices, 150 edges): every one of
+    // them is visible from the front, so the edge lists carry >100 entries —
+    // `view` prints them ALL: JSON output is never truncated.
+    let dir = scratch("view_json_is_never_truncated");
+    let mut m = String::from("wrfm 1\nvertices 300   edges 150\n\n");
+    for i in 0..150 {
+        m.push_str(&format!("v {i} 0 0\nv {i} 1 0\n"));
+    }
+    for i in 0..150 {
+        m.push_str(&format!("e {} {}\n", 2 * i, 2 * i + 1));
+    }
+    let path = write(&dir, "bars.wrfm", &m);
+    // Explicit camera: the fixture is flat (z-span 0), so the geometric-mean
+    // auto distance would be microscopic.
+    let out = run(&[
+        "view",
+        path.to_str().unwrap(),
+        "--auto-dist",
+        "false",
+        "--dist",
+        "100",
+    ]);
+    // Degree-1 vertices are a warn-level issue -> exit 1, result still full.
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    let j = stdout_json(&out);
+    let visible = j["totals"]["visible"].as_u64().unwrap() as usize;
+    assert!(visible > 100, "fixture must exceed any old cap: {visible}");
+    assert_eq!(
+        j["visible_edges"].as_array().unwrap().len(),
+        visible,
+        "every visible edge is listed"
+    );
+    assert_eq!(
+        j["occluded_edges"].as_array().unwrap().len(),
+        j["totals"]["occluded"].as_u64().unwrap() as usize,
+        "every occluded edge is listed"
+    );
     fs::remove_dir_all(&dir).ok();
 }
 
@@ -1195,39 +1229,18 @@ fn render_grid_six_views() {
 }
 
 #[test]
-fn render_budget_exit_two() {
-    let dir = scratch("render_budget_exit_two");
-    let path = write(&dir, "cube.wrfm", CUBE);
-    let out = run(&[
-        "render",
-        path.to_str().unwrap(),
-        "--format",
-        "braille",
-        "--budget",
-        "1",
-    ]);
-    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
-    assert!(stdout(&out).is_empty());
-    assert!(stderr(&out).contains("budget"), "stderr: {}", stderr(&out));
-    fs::remove_dir_all(&dir).ok();
-}
-
-#[test]
-fn render_broken_exit_one_still_emits() {
-    let dir = scratch("render_broken_exit_one");
+fn render_broken_exit_two_still_emits() {
+    let dir = scratch("render_broken_exit_two");
     let path = write(&dir, "broken.wrfm", BROKEN);
     let out = run(&["render", path.to_str().unwrap(), "--format", "grid"]);
-    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
     assert!(
         stdout(&out).contains("# grid"),
         "render still emitted:\n{}",
         stdout(&out)
     );
-    assert!(
-        stderr(&out).contains("[wrfm] check: broken"),
-        "stderr: {}",
-        stderr(&out)
-    );
+    // stderr carries only real errors — never the health report.
+    assert!(stderr(&out).is_empty(), "stderr: {}", stderr(&out));
     fs::remove_dir_all(&dir).ok();
 }
 
@@ -1251,12 +1264,8 @@ fn transform_scale_prints_model_text() {
             .iter()
             .all(|&(x, y, _)| (0.0..=2.0).contains(&x) && (0.0..=2.0).contains(&y))
     );
-    // Transform always reports the check verdict on stderr (even ok).
-    assert!(
-        stderr(&out).contains("[wrfm] check: ok"),
-        "stderr: {}",
-        stderr(&out)
-    );
+    // No health note on stderr (even for ok): the verdict is the exit code.
+    assert!(stderr(&out).is_empty(), "stderr: {}", stderr(&out));
     fs::remove_dir_all(&dir).ok();
 }
 
@@ -1270,31 +1279,28 @@ fn transform_stdin() {
 }
 
 #[test]
-fn transform_broken_exit_one_result_emitted() {
-    let dir = scratch("transform_broken_exit_one");
+fn transform_broken_exit_two_result_emitted() {
+    let dir = scratch("transform_broken_exit_two");
     let path = write(&dir, "broken.wrfm", BROKEN);
     let out = run(&["transform", path.to_str().unwrap(), "--scale", "1"]);
-    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
     // Mechanism A: the result is STILL emitted even when broken.
     assert!(
         stdout(&out).starts_with("wrfm 1\n"),
         "stdout:\n{}",
         stdout(&out)
     );
-    assert!(
-        stderr(&out).contains("[wrfm] check: broken"),
-        "stderr: {}",
-        stderr(&out)
-    );
+    // Broken is reported by the EXIT CODE (2), not by a stderr note.
+    assert!(stderr(&out).is_empty(), "stderr: {}", stderr(&out));
     fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
-fn transform_bad_translate_exit_two() {
-    let dir = scratch("transform_bad_translate_exit_two");
+fn transform_bad_translate_exit_three() {
+    let dir = scratch("transform_bad_translate_exit_three");
     let path = write(&dir, "cube.wrfm", CUBE);
     let out = run(&["transform", path.to_str().unwrap(), "--translate", "1,2"]);
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(3));
     assert!(stdout(&out).is_empty());
     assert!(
         stderr(&out).contains("translate"),
@@ -1305,18 +1311,18 @@ fn transform_bad_translate_exit_two() {
 }
 
 #[test]
-fn transform_bad_mirror_exit_two() {
-    let dir = scratch("transform_bad_mirror_exit_two");
+fn transform_bad_mirror_exit_three() {
+    let dir = scratch("transform_bad_mirror_exit_three");
     let path = write(&dir, "cube.wrfm", CUBE);
     let out = run(&["transform", path.to_str().unwrap(), "--mirror", "w"]);
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(3));
     assert!(stderr(&out).contains("mirror"), "stderr: {}", stderr(&out));
     fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
-fn transform_zero_axis_exit_two() {
-    let dir = scratch("transform_zero_axis_exit_two");
+fn transform_zero_axis_exit_three() {
+    let dir = scratch("transform_zero_axis_exit_three");
     let path = write(&dir, "cube.wrfm", CUBE);
     let out = run(&[
         "transform",
@@ -1324,7 +1330,7 @@ fn transform_zero_axis_exit_two() {
         "--rotate-axis",
         "0,0,0",
     ]);
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(3));
     assert!(
         stderr(&out).contains("non-zero"),
         "stderr: {}",
@@ -1461,7 +1467,7 @@ fn transform_bad_pivot_errors() {
     let dir = scratch("transform_bad_pivot_errors");
     let path = write(&dir, "cube.wrfm", CUBE);
     let out = run(&["transform", path.to_str().unwrap(), "--pivot", "nope"]);
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(3));
     assert!(stdout(&out).is_empty());
     assert!(stderr(&out).contains("pivot"), "stderr: {}", stderr(&out));
     fs::remove_dir_all(&dir).ok();
@@ -1472,7 +1478,7 @@ fn transform_bad_align_errors() {
     let dir = scratch("transform_bad_align_errors");
     let path = write(&dir, "cube.wrfm", CUBE);
     let out = run(&["transform", path.to_str().unwrap(), "--align", "q"]);
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(3));
     assert!(stdout(&out).is_empty());
     assert!(stderr(&out).contains("align"), "stderr: {}", stderr(&out));
     fs::remove_dir_all(&dir).ok();
@@ -1483,7 +1489,7 @@ fn transform_bad_normalize_errors() {
     let dir = scratch("transform_bad_normalize_errors");
     let path = write(&dir, "cube.wrfm", CUBE);
     let out = run(&["transform", path.to_str().unwrap(), "--normalize", "0"]);
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(3));
     assert!(stdout(&out).is_empty());
     assert!(
         stderr(&out).contains("normalize"),
@@ -1530,7 +1536,7 @@ fn edit_delete_vertices_remaps_edges() {
     let dir = scratch("edit_delete_vertices_remaps_edges");
     let path = write(&dir, "cube.wrfm", CUBE);
     let out = run(&["edit", path.to_str().unwrap(), "--delete-vertices", "7"]);
-    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
     let so = stdout(&out);
     let back = wrfm::WrfmModel::from_str("edited", &so).expect("output parses");
     assert_eq!(back.vertices.len(), 7);
@@ -1549,7 +1555,7 @@ fn edit_delete_edges() {
     let dir = scratch("edit_delete_edges");
     let path = write(&dir, "cube.wrfm", CUBE);
     let out = run(&["edit", path.to_str().unwrap(), "--delete-edges", "0,1,2"]);
-    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
     let back = wrfm::WrfmModel::from_str("edited", &stdout(&out)).expect("output parses");
     assert_eq!(back.vertices.len(), 8);
     assert_eq!(back.edges.len(), 9);
@@ -1561,7 +1567,7 @@ fn edit_extract_group() {
     let dir = scratch("edit_extract_group");
     let path = write(&dir, "two.wrfm", TWO_GROUPS);
     let out = run(&["edit", path.to_str().unwrap(), "--extract-group", "body"]);
-    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
     let so = stdout(&out);
     let back = wrfm::WrfmModel::from_str("edited", &so).expect("output parses");
     assert_eq!(back.vertices.len(), 3);
@@ -1570,8 +1576,8 @@ fn edit_extract_group() {
 }
 
 #[test]
-fn edit_two_ops_exit_two() {
-    let dir = scratch("edit_two_ops_exit_two");
+fn edit_two_ops_exit_three() {
+    let dir = scratch("edit_two_ops_exit_three");
     let path = write(&dir, "cube.wrfm", CUBE);
     let out = run(&[
         "edit",
@@ -1581,7 +1587,7 @@ fn edit_two_ops_exit_two() {
         "--delete-edges",
         "1",
     ]);
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(3));
     assert!(stdout(&out).is_empty());
     assert!(
         stderr(&out).contains("exactly ONE"),
@@ -1592,11 +1598,11 @@ fn edit_two_ops_exit_two() {
 }
 
 #[test]
-fn edit_no_op_exit_two() {
-    let dir = scratch("edit_no_op_exit_two");
+fn edit_no_op_exit_three() {
+    let dir = scratch("edit_no_op_exit_three");
     let path = write(&dir, "cube.wrfm", CUBE);
     let out = run(&["edit", path.to_str().unwrap()]);
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(3));
     assert!(
         stderr(&out).contains("requires one of"),
         "stderr: {}",
@@ -1631,7 +1637,7 @@ fn edit_dedupe_end_to_end() {
     let dir = scratch("edit_dedupe_end_to_end");
     let path = write(&dir, "dup.wrfm", DUP_MODEL);
     let out = run(&["edit", path.to_str().unwrap(), "--dedupe"]);
-    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
     let so = stdout(&out);
     let back = wrfm::WrfmModel::from_str("edited", &so).expect("output parses");
     assert_eq!(back.vertices.len(), 2, "duplicate vertex merged");
@@ -1640,7 +1646,7 @@ fn edit_dedupe_end_to_end() {
         vec![(0, 1)],
         "duplicate + zero-length edges dropped"
     );
-    // The survivor is a single dangling edge (L2 broken -> check exits 1),
+    // The survivor is a single dangling edge (L2 warn -> the edit exits 1),
     // but it must have NO duplicate or zero-length edges any more.
     let chk = run_stdin(&["check", "-"], &so);
     let co = stdout(&chk);
@@ -1680,7 +1686,7 @@ fn edit_merge_offsets_groups() {
     let a = write(&dir, "a.wrfm", CUBE);
     let b = write(&dir, "b.wrfm", BODY_HEAD);
     let out = run(&["edit", a.to_str().unwrap(), "--merge", b.to_str().unwrap()]);
-    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
     let back = wrfm::WrfmModel::from_str("edited", &stdout(&out)).expect("output parses");
     // b's groups were offset by a's 8 vertices: body [8,11), head [11,14).
     assert_eq!(back.groups.len(), 2);
@@ -1702,7 +1708,7 @@ fn edit_merge_pipe_both_sources() {
     let b = write(&dir, "b.wrfm", CUBE);
     // cat a | wrfm edit - --merge b.wrfm
     let out = run_stdin(&["edit", "-", "--merge", b.to_str().unwrap()], CUBE);
-    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
     let back = wrfm::WrfmModel::from_str("edited", &stdout(&out)).expect("output parses");
     assert_eq!(back.vertices.len(), 16);
     fs::remove_dir_all(&dir).ok();
@@ -1711,7 +1717,7 @@ fn edit_merge_pipe_both_sources() {
 #[test]
 fn edit_merge_two_stdin_errors() {
     let out = run_stdin(&["edit", "-", "--merge", "-"], CUBE);
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(3));
     assert!(stdout(&out).is_empty());
     assert!(
         stderr(&out).contains("at most one input may be stdin"),
@@ -1725,7 +1731,7 @@ fn edit_two_ops_still_errors() {
     let dir = scratch("edit_two_ops_still_errors");
     let path = write(&dir, "cube.wrfm", CUBE);
     let out = run(&["edit", path.to_str().unwrap(), "--clean", "--dedupe"]);
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(3));
     assert!(stdout(&out).is_empty());
     assert!(
         stderr(&out).contains("exactly ONE"),
@@ -1740,16 +1746,16 @@ fn edit_two_ops_still_errors() {
         "--delete-vertices",
         "0",
     ]);
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(3));
     fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
-fn edit_out_of_range_exit_two() {
-    let dir = scratch("edit_out_of_range_exit_two");
+fn edit_out_of_range_exit_three() {
+    let dir = scratch("edit_out_of_range_exit_three");
     let path = write(&dir, "cube.wrfm", CUBE);
     let out = run(&["edit", path.to_str().unwrap(), "--delete-vertices", "99"]);
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(3));
     assert!(
         stderr(&out).contains("out of range"),
         "stderr: {}",
@@ -1807,9 +1813,9 @@ fn diff_one_stdin() {
 }
 
 #[test]
-fn diff_both_stdin_exit_two() {
+fn diff_both_stdin_exit_three() {
     let out = run_stdin(&["diff", "-", "-"], CUBE);
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(3));
     assert!(
         stderr(&out).contains("at most one"),
         "stderr: {}",
@@ -1818,8 +1824,8 @@ fn diff_both_stdin_exit_two() {
 }
 
 #[test]
-fn diff_bad_format_exit_two() {
-    let dir = scratch("diff_bad_format_exit_two");
+fn diff_bad_format_exit_three() {
+    let dir = scratch("diff_bad_format_exit_three");
     let a = write(&dir, "a.wrfm", CUBE);
     let b = write(&dir, "b.wrfm", CUBE);
     let out = run(&[
@@ -1829,18 +1835,19 @@ fn diff_bad_format_exit_two() {
         "--format",
         "xml",
     ]);
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(3));
     fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
-fn diff_group_scopes_to_part() {
-    let dir = scratch("diff_group_scopes_to_part");
+fn diff_scopes_by_extraction_pipelines() {
+    // `diff --group` is gone: scope a diff by extracting the group first.
+    let dir = scratch("diff_scopes_by_extraction");
     let a = write(&dir, "a.wrfm", TWO_GROUPS);
     // Only the body triangle's vertex (1,0,0) moves to (2,0,0); head
     // (which has its own "v 1 0 1") is untouched.
     let b = write(&dir, "b.wrfm", &TWO_GROUPS.replace("v 1 0 0", "v 2 0 0"));
-    // Whole-model diff sees the moved vertex too.
+    // Whole-model diff sees the moved vertex.
     let whole = run(&[
         "diff",
         a.to_str().unwrap(),
@@ -1850,45 +1857,29 @@ fn diff_group_scopes_to_part() {
     ]);
     assert_eq!(whole.status.code(), Some(0), "stderr: {}", stderr(&whole));
     assert_eq!(stdout_json(&whole)["vertices"]["moved_count"], 1);
-    // Scoped to the body part: still one moved vertex, 3 each side.
+    // Scoping to a group is `edit --extract-group` on each side:
+    // extracting `head` gives an unchanged pair.
+    let ea = run(&["edit", a.to_str().unwrap(), "--extract-group", "head"]);
+    let eb = run(&["edit", b.to_str().unwrap(), "--extract-group", "head"]);
+    assert_eq!(ea.status.code(), Some(1), "stderr: {}", stderr(&ea));
+    assert_eq!(eb.status.code(), Some(1), "stderr: {}", stderr(&eb));
+    let (head_a, head_b) = (stdout(&ea), stdout(&eb));
+    let ha = write(&dir, "head-a.wrfm", &head_a);
+    let hb = write(&dir, "head-b.wrfm", &head_b);
     let out = run(&[
         "diff",
-        a.to_str().unwrap(),
-        b.to_str().unwrap(),
-        "--group",
-        "body",
-        "--format",
-        "json",
-    ]);
-    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
-    let j = stdout_json(&out);
-    assert_eq!(j["a"]["vertices"], 3);
-    assert_eq!(j["b"]["vertices"], 3);
-    assert_eq!(j["vertices"]["moved_count"], 1);
-    // Scoped to the head part: nothing moved.
-    let out = run(&[
-        "diff",
-        a.to_str().unwrap(),
-        b.to_str().unwrap(),
-        "--group",
-        "head",
+        ha.to_str().unwrap(),
+        hb.to_str().unwrap(),
         "--format",
         "json",
     ]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
     assert_eq!(stdout_json(&out)["vertices"]["moved_count"], 0);
-    // A group missing from EITHER side is a usage error (exit 2).
-    let c = write(&dir, "c.wrfm", CUBE);
-    let out = run(&[
-        "diff",
-        a.to_str().unwrap(),
-        c.to_str().unwrap(),
-        "--group",
-        "body",
-    ]);
-    assert_eq!(out.status.code(), Some(2));
+    // A group that does not exist is a usage error (exit 3) on the extract.
+    let out = run(&["edit", a.to_str().unwrap(), "--extract-group", "nope"]);
+    assert_eq!(out.status.code(), Some(3));
     assert!(
-        stderr(&out).contains("group 'body' not found"),
+        stderr(&out).contains("group 'nope' not found"),
         "stderr: {}",
         stderr(&out)
     );
@@ -1903,28 +1894,19 @@ fn diff_group_scopes_to_part() {
 fn stderr_never_mixes_into_stdout() {
     let dir = scratch("stderr_never_mixes_into_stdout");
     let path = write(&dir, "broken.wrfm", BROKEN);
-    // A broken model: the note goes to stderr, stdout stays pure JSON.
+    // A broken model: the result goes to stdout as pure JSON, stderr carries
+    // only real errors (there are none here) and stdout parses cleanly.
     let out = run(&["geometry", path.to_str().unwrap()]);
-    assert_eq!(out.status.code(), Some(1));
-    assert!(
-        !stdout(&out).contains("[wrfm] check:"),
-        "stdout: {}",
-        stdout(&out)
-    );
-    assert!(
-        stderr(&out).contains("[wrfm] check:"),
-        "stderr: {}",
-        stderr(&out)
-    );
-    // And stdout still parses as JSON.
+    assert_eq!(out.status.code(), Some(2));
     let _ = stdout_json(&out);
+    assert!(stderr(&out).is_empty(), "stderr: {}", stderr(&out));
     fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
 fn pipefail_propagates_broken_exit() {
     // `set -o pipefail` makes a pipeline fail when any stage exits non-zero
-    // (PLAN §3) — here the `wrfm check -` stage exits 1 (broken model).
+    // (PLAN §3) — here the `wrfm check -` stage exits 2 (broken model).
     let dir = scratch("pipefail_propagates_broken_exit");
     let script = format!(
         "set -o pipefail; printf '{}' | '{}' check - | wc -l >/dev/null",
@@ -1938,8 +1920,8 @@ fn pipefail_propagates_broken_exit() {
         .expect("run bash");
     assert_eq!(
         out.status.code(),
-        Some(1),
-        "pipefail must surface wrfm's exit 1: {}",
+        Some(2),
+        "pipefail must surface wrfm's exit 2: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     fs::remove_dir_all(&dir).ok();
@@ -2015,7 +1997,23 @@ fn format_teaches_streams_contract() {
     let so = stdout(&out);
     // The 2>&1 corruption warning and the diagnostic channel spelling.
     assert!(so.contains("2>/dev/null"), "stdout:\n{so}");
-    assert!(so.contains("stderr = \"[wrfm] check:"), "stdout:\n{so}");
+    assert!(
+        so.contains("stderr = diagnostics and errors"),
+        "stdout:\n{so}"
+    );
+    assert!(
+        so.contains("the health verdict travels on the exit"),
+        "stdout:\n{so}"
+    );
+    // The four-tier exit-code contract, as taught by `wrfm format` itself
+    // (verify fail sits in the "repair required" tier, not in warn).
+    assert!(so.contains("0 ok · 1 warn"), "stdout:\n{so}");
+    assert!(so.contains("2 broken (repair required"), "stdout:\n{so}");
+    assert!(so.contains("3 no result"), "stdout:\n{so}");
+    assert!(
+        so.contains("--strict upgrading a warn"),
+        "stdout:\n{so}"
+    );
 }
 
 #[test]
@@ -2033,6 +2031,13 @@ fn help_mentions_format() {
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
     let so = stdout(&out);
     assert!(so.contains("wrfm format"), "stdout:\n{so}");
+    // The after_help exit-code table matches the four-tier contract.
+    assert!(
+        so.contains("0 ok (clean result / verify pass) · 1 warn"),
+        "stdout:\n{so}"
+    );
+    assert!(so.contains("2 broken"), "stdout:\n{so}");
+    assert!(so.contains("3 no result"), "stdout:\n{so}");
 }
 
 // ---------------------------------------------------------------------------
@@ -2060,11 +2065,12 @@ fn verify_pass_exit_zero() {
 }
 
 #[test]
-fn verify_fail_exit_one() {
-    let dir = scratch("verify_fail_exit_one");
+fn verify_fail_exit_two() {
+    let dir = scratch("verify_fail_exit_two");
     let path = write(&dir, "cube.wrfm", CUBE);
     let out = run(&["verify", path.to_str().unwrap(), "--expect-size", "3,3,3"]);
-    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    // An unmet declaration is "repair required", not a warning.
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
     let v = stdout_json(&out);
     assert_eq!(v["verdict"], "fail");
     let e = &v["expectations"][0];
@@ -2083,11 +2089,11 @@ fn verify_fail_exit_one() {
 }
 
 #[test]
-fn verify_no_expectations_exit_two() {
-    let dir = scratch("verify_no_expectations_exit_two");
+fn verify_no_expectations_exit_three() {
+    let dir = scratch("verify_no_expectations_exit_three");
     let path = write(&dir, "cube.wrfm", CUBE);
     let out = run(&["verify", path.to_str().unwrap()]);
-    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert_eq!(out.status.code(), Some(3), "stderr: {}", stderr(&out));
     assert!(
         stderr(&out).contains("needs at least one --expect-* flag"),
         "stderr: {}",
@@ -2097,8 +2103,8 @@ fn verify_no_expectations_exit_two() {
 }
 
 #[test]
-fn verify_parse_error_exit_two() {
-    let dir = scratch("verify_parse_error_exit_two");
+fn verify_parse_error_exit_three() {
+    let dir = scratch("verify_parse_error_exit_three");
     let path = write(&dir, "cube.wrfm", CUBE);
     let out = run(&[
         "verify",
@@ -2106,7 +2112,7 @@ fn verify_parse_error_exit_two() {
         "--expect-size",
         "1,,2",
     ]);
-    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert_eq!(out.status.code(), Some(3), "stderr: {}", stderr(&out));
     assert!(
         stderr(&out).contains("expect_size must be 'x,y,z'"),
         "stderr: {}",
@@ -2116,8 +2122,8 @@ fn verify_parse_error_exit_two() {
 }
 
 #[test]
-fn verify_missing_file_exit_two() {
-    let dir = scratch("verify_missing_file_exit_two");
+fn verify_missing_file_exit_three() {
+    let dir = scratch("verify_missing_file_exit_three");
     let missing = dir.join("nope.wrfm");
     let out = run(&[
         "verify",
@@ -2125,7 +2131,7 @@ fn verify_missing_file_exit_two() {
         "--expect-size",
         "1,1,1",
     ]);
-    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert_eq!(out.status.code(), Some(3), "stderr: {}", stderr(&out));
     assert!(
         stderr(&out).contains("cannot read"),
         "stderr: {}",
@@ -2180,7 +2186,7 @@ fn verify_group_scopes_expectations() {
         "--expect-size",
         "1,1,1",
     ]);
-    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    assert_eq!(out.status.code(), Some(2), "unmet intent -> repair required");
     let v = stdout_json(&out);
     assert_eq!(v["verdict"], "fail");
     // --expect-groups still checks the FULL group list (head exists even
@@ -2212,5 +2218,634 @@ fn verify_symmetric_off_center_cube_passes() {
     assert_eq!(v["verdict"], "pass");
     assert_eq!(v["expectations"][0]["name"], "symmetric_x");
     assert_eq!(v["expectations"][0]["pass"], true);
+    fs::remove_dir_all(&dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Review-doc additions (docs/wrfm-cli-review.md #1 #2 #3 #4 #6 #7)
+// ---------------------------------------------------------------------------
+
+/// A tetrahedron plus a 5th vertex that differs from vertex 3 by ~2e-16
+/// (float noise between two samples of the same curve), wired into the
+/// tetra's three other corners. `--dedupe` (exact match) keeps it;
+/// `--weld 1e-9` merges it, and its three edges collapse onto the
+/// tetra's existing edges (dropped by the shared cleanup).
+const NEAR_DUP_TETRA: &str = "\
+wrfm 1
+vertices 5   edges 9
+
+v 0 0 0
+v 1 0 0
+v 0 1 0
+v 0 0 1
+v 0 0 1.0000000000000002
+e 0 1
+e 0 2
+e 0 3
+e 1 2
+e 1 3
+e 2 3
+e 0 4
+e 1 4
+e 2 4
+";
+
+/// Lit (`#`) dots in a `--format ascii` render, skipping the `# ...`
+/// header lines and the `[view=...]` markers.
+fn lit_dots(render_stdout: &str) -> usize {
+    render_stdout
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.starts_with("[view="))
+        .map(|l| l.chars().filter(|&c| c == '#').count())
+        .sum()
+}
+
+#[test]
+fn check_always_prints_the_full_report() {
+    let dir = scratch("check_full_report");
+    let ok = write(&dir, "cube.wrfm", CUBE);
+    let out = run(&["check", ok.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert!(
+        stdout(&out).starts_with("ok: cube (8 vertices, 12 edges)"),
+        "stdout: {}",
+        stdout(&out)
+    );
+    assert!(stderr(&out).is_empty(), "stderr: {}", stderr(&out));
+
+    let warn = write(&dir, "dup.wrfm", DUP_VERTEX);
+    let out = run(&["check", warn.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(1), "warn stays 1: {}", stderr(&out));
+    assert!(
+        stdout(&out).starts_with("warn: dup (9 vertices, 13 edges)"),
+        "stdout: {}",
+        stdout(&out)
+    );
+
+    let broken = write(&dir, "broken.wrfm", BROKEN);
+    let out = run(&["check", broken.to_str().unwrap()]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "broken is 2, never 1: {}",
+        stderr(&out)
+    );
+    assert!(
+        stdout(&out).starts_with("broken: broken (8 vertices, 13 edges)"),
+        "stdout: {}",
+        stdout(&out)
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn group_always_prints_json() {
+    let dir = scratch("group_always_json");
+    let path = write(&dir, "two.wrfm", TWO_GROUPS);
+    // The WHOLE model is warn (every vertex is degree 2) -> exit 1.
+    let out = run(&["group", path.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    let j = stdout_json(&out);
+    let names: Vec<&str> = j["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| g["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["body", "head"], "file order, every group");
+    // Each group's own health verdict comes from the JSON
+    // (`jq -r '.groups[] | "\(.name):\(.verdict)"'`).
+    assert_eq!(j["groups"][0]["verdict"], "ok");
+    // Scoped to one group, JSON mode untouched.
+    let out = run(&["group", path.to_str().unwrap(), "head"]);
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    let j = stdout_json(&out);
+    assert_eq!(j["groups"].as_array().unwrap().len(), 1);
+    assert_eq!(j["groups"][0]["name"], "head");
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn render_stderr_stays_empty_for_warn_and_broken() {
+    let dir = scratch("render_stderr_empty");
+    // Broken model: the exit code keeps the verdict, stderr carries nothing.
+    let path = write(&dir, "broken.wrfm", BROKEN);
+    let out = run(&["render", path.to_str().unwrap(), "--format", "grid"]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "exit still carries broken: {}",
+        stderr(&out)
+    );
+    assert!(stdout(&out).contains("# grid"), "stdout: {}", stdout(&out));
+    assert!(stderr(&out).is_empty(), "stderr: {}", stderr(&out));
+
+    // Warn model: same silence, exit 1.
+    let two = write(&dir, "two.wrfm", TWO_GROUPS);
+    let out = run(&["render", two.to_str().unwrap(), "--format", "grid"]);
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    assert!(stderr(&out).is_empty(), "stderr: {}", stderr(&out));
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn render_fit_content_fills_the_canvas() {
+    let dir = scratch("render_fit_content");
+    let path = write(&dir, "cube.wrfm", CUBE);
+    let mut args: Vec<&str> = vec![
+        "render",
+        path.to_str().unwrap(),
+        "--views",
+        "front",
+        "--format",
+        "ascii",
+        "--width",
+        "40",
+        "--height",
+        "16",
+    ];
+    let plain = run(&args);
+    assert_eq!(plain.status.code(), Some(0), "stderr: {}", stderr(&plain));
+    args.extend(["--fit", "content"]);
+    let fit = run(&args);
+    assert_eq!(fit.status.code(), Some(0), "stderr: {}", stderr(&fit));
+    let head = stdout(&fit).lines().next().unwrap_or("").to_string();
+    assert!(head.contains("fit=content"), "header: {head}");
+    let (p, f) = (lit_dots(&stdout(&plain)), lit_dots(&stdout(&fit)));
+    assert!(f > p, "fit must light more dots: plain={p} fit={f}");
+
+    // Priority contract: an explicit --region WINS over --fit content.
+    args.extend(["--region", "0.25,0.25,0.75,0.75"]);
+    let reg = run(&args);
+    assert_eq!(reg.status.code(), Some(0), "stderr: {}", stderr(&reg));
+    let head = stdout(&reg).lines().next().unwrap_or("").to_string();
+    assert!(head.contains("region=["), "header: {head}");
+    assert!(!head.contains("fit=content"), "region wins: {head}");
+
+    // An unknown fit mode is a usage error -> 3.
+    let out = run(&[
+        "render",
+        path.to_str().unwrap(),
+        "--views",
+        "front",
+        "--fit",
+        "zoom",
+    ]);
+    assert_eq!(out.status.code(), Some(3), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("fit must be"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn edit_weld_merges_vertices_within_tolerance() {
+    let dir = scratch("edit_weld_merges");
+    let path = write(&dir, "tetra.wrfm", NEAR_DUP_TETRA);
+
+    // `--dedupe` is EXACT: the ~2e-16 twin survives -> warn, exit 1.
+    let out = run(&["edit", path.to_str().unwrap(), "--dedupe"]);
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    let back = wrfm::WrfmModel::from_str("deduped", &stdout(&out)).expect("parses");
+    assert_eq!(back.vertices.len(), 5, "exact dedupe cannot merge noise");
+
+    // `--weld 1e-9` merges the twin; the model becomes a healthy tetra.
+    let out = run(&["edit", path.to_str().unwrap(), "--weld", "1e-9"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let so = stdout(&out);
+    let back = wrfm::WrfmModel::from_str("welded", &so).expect("parses");
+    assert_eq!(back.vertices.len(), 4, "twin merged away");
+    assert_eq!(back.edges.len(), 6, "collapsed + duplicate edges dropped");
+    let chk = run_stdin(&["check", "-"], &so);
+    assert_eq!(chk.status.code(), Some(0), "check stderr: {}", stderr(&chk));
+
+    // A tolerance below the gap merges nothing (still warn).
+    let out = run(&["edit", path.to_str().unwrap(), "--weld", "1e-18"]);
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    let back = wrfm::WrfmModel::from_str("unwelded", &stdout(&out)).expect("parses");
+    assert_eq!(back.vertices.len(), 5, "nothing within 1e-18");
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn edit_weld_usage_errors_exit_three() {
+    let dir = scratch("edit_weld_usage_errors");
+    let path = write(&dir, "tetra.wrfm", NEAR_DUP_TETRA);
+    for tol in ["0", "nan", "inf"] {
+        let out = run(&["edit", path.to_str().unwrap(), "--weld", tol]);
+        assert_eq!(out.status.code(), Some(3), "tol={tol}: {}", stderr(&out));
+        assert!(
+            stderr(&out).contains("weld tolerance"),
+            "tol={tol}: {}",
+            stderr(&out)
+        );
+    }
+    // `-1` never reaches the validator (clap reads it as a flag) — still a
+    // usage error, still 3; spelled `--weld=-1` it reaches ours.
+    let out = run(&["edit", path.to_str().unwrap(), "--weld", "-1"]);
+    assert_eq!(out.status.code(), Some(3), "stderr: {}", stderr(&out));
+    let out = run(&["edit", path.to_str().unwrap(), "--weld=-1"]);
+    assert_eq!(out.status.code(), Some(3), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("weld tolerance"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    // A non-numeric tolerance is a clap argument error -> 3 as well.
+    let out = run(&["edit", path.to_str().unwrap(), "--weld", "abc"]);
+    assert_eq!(out.status.code(), Some(3), "stderr: {}", stderr(&out));
+    // One edit op per call: --weld does not compose either.
+    let out = run(&["edit", path.to_str().unwrap(), "--weld", "1e-9", "--clean"]);
+    assert_eq!(out.status.code(), Some(3), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("exactly ONE"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn clap_argument_errors_exit_three_and_help_exits_zero() {
+    let dir = scratch("clap_exit_contract");
+    let path = write(&dir, "cube.wrfm", CUBE);
+    // Unknown flag: clap's own usage error is forced onto exit 3 — 2 is
+    // reserved for `broken`, never an argument mistake.
+    let out = run(&["check", path.to_str().unwrap(), "--nope"]);
+    assert_eq!(out.status.code(), Some(3), "stderr: {}", stderr(&out));
+    assert!(!stderr(&out).is_empty(), "clap prints the usage error");
+    assert!(stdout(&out).is_empty(), "no result on a usage error");
+    // Help and version are results, not errors.
+    let out = run(&["check", "--help"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert!(stdout(&out).contains("--strict"), "help lists new flags");
+    let out = run(&["--version"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn help_documents_the_new_flags() {
+    for (args, needle) in [
+        (vec!["check", "--help"], "--strict"),
+        (vec!["check", "--help"], "--format"),
+        (vec!["query", "--help"], "--format"),
+        (vec!["verify", "--help"], "--expect-closed"),
+        (vec!["group", "--help"], "structured facts"),
+        (vec!["render", "--help"], "--fit"),
+        (vec!["edit", "--help"], "--weld"),
+    ] {
+        let out = run(&args);
+        assert_eq!(out.status.code(), Some(0), "{args:?}: {}", stderr(&out));
+        assert!(
+            stdout(&out).contains(needle),
+            "{args:?} help never mentions {needle}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Point identity: `check` and `edit --weld` share ONE definition (strictly
+// closer than 1e-6 world units), so "check -> repair -> check" converges.
+// ---------------------------------------------------------------------------
+
+/// Two vertices ~1e-15 apart (not bit-identical) plus two clean chains.
+const NEAR_TWIN: &str = "\
+wrfm 1
+vertices 4   edges 2
+
+v 1.0 1.0 1.0
+v 0.0 0.0 0.0
+v 1.0000000000000002 1.0 1.0
+v 2.0 0.0 0.0
+e 0 1
+e 2 3
+";
+
+#[test]
+fn check_reports_near_duplicates_and_weld_clears_them() {
+    let dir = scratch("check_reports_near_duplicates_and_weld_clears_them");
+    let path = write(&dir, "near.wrfm", NEAR_TWIN);
+    let f = path.to_str().unwrap();
+
+    let out = run(&["check", f]);
+    let so = stdout(&out);
+    assert!(so.contains("near-duplicate vertices"), "stdout: {so}");
+    // NEAR_TWIN also has dangling edges, so this asserts the tolerance line
+    // stays attached to the near-duplicate list instead of repeating once
+    // per problem section.
+    assert_eq!(
+        so.matches("tolerance: 1e-6").count(),
+        1,
+        "stdout: {so}"
+    );
+
+    // Near-duplicates are NOT bit-identical: the exact counter stays empty.
+    let j = stdout_json(&run(&["check", f, "--format", "json"]));
+    assert_eq!(
+        j["issues"]["duplicate_vertices"].as_array().unwrap().len(),
+        0,
+        "{j}"
+    );
+    assert_eq!(
+        j["issues"]["near_duplicate_vertices"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "{j}"
+    );
+    assert_eq!(j["tolerance"], 1e-6);
+
+    // `--dedupe` is bit-exact and cannot clear a near-duplicate...
+    let deduped = run(&["edit", f, "--dedupe"]);
+    let after = run_stdin(&["check", "-"], &stdout(&deduped));
+    assert!(
+        stdout(&after).contains("near-duplicate vertices"),
+        "--dedupe must not clear a near-duplicate: {}",
+        stdout(&after)
+    );
+
+    // ...`--weld 1e-6` is the repair, and re-checking converges.
+    let welded = run(&["edit", f, "--weld", "1e-6"]);
+    let after = run_stdin(&["check", "-", "--format", "json"], &stdout(&welded));
+    let j = stdout_json(&after);
+    assert_eq!(
+        j["issues"]["near_duplicate_vertices"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0,
+        "weld must clear the finding: {j}"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn check_finds_near_duplicates_across_a_cell_boundary() {
+    // Regression: 2e-7 apart, straddling the old single-bucket boundary —
+    // the code used to report "0 duplicate vertices" while calling the very
+    // same pair a zero-length edge.
+    let dir = scratch("check_finds_near_duplicates_across_a_cell_boundary");
+    let straddle = "\
+wrfm 1
+vertices 2   edges 1
+
+v 4.99e-05 0 0
+v 5.0100000000000005e-05 0 0
+e 0 1
+";
+    let path = write(&dir, "straddle.wrfm", straddle);
+    let j = stdout_json(&run(&["check", path.to_str().unwrap(), "--format", "json"]));
+    assert_eq!(
+        j["issues"]["near_duplicate_vertices"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "{j}"
+    );
+    // Both statements about the same pair agree now.
+    assert_eq!(
+        j["issues"]["zero_length_edges"].as_array().unwrap().len(),
+        1
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn point_tolerance_boundary_is_strict() {
+    let dir = scratch("point_tolerance_boundary_is_strict");
+    let exact = "\
+wrfm 1
+vertices 2   edges 1
+
+v 0 0 0
+v 1e-6 0 0
+e 0 1
+";
+    let path = write(&dir, "exact.wrfm", exact);
+    let f = path.to_str().unwrap();
+    let j = stdout_json(&run(&["check", f, "--format", "json"]));
+    assert_eq!(
+        j["issues"]["near_duplicate_vertices"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0,
+        "exactly 1e-6 apart is not the same point: {j}"
+    );
+    assert_eq!(
+        j["issues"]["zero_length_edges"].as_array().unwrap().len(),
+        0
+    );
+    let welded = run(&["edit", f, "--weld", "1e-6"]);
+    assert!(
+        stdout(&welded).contains("vertices 2"),
+        "weld must not merge a pair exactly tol apart: {}",
+        stdout(&welded)
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn check_json_is_the_machine_form() {
+    let dir = scratch("check_json_is_the_machine_form");
+    for (name, fixture) in [("cube.wrfm", CUBE), ("broken.wrfm", BROKEN)] {
+        let path = write(&dir, name, fixture);
+        let out = run(&["check", path.to_str().unwrap(), "--format", "json"]);
+        assert!(stderr(&out).is_empty(), "stderr: {}", stderr(&out));
+        let j = stdout_json(&out);
+        for key in [
+            "name", "source", "vertices", "edges", "tolerance", "verdict", "summary", "issues",
+            "quality",
+        ] {
+            assert!(j.get(key).is_some(), "check --format json lacks {key}: {j}");
+        }
+        assert_eq!(j["tolerance"], 1e-6);
+        // Every category is a list and every entry an object — the isolated
+        // vertices used to be bare integers, the one shape outlier.
+        for (k, v) in j["issues"].as_object().unwrap() {
+            let list = v.as_array().unwrap_or_else(|| panic!("{k} must be a list"));
+            for item in list {
+                assert!(item.is_object(), "{k} entries must be objects: {item}");
+            }
+        }
+    }
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn query_profile_json_edge_cover_is_ordered() {
+    let dir = scratch("query_profile_json_edge_cover_is_ordered");
+    let path = write(&dir, "cube.wrfm", CUBE);
+    let out = run(&["query", path.to_str().unwrap(), "profile", "--format", "json"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let j = stdout_json(&out);
+    for axis in ["x", "y", "z"] {
+        let c = j["profile"][axis]["edge_cover"].as_array().unwrap();
+        let (lo, hi) = (c[0].as_f64().unwrap(), c[1].as_f64().unwrap());
+        assert!(lo <= hi, "{axis}: edge_cover must be ordered, got {lo}..{hi}");
+        assert_eq!((lo, hi), (0.0, 1.0), "{axis}: union of the edges' extents");
+        assert_eq!(j["profile"][axis]["span"], 1.0);
+    }
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn info_bounds_matches_geometry_bounds() {
+    let dir = scratch("info_bounds_matches_geometry_bounds");
+    let path = write(&dir, "cube.wrfm", CUBE);
+    let f = path.to_str().unwrap();
+    let info = stdout_json(&run(&["info", f]));
+    let geo = stdout_json(&run(&["geometry", f]));
+    assert_eq!(info["bounds"], geo["bounds"], "one shape for bounds");
+    assert!(info["bounds"]["size"].is_array(), "info.bounds needs size");
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn diff_reports_group_membership_changes() {
+    let dir = scratch("diff_reports_group_membership_changes");
+    let a = write(&dir, "a.wrfm", TWO_GROUPS);
+    // Same vertices, same edges — vertex 2 moved from `body` to `head`.
+    let regrouped = "\
+wrfm 1
+vertices 6   edges 6
+
+group body
+  v 0 0 0
+  v 1 0 0
+group head
+  v 0 1 0
+  v 0 0 1
+  v 1 0 1
+  v 0.5 1 1
+e 0 1
+e 1 2
+e 2 0
+e 3 4
+e 4 5
+e 5 3
+";
+    let b = write(&dir, "b.wrfm", regrouped);
+    let out = run(&[
+        "diff",
+        a.to_str().unwrap(),
+        b.to_str().unwrap(),
+        "--format",
+        "json",
+    ]);
+    let j = stdout_json(&out);
+    let changed = j["groups"]["membership_changed"].as_array().unwrap();
+    let body = changed
+        .iter()
+        .find(|c| c["name"] == "body")
+        .unwrap_or_else(|| panic!("body must be reported: {j}"));
+    assert_eq!(body["only_in_a"], serde_json::json!([2]));
+    assert_eq!(body["only_in_b"], serde_json::json!([]));
+    let head = changed
+        .iter()
+        .find(|c| c["name"] == "head")
+        .unwrap_or_else(|| panic!("head must be reported: {j}"));
+    assert_eq!(head["only_in_b"], serde_json::json!([2]));
+    // The geometry is identical, so the vertex/edge diff stays empty.
+    assert_eq!(j["vertices"]["moved_count"], 0);
+    assert!(j["edges"]["added"].as_array().unwrap().is_empty());
+    // The text form names the change instead of silently reporting nothing.
+    let t = run(&["diff", a.to_str().unwrap(), b.to_str().unwrap()]);
+    assert!(
+        stdout(&t).contains("changed: body"),
+        "stdout: {}",
+        stdout(&t)
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// A consumer that closes the pipe early (head / an early-exiting jq) is not
+// an error: the remaining stdout writes are dropped, no panic, and the verdict
+// still reaches the exit code (see src/output.rs).
+// ---------------------------------------------------------------------------
+
+/// Spawn `wrfm <args>`, read a little of stdout, then close the read end so
+/// the next write really hits `EPIPE`.
+fn run_with_closed_pipe(args: &[&str]) -> Output {
+    let mut child = Command::new(bin())
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn wrfm");
+    {
+        let mut out = child.stdout.take().expect("stdout");
+        let mut buf = [0u8; 64];
+        let _ = out.read(&mut buf);
+    } // dropping `out` closes the read end
+    child.wait_with_output().expect("wait wrfm")
+}
+
+/// Big enough that the render cannot fit in the 64 KiB pipe buffer.
+fn big_render_args(model: &str) -> Vec<String> {
+    [
+        "render",
+        model,
+        "--views",
+        "front,back,top",
+        "--width",
+        "300",
+        "--height",
+        "300",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+#[test]
+fn closed_pipe_is_not_a_panic() {
+    let dir = scratch("closed_pipe_is_not_a_panic");
+    let path = write(&dir, "cube.wrfm", CUBE);
+    let args = big_render_args(path.to_str().unwrap());
+    let argv: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    // Premise: the output really exceeds the 64 KiB pipe buffer, otherwise
+    // the child would finish before the reader closes and the test would
+    // pass vacuously.
+    let full = run(&argv);
+    assert!(
+        full.stdout.len() > 64 * 1024,
+        "test premise: output must exceed the pipe buffer, got {} bytes",
+        full.stdout.len()
+    );
+    let out = run_with_closed_pipe(&argv);
+    assert!(
+        !stderr(&out).contains("panicked"),
+        "stderr must stay clean: {}",
+        stderr(&out)
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a closed pipe must not change the verdict: {}",
+        stderr(&out)
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn verdict_survives_a_closed_pipe() {
+    let dir = scratch("verdict_survives_a_closed_pipe");
+    let path = write(&dir, "broken.wrfm", BROKEN);
+    let args = big_render_args(path.to_str().unwrap());
+    let argv: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let out = run_with_closed_pipe(&argv);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "the broken verdict still travels on the exit code: {}",
+        stderr(&out)
+    );
     fs::remove_dir_all(&dir).ok();
 }

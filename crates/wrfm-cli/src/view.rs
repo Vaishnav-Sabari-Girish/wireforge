@@ -12,8 +12,6 @@ pub struct ViewParams {
  pub pan_x: f64,
  /// Aim-point Y offset (world units, the fork's pan_y).
  pub pan_y: f64,
- /// Max visible/occluded edges listed (sorted near-to-far).
- pub limit: usize,
 }
 
 /// Projected vertex: screen coords (relative units, +y up) + camera depth.
@@ -259,12 +257,6 @@ pub fn analyze(m: &Model, p: &ViewParams) -> Value {
             .partial_cmp(&b["avg_depth"].as_f64().unwrap())
  .unwrap()
  });
- if visible_edges.len() > p.limit {
- visible_edges.truncate(p.limit);
- }
- if occluded_edges.len() > p.limit {
- occluded_edges.truncate(p.limit);
- }
 
  // Silhouette: convex hull of visible vertices in screen space.
  let hull = convex_hull(&hull_pts);
@@ -358,7 +350,6 @@ mod tests {
  dist: 8.0,
  pan_x: 0.0,
  pan_y: 0.0,
- limit: 100,
  }
  }
 

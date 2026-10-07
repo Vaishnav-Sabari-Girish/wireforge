@@ -1,33 +1,31 @@
 use crate::render::bounds;
 use ratatui_wireframe::model::Model;
-use serde_json::json;
+use serde_json::{json, Value};
 
 /// A query that can be run against a model.
+///
+/// Only the queries that are NOT already covered by `wrfm geometry` live
+/// here: `profile` and `cross_section` need parameters, `vertices` /
+/// `distance` / `connectivity` answer per-index questions. The three
+/// summary queries (`extents` / `topology` / `edge_stats`) printed a subset
+/// of `geometry`'s JSON and were removed — `Query::parse` points callers at
+/// the replacement.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Query {
- /// Bounding box, center, proportions, longest axis.
- Extents,
- /// Vertex/edge counts, degree distribution, dangling edges, components.
- Topology,
- /// Edge length statistics (min/max/avg, count of long edges).
- EdgeStats,
- /// Axis-aligned span plus how much of each axis is covered by edges.
+ /// Axis-aligned span plus the extent each axis is covered by edges.
  Profile,
  /// Edges crossing the plane `z = at` (default 0).
  CrossSection,
-/// Every vertex (index + coords), optionally filtered by `--range` / `--group` — JSON.
+ /// Every vertex (index + coords), optionally filtered by `--range` / `--group`.
  Vertices,
- /// Euclidean distance between two vertices (JSON).
+ /// Euclidean distance between two vertices.
  Distance,
- /// Whether two vertices are in the same connected component (JSON).
+ /// Whether two vertices are in the same connected component.
  Connectivity,
 }
 
 impl Query {
- pub const ALL: [&'static str; 8] = [
-        "extents",
-        "topology",
-        "edge_stats",
+ pub const ALL: [&'static str; 5] = [
         "profile",
         "cross_section",
         "vertices",
@@ -37,20 +35,29 @@ impl Query {
 
  pub fn parse(s: &str) -> Result<Query, String> {
  match s.trim().to_ascii_lowercase().as_str() {
-            "extents" => Ok(Query::Extents),
-            "topology" => Ok(Query::Topology),
-            "edge_stats" => Ok(Query::EdgeStats),
             "profile" => Ok(Query::Profile),
             "cross_section" => Ok(Query::CrossSection),
             "vertices" => Ok(Query::Vertices),
             "distance" => Ok(Query::Distance),
             "connectivity" => Ok(Query::Connectivity),
- other => Err(format!(
+ // Summarised by `wrfm geometry` (same numbers, JSON): name the
+ // replacement instead of a bare "unknown query".
+            "extents" => Err(moved_to_geometry("extents", "bounds")),
+            "topology" => Err(moved_to_geometry("topology", "topology")),
+            "edge_stats" => Err(moved_to_geometry("edge_stats", "edge_lengths")),
+  other => Err(format!(
                 "unknown query '{other}' (expected {})",
                 Query::ALL.join("|")
- )),
+  )),
  }
  }
+}
+
+/// The migration message for a query whose numbers `wrfm geometry` now owns.
+fn moved_to_geometry(old: &str, field: &str) -> String {
+    format!(
+        "query '{old}' moved to `wrfm geometry` (see .{field}) — the same numbers, as JSON"
+    )
 }
 
 /// Arguments for the parameterised queries. `range` selects the vertex indices [a, b] (inclusive, 0-based, global) for `vertices` / `distance` / `connectivity` (None = all vertices for `vertices`).
@@ -65,236 +72,177 @@ fn dist(a: (f64, f64, f64), b: (f64, f64, f64)) -> f64 {
  ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2) + (a.2 - b.2).powi(2)).sqrt()
 }
 
-fn components(m: &Model) -> usize {
- let n = m.vertices.len();
- let mut parent: Vec<usize> = (0..n).collect();
- fn find(parent: &mut Vec<usize>, x: usize) -> usize {
- if parent[x] != x {
- parent[x] = find(parent, parent[x]);
- }
- parent[x]
- }
- for &(a, b) in &m.edges {
- let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
- if ra != rb {
- parent[ra] = rb;
- }
- }
- (0..n)
- .map(|i| find(&mut parent, i))
- .collect::<std::collections::HashSet<_>>()
- .len()
-}
-
 /// Whether `a` and `b` are in the same connected component (BFS over the edge graph; `a == b` is trivially connected). Defensive about
 fn connected(m: &Model, a: usize, b: usize) -> bool {
  if a == b {
- return true;
+  return true;
  }
  let n = m.vertices.len();
  let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
  for &(u, v) in &m.edges {
- if u < n && v < n {
- adj[u].push(v);
- adj[v].push(u);
- }
+  if u < n && v < n {
+  adj[u].push(v);
+  adj[v].push(u);
+  }
  }
  let mut visited = vec![false; n];
  let mut queue = std::collections::VecDeque::new();
  visited[a] = true;
  queue.push_back(a);
  while let Some(u) = queue.pop_front() {
- for &w in &adj[u] {
- if !visited[w] {
- if w == b {
- return true;
- }
- visited[w] = true;
- queue.push_back(w);
- }
- }
+  for &w in &adj[u] {
+  if !visited[w] {
+  if w == b {
+   return true;
+  }
+  visited[w] = true;
+  queue.push_back(w);
+  }
+  }
  }
  false
 }
 
-/// Run `query` against `m` (with optional cross-section plane `at`).
-pub fn run(m: &Model, query: Query, args: &QueryArgs) -> String {
+/// The machine-readable answer — the authoritative form of every query.
+/// `run` renders its text projection; nothing computes a number twice.
+pub fn value(m: &Model, query: Query, args: &QueryArgs) -> Value {
  let at = args.at;
  match query {
- Query::Extents => {
- let (min, max) = bounds(m);
- let c = [
- (min[0] + max[0]) / 2.0,
- (min[1] + max[1]) / 2.0,
- (min[2] + max[2]) / 2.0,
- ];
- let span = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
-            let (longest, axis) = ["x", "y", "z"]
- .iter()
- .zip(span.iter())
- .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
- .map(|(a, &s)| (s, *a))
- .unwrap();
- format!(
-                "extents:\n  min=[{:.3},{:.3},{:.3}] max=[{:.3},{:.3},{:.3}] center=[{:.3},{:.3},{:.3}]\n  span x={:.3} y={:.3} z={:.3}  (longest axis: {axis} = {longest:.3})\n  proportions x:y:z = {:.2}:{:.2}:{:.2}",
- min[0],
- min[1],
- min[2],
- max[0],
- max[1],
- max[2],
- c[0],
- c[1],
- c[2],
- span[0],
- span[1],
- span[2],
- span[0] / span.iter().cloned().fold(f64::MIN, f64::max).max(1e-9),
- span[1] / span.iter().cloned().fold(f64::MIN, f64::max).max(1e-9),
- span[2] / span.iter().cloned().fold(f64::MIN, f64::max).max(1e-9),
- )
- }
- Query::Topology => {
- let n = m.vertices.len();
- let mut deg = vec![0usize; n];
- for &(a, b) in &m.edges {
- deg[a] += 1;
- deg[b] += 1;
- }
- let dangling = deg.iter().filter(|&&d| d == 1).count();
- let max_deg = deg.iter().copied().max().unwrap_or(0);
- let avg_deg = if n > 0 {
- deg.iter().sum::<usize>() as f64 / n as f64
- } else {
- 0.0
- };
- format!(
-                "topology:\n  vertices={} edges={}\n  degree min=0 max={max_deg} avg={avg_deg:.2}\n  dangling_edges={dangling} (degree-1 vertices)\n  connected_components={}",
- n,
- m.edges.len(),
- components(m)
- )
- }
- Query::EdgeStats => {
- let mut lens: Vec<f64> = m
- .edges
- .iter()
- .map(|&(a, b)| dist(m.vertices[a], m.vertices[b]))
- .collect();
- lens.sort_by(|a, b| a.partial_cmp(b).unwrap());
- let (min, max) = (
- lens.first().copied().unwrap_or(0.0),
- lens.last().copied().unwrap_or(0.0),
- );
- let avg = if !lens.is_empty() {
- lens.iter().sum::<f64>() / lens.len() as f64
- } else {
- 0.0
- };
- let long = lens.iter().filter(|&&l| l > avg * 2.0).count();
- format!(
-                "edge_stats:\n  edges={}  length min={min:.3} max={max:.3} avg={avg:.3}\n  edges_longer_than_2x_avg={long}",
- lens.len()
- )
- }
  Query::Profile => {
- let (min, max) = bounds(m);
- let span = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
- // Coverage: project every edge onto each axis, union the intervals.
- let mut cov = [[f64::MIN, f64::MAX]; 3];
- for &(a, b) in &m.edges {
- let (va, vb) = (m.vertices[a], m.vertices[b]);
- for (i, (pa, pb)) in [(va.0, vb.0), (va.1, vb.1), (va.2, vb.2)]
- .into_iter()
- .enumerate()
- {
- cov[i][0] = cov[i][0].max(pa.min(pb));
- cov[i][1] = cov[i][1].min(pa.max(pb));
- }
- }
- let _ = span;
- format!(
-                "profile (axis span vs edge-cover extent):\n  x: span={:.3} edge_cover=[{:.3},{:.3}]\n  y: span={:.3} edge_cover=[{:.3},{:.3}]\n  z: span={:.3} edge_cover=[{:.3},{:.3}]",
- max[0] - min[0],
- cov[0][0],
- cov[0][1],
- max[1] - min[1],
- cov[1][0],
- cov[1][1],
- max[2] - min[2],
- cov[2][0],
- cov[2][1],
- )
+  let (min, max) = bounds(m);
+  let span = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
+  // Coverage: the UNION of every edge's projection onto each axis
+  // ([min of lower ends, max of upper ends]). The old code intersected
+  // them (max of lower ends / min of upper ends), which for most models
+  // collapsed to an inverted, meaningless interval.
+  let mut cover: Option<[[f64; 2]; 3]> = None;
+  for &(a, b) in &m.edges {
+  let (va, vb) = (m.vertices[a], m.vertices[b]);
+  let c = cover.get_or_insert([[f64::INFINITY, f64::NEG_INFINITY]; 3]);
+  for (i, (pa, pb)) in [(va.0, vb.0), (va.1, vb.1), (va.2, vb.2)]
+  .into_iter()
+  .enumerate()
+  {
+   c[i][0] = c[i][0].min(pa.min(pb));
+   c[i][1] = c[i][1].max(pa.max(pb));
+  }
+  }
+  let axis = |i: usize| {
+  json!({
+                    "span": span[i],
+                    "edge_cover": cover.map(|c| json!([c[i][0], c[i][1]])),
+  })
+  };
+  json!({ "profile": { "x": axis(0), "y": axis(1), "z": axis(2) } })
  }
  Query::CrossSection => {
- let mut count = 0usize;
- let mut xs = [f64::MAX, f64::MIN];
- let mut ys = [f64::MAX, f64::MIN];
- for &(a, b) in &m.edges {
- let (va, vb) = (m.vertices[a], m.vertices[b]);
- let (z0, z1) = (va.2, vb.2);
- if (z0 - at) * (z1 - at) <= 0.0 && (z0 - z1).abs() > 1e-12 {
- let t = (at - z0) / (z1 - z0);
- let x = va.0 + t * (vb.0 - va.0);
- let y = va.1 + t * (vb.1 - va.1);
- xs[0] = xs[0].min(x);
- xs[1] = xs[1].max(x);
- ys[0] = ys[0].min(y);
- ys[1] = ys[1].max(y);
- count += 1;
- }
- }
- if count == 0 {
-                format!("cross_section z={at}: no edges cross this plane")
- } else {
- format!(
-                    "cross_section z={at}: {count} edges cross  x=[{:.3},{:.3}] y=[{:.3},{:.3}]",
- xs[0], xs[1], ys[0], ys[1]
- )
- }
+  let mut crossing: Vec<Value> = Vec::new();
+  let mut xs = [f64::MAX, f64::MIN];
+  let mut ys = [f64::MAX, f64::MIN];
+  for &(a, b) in &m.edges {
+  let (va, vb) = (m.vertices[a], m.vertices[b]);
+  let (z0, z1) = (va.2, vb.2);
+  if (z0 - at) * (z1 - at) <= 0.0 && (z0 - z1).abs() > 1e-12 {
+   let t = (at - z0) / (z1 - z0);
+   let x = va.0 + t * (vb.0 - va.0);
+   let y = va.1 + t * (vb.1 - va.1);
+   xs[0] = xs[0].min(x);
+   xs[1] = xs[1].max(x);
+   ys[0] = ys[0].min(y);
+   ys[1] = ys[1].max(y);
+   crossing.push(json!([a, b]));
+  }
+  }
+  let empty = crossing.is_empty();
+  json!({
+            "at": at,
+            "axis": "z",
+            "edges_crossing": crossing,
+            "x": if empty { Value::Null } else { json!([xs[0], xs[1]]) },
+            "y": if empty { Value::Null } else { json!([ys[0], ys[1]]) },
+  })
  }
  Query::Vertices => {
- let selected: Vec<usize> = match args.range {
- // A degenerate range (a > b, e.g. an empty group) -> empty.
- Some((a, b)) if a <= b => (a..=b).collect(),
- Some(_) => Vec::new(),
- None => (0..m.vertices.len()).collect(),
- };
- let vs: Vec<serde_json::Value> = selected
- .iter()
- .map(|&i| {
- let (x, y, z) = m.vertices[i];
-                    json!({ "index": i, "x": x, "y": y, "z": z })
- })
- .collect();
-            serde_json::to_string_pretty(&json!({ "vertices": vs })).unwrap()
+  let selected: Vec<usize> = match args.range {
+  // A degenerate range (a > b, e.g. an empty group) -> empty.
+  Some((a, b)) if a <= b => (a..=b).collect(),
+  Some(_) => Vec::new(),
+  None => (0..m.vertices.len()).collect(),
+  };
+  let vs: Vec<Value> = selected
+  .iter()
+  .map(|&i| {
+  let (x, y, z) = m.vertices[i];
+                json!({ "index": i, "x": x, "y": y, "z": z })
+  })
+  .collect();
+  json!({ "vertices": vs })
  }
  Query::Distance => {
- // Indices validated by the CLI (exit 2 on out of range; the CLI
- // guarantees `range` is present for distance/connectivity).
- let (a, b) = args
- .range
- .expect("distance requires a --range (guaranteed by cmd_query)");
- let d = dist(m.vertices[a], m.vertices[b]);
- serde_json::to_string_pretty(&json!({
-                "distance": d,
-                "from": a,
-                "to": b,
- }))
- .unwrap()
+  // Indices validated by the CLI (exit 3 on out of range; the CLI
+  // guarantees `range` is present for distance/connectivity).
+  let (a, b) = args
+  .range
+  .expect("distance requires a --range (guaranteed by cmd_query)");
+  json!({ "from": a, "to": b, "distance": dist(m.vertices[a], m.vertices[b]) })
  }
  Query::Connectivity => {
- let (a, b) = args
- .range
- .expect("connectivity requires a --range (guaranteed by cmd_query)");
- let c = connected(m, a, b);
- serde_json::to_string_pretty(&json!({
-                "connected": c,
-                "from": a,
-                "to": b,
- }))
- .unwrap()
+  let (a, b) = args
+  .range
+  .expect("connectivity requires a --range (guaranteed by cmd_query)");
+  json!({ "from": a, "to": b, "connected": connected(m, a, b) })
  }
+ }
+}
+
+/// The human-readable projection of [`value`] — it must not contain a number
+/// the JSON does not have. `vertices` / `distance` / `connectivity` have no
+/// separate text form: their pretty-printed JSON *is* the text.
+pub fn run(m: &Model, query: Query, args: &QueryArgs) -> String {
+ let v = value(m, query, args);
+ match query {
+ Query::Profile => {
+  let axis = |name: &str| {
+  let a = &v["profile"][name];
+  let cover = match a["edge_cover"].as_array() {
+                    Some(c) => format!(
+                        "[{:.3},{:.3}]",
+                        c[0].as_f64().unwrap_or(0.0),
+                        c[1].as_f64().unwrap_or(0.0)
+                    ),
+                    None => "none".to_string(),
+  };
+  format!(
+                    "  {name}: span={:.3} edge_cover={cover}",
+                    a["span"].as_f64().unwrap_or(0.0)
+  )
+  };
+  format!(
+                "profile (axis span vs edge-cover extent):\n{}\n{}\n{}\n",
+  axis("x"),
+  axis("y"),
+  axis("z")
+  )
+ }
+ Query::CrossSection => {
+  let at = v["at"].as_f64().unwrap_or(0.0);
+  let n = v["edges_crossing"].as_array().map(|a| a.len()).unwrap_or(0);
+  if n == 0 {
+                return format!("cross_section z={at}: no edges cross this plane\n");
+  }
+  let (x0, x1) = (
+  v["x"][0].as_f64().unwrap_or(0.0),
+  v["x"][1].as_f64().unwrap_or(0.0),
+  );
+  let (y0, y1) = (
+  v["y"][0].as_f64().unwrap_or(0.0),
+  v["y"][1].as_f64().unwrap_or(0.0),
+  );
+  format!(
+                "cross_section z={at}: {n} edges cross  x=[{x0:.3},{x1:.3}] y=[{y0:.3},{y1:.3}]\n"
+  )
+ }
+ _ => serde_json::to_string_pretty(&v).unwrap(),
  }
 }
 
@@ -309,11 +257,11 @@ mod tests {
  for i in 0..2 {
  for j in 0..2 {
  for k in 0..2 {
- verts.push((
- if i == 0 { -h } else { h },
- if j == 0 { -h } else { h },
- if k == 0 { -h } else { h },
- ));
+  verts.push((
+  if i == 0 { -h } else { h },
+  if j == 0 { -h } else { h },
+  if k == 0 { -h } else { h },
+  ));
  }
  }
  }
@@ -321,9 +269,9 @@ mod tests {
  for j in 0..2 {
  for k in 0..2 {
  for (di, dj, dk) in [(1, 0, 0), (0, 1, 0), (0, 0, 1)] {
- if i + di < 2 && j + dj < 2 && k + dk < 2 {
- edges.push((i * 4 + j * 2 + k, (i + di) * 4 + (j + dj) * 2 + (k + dk)));
- }
+  if i + di < 2 && j + dj < 2 && k + dk < 2 {
+  edges.push((i * 4 + j * 2 + k, (i + di) * 4 + (j + dj) * 2 + (k + dk)));
+  }
  }
  }
  }
@@ -335,45 +283,59 @@ mod tests {
  }
 
  #[test]
- fn query_parse() {
-        assert_eq!(Query::parse("extents").unwrap(), Query::Extents);
-        assert_eq!(Query::parse("EDGE_STATS").unwrap(), Query::EdgeStats);
+ fn query_parse_keeps_the_five_computational_queries() {
+        assert_eq!(Query::parse("profile").unwrap(), Query::Profile);
+        assert_eq!(Query::parse("CROSS_SECTION").unwrap(), Query::CrossSection);
+        assert_eq!(Query::parse("vertices").unwrap(), Query::Vertices);
+        assert_eq!(Query::parse("DISTANCE").unwrap(), Query::Distance);
+        assert_eq!(Query::parse("connectivity").unwrap(), Query::Connectivity);
         assert!(Query::parse("nope").is_err());
  }
 
  #[test]
- fn extents_of_cube() {
- let t = run(
- &cube(),
- Query::Extents,
- &QueryArgs { at: 0.0, range: None },
- );
-        assert!(t.contains("min=[-1.000,-1.000,-1.000]"));
-        assert!(t.contains("max=[1.000,1.000,1.000]"));
-        assert!(t.contains("span x=2.000 y=2.000 z=2.000"));
-        assert!(t.contains("longest axis:"));
+ fn query_parse_redirects_the_three_summary_queries() {
+        // Removed modes must name their replacement, not say "unknown".
+ for (old, field) in [
+  ("extents", "bounds"),
+  ("topology", "topology"),
+  ("edge_stats", "edge_lengths"),
+ ] {
+  let e = Query::parse(old).unwrap_err();
+  assert!(e.contains("wrfm geometry"), "{e}");
+  assert!(e.contains(field), "{e}");
+ }
  }
 
  #[test]
- fn topology_of_cube() {
- let t = run(
- &cube(),
- Query::Topology,
- &QueryArgs { at: 0.0, range: None },
- );
-        assert!(t.contains("vertices=8 edges=12"));
-        assert!(t.contains("max=3"));
-        assert!(t.contains("connected_components=1"));
+ fn profile_edge_cover_is_a_union_not_an_intersection() {
+        // Regression: the intersection of every edge's projection is
+        // degenerate for most models (cube: [1,-1], min > max).
+ let v = value(&cube(), Query::Profile, &args());
+ for axis in ["x", "y", "z"] {
+  let c = v["profile"][axis]["edge_cover"].as_array().unwrap();
+  let (lo, hi) = (c[0].as_f64().unwrap(), c[1].as_f64().unwrap());
+  assert_eq!((lo, hi), (-1.0, 1.0), "{axis}");
+  assert!(lo <= hi, "edge_cover must be ordered: {axis} {lo} {hi}");
+  assert_eq!(v["profile"][axis]["span"], 2.0);
+ }
  }
 
  #[test]
- fn edge_stats_of_cube() {
- let t = run(
- &cube(),
- Query::EdgeStats,
- &QueryArgs { at: 0.0, range: None },
- );
-        assert!(t.contains("length min=2.000 max=2.000 avg=2.000"));
+ fn profile_text_projection_matches_the_json() {
+ let t = run(&cube(), Query::Profile, &args());
+ assert!(t.contains("x: span=2.000 edge_cover=[-1.000,1.000]"), "{t}");
+ assert!(t.ends_with('\n'), "text queries end with a newline");
+ }
+
+ #[test]
+ fn profile_without_edges_has_no_cover() {
+ let m = Model {
+ vertices: vec![(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)],
+ edges: vec![],
+ };
+ let v = value(&m, Query::Profile, &args());
+ assert!(v["profile"]["x"]["edge_cover"].is_null());
+ assert!(run(&m, Query::Profile, &args()).contains("edge_cover=none"));
  }
 
  #[test]
@@ -385,20 +347,31 @@ mod tests {
  );
         assert!(t.contains("edges cross"));
         assert!(t.contains("x=[-1.000,1.000] y=[-1.000,1.000]"));
+        // The count in the text is the length of the JSON edge list.
+ let v = value(&cube(), Query::CrossSection, &args());
+ let n = v["edges_crossing"].as_array().unwrap().len();
+ assert!(t.contains(&format!("{n} edges cross")));
  }
+
+ #[test]
+ fn cross_section_without_crossings_is_empty_not_inverted() {
+ let m = Model {
+ vertices: vec![(0.0, 0.0, 0.0), (1.0, 0.0, 1.0)],
+ edges: vec![(0, 1)],
+ };
+ let v = value(&m, Query::CrossSection, &QueryArgs { at: 5.0, ..args() });
+ assert!(v["edges_crossing"].as_array().unwrap().is_empty());
+ assert!(v["x"].is_null() && v["y"].is_null());
+ assert!(run(&m, Query::CrossSection, &QueryArgs { at: 5.0, ..args() })
+ .contains("no edges cross"));
+ }
+
  fn verts(n: usize) -> Vec<(f64, f64, f64)> {
  (0..n).map(|i| (i as f64, 0.0, 0.0)).collect()
  }
 
  fn args() -> QueryArgs {
  QueryArgs { at: 0.0, range: None }
- }
-
- #[test]
- fn query_parse_new_types() {
-        assert_eq!(Query::parse("vertices").unwrap(), Query::Vertices);
-        assert_eq!(Query::parse("DISTANCE").unwrap(), Query::Distance);
-        assert_eq!(Query::parse("connectivity").unwrap(), Query::Connectivity);
  }
 
  #[test]
@@ -522,4 +495,3 @@ mod tests {
         assert_eq!(j["connected"], true);
  }
 }
-
