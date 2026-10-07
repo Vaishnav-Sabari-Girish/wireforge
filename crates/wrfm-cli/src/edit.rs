@@ -1,3 +1,4 @@
+use crate::proximity::Grid;
 use ratatui_wireframe::model::Model;
 use std::collections::HashSet;
 
@@ -175,7 +176,7 @@ pub fn clean(m: &Model) -> (Model, Vec<usize>) {
 
 /// `dedupe`: merge duplicate vertices (EXACT same (x,y,z) — the bit pattern, since `f64` is not reliably hashable) and drop duplicate /
 pub fn dedupe(m: &Model) -> (Model, Vec<usize>) {
- use std::collections::{HashMap, HashSet};
+ use std::collections::HashMap;
 
  // 1. First-occurrence index keyed by the exact coordinate bit pattern.
  let mut first: HashMap<(u64, u64, u64), usize> = HashMap::new();
@@ -194,30 +195,92 @@ pub fn dedupe(m: &Model) -> (Model, Vec<usize>) {
  }
  }
 
- // 2. Edges: drop edges that collapse to zero length (original a == b,
- // or both endpoints merged to the same kept vertex), then dedupe by
- // the unordered kept pair, keeping the first occurrence.
+ // 2. Edge cleanup (shared with `weld`): drop edges that collapsed onto
+ // one survivor and duplicate unordered pairs (first occurrence wins).
+ collapse(m, &map, kept, removed)
+}
+
+/// Rebuild the model from the `kept` survivors of a vertex merge
+/// (`dedupe` / `weld`): remap every edge through `map`, drop edges that
+/// collapse to zero length (both endpoints landed on the same survivor),
+/// then drop duplicate unordered pairs (first occurrence wins). The
+/// shared "merge cleanup" tail — `--weld` behaves exactly like
+/// `--dedupe` here; only the vertex-merge criterion differs.
+fn collapse(
+ m: &Model,
+ map: &[usize],
+ kept: Vec<(f64, f64, f64)>,
+ removed: Vec<usize>,
+) -> (Model, Vec<usize>) {
  let mut seen: HashSet<(usize, usize)> = HashSet::new();
  let mut edges = Vec::new();
  for &(a, b) in &m.edges {
- let (Some(&ma), Some(&mb)) = (map.get(a), map.get(b)) else {
- continue; // out-of-range endpoint -> dropped
- };
- if ma == mb {
- continue; // zero-length after dedupe
- }
- let key = (ma.min(mb), ma.max(mb));
- if seen.insert(key) {
- edges.push((ma, mb));
- }
+  let (Some(&ma), Some(&mb)) = (map.get(a), map.get(b)) else {
+   continue; // out-of-range endpoint -> dropped
+  };
+  if ma == mb {
+   continue; // zero-length after the merge
+  }
+  let key = (ma.min(mb), ma.max(mb));
+  if seen.insert(key) {
+   edges.push((ma, mb));
+  }
  }
  (
- Model {
- vertices: kept,
- edges,
- },
- removed,
+  Model {
+   vertices: kept,
+   edges,
+  },
+  removed,
  )
+}
+
+/// `weld`: merge vertices strictly closer than `tol` world units — the
+/// tolerance-based twin of `dedupe`, for real-world data whose "same"
+/// points differ by float noise (~1e-15 between independently sampled
+/// boundary curves, which `--dedupe`'s exact match misses). Uses the same
+/// `proximity` definition of "the same point" as `check` (strict `<`), so
+/// `weld` clears exactly the near-duplicates `check` reports.
+///
+/// Spatial hash (`proximity::Grid`): vertices are bucketed by
+/// `floor(coord / tol)` and every vertex probes its 27 neighbouring cells,
+/// so a pair straddling a cell boundary still merges. A cluster resolves to
+/// its LOWEST-INDEX member (the "first-touch" rule): the survivor keeps its
+/// file position, group segments stay contiguous, and each merged vertex
+/// belongs to exactly one group — the first group section that touched it.
+///
+/// Returns the merged model plus the merged-away indices (ordered, ready
+/// for `remap_groups`) and reuses `dedupe`'s edge cleanup: duplicate and
+/// zero-length edges are dropped.
+pub fn weld(m: &Model, tol: f64) -> (Model, Vec<usize>) {
+
+ // The caller validates `tol` (finite, > 0); keep a hard guard here so a
+ // bad value can never silently weld whole models together.
+ debug_assert!(
+  tol.is_finite() && tol > 0.0,
+  "weld tolerance must be finite and > 0"
+ );
+ let mut grid = Grid::new(tol);
+ let mut map = vec![0usize; m.vertices.len()];
+ let mut kept: Vec<(f64, f64, f64)> = Vec::new();
+ let mut removed = Vec::new();
+ for (i, &v) in m.vertices.iter().enumerate() {
+  match grid.nearest_within(v, &m.vertices, tol) {
+   // Join the lowest-indexed survivor within tol — `map[j]` is that
+   // survivor's slot, so a chain resolves to the first-touch member.
+   Some(j) => {
+    map[i] = map[j];
+    removed.push(i);
+   }
+   // New survivor: the first touch of its own cluster.
+   None => {
+    map[i] = kept.len();
+    kept.push(v);
+    grid.insert(i, v);
+   }
+  }
+ }
+ collapse(m, &map, kept, removed)
 }
 
 /// `merge`: concatenate model `b` into model `a` (vertices appended, edges offset).
@@ -465,6 +528,77 @@ mod tests {
  fn dedupe_zero_length_edge_dropped() {
  let out = dedupe(&m(verts(3), vec![(1, 1)]));
  assert!(out.0.edges.is_empty());
+ }
+
+ // -- weld -------------------------------------------------------------------
+
+ #[test]
+ fn weld_merges_vertices_within_tolerance() {
+ // Vertex 2 sits 1e-7 from vertex 1 — invisible to `--dedupe`'s exact
+ // match, well inside a 1e-6 weld tolerance.
+ let model = m(
+ vec![(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0000001, 0.0, 0.0)],
+ vec![(0, 1), (1, 2)],
+ );
+ let out = weld(&model, 1e-6);
+ assert_eq!(out.0.vertices.len(), 2, "the near-twin must merge");
+ assert_eq!(out.1, vec![2]);
+ // Edge (1,2) collapsed onto one survivor -> dropped; (0,1) survives.
+ assert_eq!(out.0.edges, vec![(0, 1)]);
+ }
+
+ #[test]
+ fn weld_probes_neighbour_cells_across_the_grid() {
+ // tol = 1.0 buckets 0.99 into cell 0 and 1.01 into cell 1; a naive
+ // single-cell hash would miss this pair.
+ let model = m(vec![(0.99, 0.0, 0.0), (1.01, 0.0, 0.0)], vec![]);
+ let out = weld(&model, 1.0);
+ assert_eq!(out.0.vertices.len(), 1, "cell-boundary pair must merge");
+ assert_eq!(out.1, vec![1]);
+ }
+
+ #[test]
+ fn weld_keeps_vertices_beyond_tolerance() {
+ let model = m(vec![(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.00001, 0.0, 0.0)], vec![]);
+ let out = weld(&model, 1e-6);
+ assert_eq!(out.0.vertices.len(), 3, "2e-5 apart > 1e-6 tol");
+ assert!(out.1.is_empty());
+ }
+
+ #[test]
+ fn weld_first_occurrence_survives() {
+ // First-touch rule: the lowest-index twin keeps its slot (and its
+ // group segment); the later one is merged away.
+ let model = m(vec![(1.0, 1.0, 1.0), (0.0, 0.0, 0.0), (1.0 + 1e-9, 1.0, 1.0)], vec![]);
+ let out = weld(&model, 1e-6);
+ assert_eq!(out.0.vertices, vec![(1.0, 1.0, 1.0), (0.0, 0.0, 0.0)]);
+ assert_eq!(out.1, vec![2]);
+ }
+
+ #[test]
+ fn weld_cleans_duplicate_and_zero_length_edges() {
+ // The `--dedupe` cleanup contract, applied to a tolerance merge:
+ // (1,2) is a near-twin pair -> collapses, twice; (0,0) is zero-length.
+ let model = m(
+ vec![(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0 + 1e-9, 0.0, 0.0)],
+ vec![(0, 1), (1, 2), (1, 2), (0, 0)],
+ );
+ let out = weld(&model, 1e-6);
+ assert_eq!(out.0.vertices.len(), 2);
+ assert_eq!(out.0.edges, vec![(0, 1)], "collapsed + duplicate edges dropped");
+ }
+
+ #[test]
+ fn weld_merges_float_noise_at_1e_15() {
+ // The teapot case: two samples of the same boundary curve differ by
+ // ~1e-15 — `dedupe` misses it, `weld 1e-6` must not.
+ let model = m(
+ vec![(1.0, 1.0, 1.0), (1.0000000000000002, 1.0, 1.0)],
+ vec![],
+ );
+ assert_eq!(dedupe(&model).0.vertices.len(), 2, "exact match misses it");
+ let out = weld(&model, 1e-6);
+ assert_eq!(out.0.vertices.len(), 1, "weld must catch the 1e-15 twin");
  }
 
  // -- merge -----------------------------------------------------------------

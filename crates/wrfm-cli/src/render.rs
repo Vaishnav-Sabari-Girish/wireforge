@@ -97,55 +97,6 @@ impl Format {
  }
 }
 
-/// Detail presets implementing the "pyramid" viewing strategy.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Detail {
- /// Layer 1: coarse density grid (16x8) — overall shape, ~150 tokens.
- Overview,
- /// Layer 2: fine density grid (32x16) — structural detail, ~350 tokens.
- Standard,
-    /// Layer 3: ASCII dot map (40x16 chars = 80x64 dots) — "final look", ~1.5k tokens.
- Fine,
-}
-
-impl Detail {
- /// Apply the preset onto `opts` (overrides format, size and grid dims).
- pub fn apply(self, opts: &mut RenderOptions) {
- match self {
- Detail::Overview => {
- opts.format = Format::Grid;
- opts.width = 40;
- opts.height = 16;
- opts.grid_w = 16;
- opts.grid_h = 8;
- }
- Detail::Standard => {
- opts.format = Format::Grid;
- opts.width = 60;
- opts.height = 24;
- opts.grid_w = 32;
- opts.grid_h = 16;
- }
- Detail::Fine => {
- opts.format = Format::Ascii;
- opts.width = 40;
- opts.height = 16;
- }
- }
- }
-
- pub fn parse(s: &str) -> Result<Detail, String> {
- match s.trim().to_ascii_lowercase().as_str() {
-            "overview" => Ok(Detail::Overview),
-            "standard" => Ok(Detail::Standard),
-            "fine" => Ok(Detail::Fine),
- other => Err(format!(
-                "unknown detail '{other}' (expected overview|standard|fine)"
- )),
- }
- }
-}
-
 /// Standard camera views, expressed in the wireforge fork's world-frame yaw/pitch.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum View {
@@ -245,6 +196,8 @@ pub struct RenderOptions {
  pub grid_h: usize,
 /// Zoom into a sub-region of the projected view, as normalized fractions `(x0, y0, x1, y1)` in 0..1 of the canvas (y grows downward). None =
  pub region: Option<[f64; 4]>,
+/// `--fit content`: crop each frame to the projected content bounding box, so the model fills the canvas. Applied per view AFTER the camera
+ pub fit_content: bool,
 }
 
 /// Inter-group adjacency for every group: how many BOUNDARY edges (exactly one endpoint in the group) connect to each OTHER group (the first group
@@ -454,6 +407,68 @@ pub(crate) fn project_vertex(
  Some((f * rxr / z, f * ryr / z))
 }
 
+/// `--fit content`: the normalized region `(x0, y0, x1, y1)` (0..1 canvas
+/// fractions, y growing downward) that crops this camera's frame to the
+/// projected model content, so the content fills the canvas. Computed with
+/// the SAME projection the frame uses (world rotation, dist, focal length,
+/// roll, pan), per view. Returns `None` when nothing projects (e.g. every
+/// vertex behind the camera) — the caller then keeps the full frame.
+///
+/// An explicit `--region` is never overridden: `--fit content` only fills
+/// in the region when the caller did not pass one.
+pub fn fit_content_region(
+ m: &Model,
+ pitch_deg: f64,
+ yaw_deg: f64,
+ roll_deg: f64,
+ opts: &RenderOptions,
+) -> Option<[f64; 4]> {
+ let px_w = opts.width.max(1) as f64 * 2.0;
+ let px_h = opts.height.max(1) as f64 * 4.0;
+ let rot = world_rot(pitch_deg, yaw_deg);
+ let dist = if opts.auto_dist {
+  auto_dist(m)
+ } else {
+  opts.dist.unwrap_or(DEFAULT_DIST)
+ };
+ let f = (px_h / 2.0) / (FOV_DEG / 2.0).to_radians().tan();
+ let (sr, cr) = roll_deg.to_radians().sin_cos();
+
+ // Projected content bounding box in canvas pixels (origin = centre).
+ let (mut minx, mut maxx) = (f64::INFINITY, f64::NEG_INFINITY);
+ let (mut miny, mut maxy) = (f64::INFINITY, f64::NEG_INFINITY);
+ let mut any = false;
+ for &v in &m.vertices {
+  if let Some((x, y)) = project_vertex(v, &rot, dist, f, opts.pan_x, opts.pan_y, sr, cr) {
+   minx = minx.min(x);
+   maxx = maxx.max(x);
+   miny = miny.min(y);
+   maxy = maxy.max(y);
+   any = true;
+  }
+ }
+ if !any {
+  return None;
+ }
+
+ // Canvas fractions; y flips (canvas y grows downward).
+ let (mut x0, mut x1) = ((minx + px_w / 2.0) / px_w, (maxx + px_w / 2.0) / px_w);
+ let (mut y0, mut y1) = ((px_h / 2.0 - maxy) / px_h, (px_h / 2.0 - miny) / px_h);
+ // 2% breathing room per side (>= 0.001 so a degenerate point/edge-on
+ // line still yields a usable window) — keeps the outer braille dots
+ // from being clipped by the frame.
+ let padx = ((x1 - x0) * 0.02).max(0.001);
+ let pady = ((y1 - y0) * 0.02).max(0.001);
+ x0 = (x0 - padx).clamp(0.0, 1.0);
+ x1 = (x1 + padx).clamp(0.0, 1.0);
+ y0 = (y0 - pady).clamp(0.0, 1.0);
+ y1 = (y1 + pady).clamp(0.0, 1.0);
+ if x1 <= x0 || y1 <= y0 {
+  return None;
+ }
+ Some([x0, y0, x1, y1])
+}
+
 /// Geometry / view parameters for a single off-screen render.
 struct GeomParams {
  pitch_deg: f64,
@@ -573,6 +588,13 @@ fn render_single_to_text(
  opts: &RenderOptions,
 ) -> String {
  let (w, h) = (opts.width, opts.height);
+ // `--fit content` fills in the region PER VIEW when no explicit
+ // --region was passed (an explicit --region always wins).
+ let region = if opts.fit_content && opts.region.is_none() {
+ fit_content_region(m, pitch_deg, yaw_deg, roll_deg, opts)
+ } else {
+ opts.region
+ };
  let g = GeomParams {
  pitch_deg,
  yaw_deg,
@@ -583,7 +605,7 @@ fn render_single_to_text(
  dist: opts.dist,
  pan_x: opts.pan_x,
  pan_y: opts.pan_y,
- region: opts.region,
+ region,
  };
  let braille = render_braille(m, &g);
 
@@ -807,6 +829,79 @@ pub fn diff_to_text(a: &Model, b: &Model, opts: &DiffOptions, detail: bool) -> S
 }
 
 /// Structured diff between two models: vertex add/remove/move (matched by quantized coordinates, displacements reported) and edge add/remove, plus
+/// Group comparison for `wrfm diff`: the group names on each side, the
+/// add/remove sets, and — the case that used to be invisible — vertices that
+/// changed group membership while the geometry stayed identical.
+///
+/// Membership is the group's vertex range `[vertex_start, vertex_end)` in
+/// the ONE global vertex list, so a regrouping shows up as `only_in_a` /
+/// `only_in_b` index lists.
+pub fn groups_diff(a: &[wrfm::Group], b: &[wrfm::Group]) -> Value {
+    let names = |gs: &[wrfm::Group]| -> Vec<String> {
+        gs.iter().map(|g| g.name.clone()).collect()
+    };
+    let (na, nb) = (names(a), names(b));
+    let added: Vec<&String> = nb.iter().filter(|n| !na.contains(n)).collect();
+    let removed: Vec<&String> = na.iter().filter(|n| !nb.contains(n)).collect();
+    let mut changed: Vec<Value> = Vec::new();
+    for ga in a {
+        let Some(gb) = b.iter().find(|g| g.name == ga.name) else {
+            continue;
+        };
+        let in_a = |i: usize| (ga.vertex_start..ga.vertex_end).contains(&i);
+        let in_b = |i: usize| (gb.vertex_start..gb.vertex_end).contains(&i);
+        let lo = ga.vertex_start.min(gb.vertex_start);
+        let hi = ga.vertex_end.max(gb.vertex_end);
+        let only_in_a: Vec<usize> = (lo..hi).filter(|&i| in_a(i) && !in_b(i)).collect();
+        let only_in_b: Vec<usize> = (lo..hi).filter(|&i| in_b(i) && !in_a(i)).collect();
+        if !only_in_a.is_empty() || !only_in_b.is_empty() {
+            changed.push(json!({
+                "name": ga.name,
+                "only_in_a": only_in_a,
+                "only_in_b": only_in_b,
+            }));
+        }
+    }
+    json!({
+        "a": na,
+        "b": nb,
+        "added": added,
+        "removed": removed,
+        "membership_changed": changed,
+    })
+}
+
+/// The text projection of [`groups_diff`]: `None` when the group structure is
+/// identical (so the text diff stays byte-for-byte what it was).
+pub fn groups_diff_line(g: &Value) -> Option<String> {
+    let count = |k: &str| g[k].as_array().map(|a| a.len()).unwrap_or(0);
+    let (na, nb) = (count("a"), count("b"));
+    let mut parts: Vec<String> = Vec::new();
+    // `Value` Display would print JSON strings WITH their quotes.
+    for name in g["added"].as_array().into_iter().flatten() {
+        parts.push(format!("+{}", name.as_str().unwrap_or("-")));
+    }
+    for name in g["removed"].as_array().into_iter().flatten() {
+        parts.push(format!("-{}", name.as_str().unwrap_or("-")));
+    }
+    for c in g["membership_changed"].as_array().into_iter().flatten() {
+        let out = c["only_in_a"].as_array().map(|a| a.len()).unwrap_or(0);
+        let inn = c["only_in_b"].as_array().map(|a| a.len()).unwrap_or(0);
+        parts.push(format!(
+            "{} (-{out} +{inn} vertices)",
+            c["name"].as_str().unwrap_or("-")
+        ));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "# groups: {na} -> {nb}   changed: {}",
+            parts.join(", ")
+        ))
+    }
+}
+
 pub fn diff_to_json(a: &Model, b: &Model, limit: usize) -> Value {
  let r3 = |x: f64| (x * 1000.0).round() / 1000.0;
  let bucket = |v: &(f64, f64, f64)| -> (i64, i64, i64) {
@@ -1139,6 +1234,7 @@ mod tests {
  grid_w: 16,
  grid_h: 8,
  region: None,
+ fit_content: false,
  }
  }
 
@@ -1314,32 +1410,6 @@ mod tests {
  // There must be at least one changed cell.
         let summary = text.lines().find(|l| l.starts_with("# summary:")).unwrap();
         assert!(!summary.contains("0/128 cells changed"));
- }
-
- #[test]
- fn detail_presets_override_format_and_size() {
- let mut o = opts(Format::Braille, vec![]);
- Detail::Overview.apply(&mut o);
- assert_eq!(o.format, Format::Grid);
- assert_eq!((o.grid_w, o.grid_h), (16, 8));
- assert_eq!((o.width, o.height), (40, 16));
-
- Detail::Standard.apply(&mut o);
- assert_eq!(o.format, Format::Grid);
- assert_eq!((o.grid_w, o.grid_h), (32, 16));
- assert_eq!((o.width, o.height), (60, 24));
-
- Detail::Fine.apply(&mut o);
- assert_eq!(o.format, Format::Ascii);
- assert_eq!((o.width, o.height), (40, 16));
- }
-
- #[test]
- fn detail_parse() {
-        assert_eq!(Detail::parse("overview").unwrap(), Detail::Overview);
-        assert_eq!(Detail::parse("STANDARD").unwrap(), Detail::Standard);
-        assert_eq!(Detail::parse("fine").unwrap(), Detail::Fine);
-        assert!(Detail::parse("nope").is_err());
  }
 
  #[test]
@@ -1531,6 +1601,96 @@ mod tests {
  render_to_text(&m, &plain),
             "named views must ignore explicit angles"
  );
+ }
+
+ // -- fit content ------------------------------------------------------------
+
+ /// Fraction of the ascii frame covered by the lit-dot bounding box:
+ /// `(columns, rows)`.
+ fn ascii_coverage(text: &str) -> (f64, f64) {
+ let rows: Vec<Vec<char>> = text.lines().map(|l| l.chars().collect()).collect();
+ let (h, w) = (rows.len(), rows.first().map(|r| r.len()).unwrap_or(0));
+ let (mut c0, mut c1, mut r0, mut r1) = (usize::MAX, 0usize, usize::MAX, 0usize);
+ for (y, row) in rows.iter().enumerate() {
+ for (x, &c) in row.iter().enumerate() {
+ if c == '#' {
+ c0 = c0.min(x);
+ c1 = c1.max(x);
+ r0 = r0.min(y);
+ r1 = r1.max(y);
+ }
+ }
+ }
+ if c0 == usize::MAX || w == 0 || h == 0 {
+ return (0.0, 0.0);
+ }
+ (
+ (c1 - c0 + 1) as f64 / w as f64,
+ (r1 - r0 + 1) as f64 / h as f64,
+ )
+ }
+
+ #[test]
+ fn fit_content_region_is_some_and_inside_the_canvas() {
+ let m = cube();
+ let o = opts(Format::Braille, vec![]);
+ // front / top / iso: every view gets its own clamped, non-degenerate window.
+ for (pitch, yaw) in [(0.0, 0.0), (-90.0, 0.0), (30.0, 45.0)] {
+ let r = fit_content_region(&m, pitch, yaw, 0.0, &o).expect("cube projects");
+ assert!(
+ r[0] >= 0.0 && r[1] >= 0.0 && r[2] <= 1.0 && r[3] <= 1.0,
+ "region must be clamped to the canvas: {r:?}"
+ );
+ assert!(r[2] > r[0] && r[3] > r[1], "region must be non-degenerate: {r:?}");
+ // auto_dist frames the model well inside the canvas, so the content
+ // window is strictly smaller than the full frame.
+ assert!(
+ (r[2] - r[0]) < 0.99 && (r[3] - r[1]) < 0.99,
+ "fit must crop, not keep the whole frame: {r:?}"
+ );
+ }
+ }
+
+ #[test]
+ fn fit_content_fills_the_canvas() {
+ let m = cube();
+ let plain = opts(Format::Ascii, vec![]);
+ let mut fit = opts(Format::Ascii, vec![]);
+ fit.fit_content = true;
+ let nofit = ascii_coverage(&render_to_text(&m, &plain));
+ let fitted = ascii_coverage(&render_to_text(&m, &fit));
+ assert!(
+ fitted.0 >= 0.8 && fitted.1 >= 0.8,
+ "fit content should fill the canvas, got {fitted:?}"
+ );
+ assert!(
+ fitted.0 > nofit.0 + 0.2 && fitted.1 > nofit.1 + 0.2,
+ "fit {fitted:?} must cover substantially more than {nofit:?}"
+ );
+ }
+
+ #[test]
+ fn fit_content_yields_to_an_explicit_region() {
+ // Priority contract: --region beats --fit content.
+ let m = cube();
+ let mut o = opts(Format::Ascii, vec![]);
+ o.region = Some([0.25, 0.25, 0.75, 0.75]);
+ o.fit_content = true;
+ let with_fit = render_to_text(&m, &o);
+ o.fit_content = false;
+ let without_fit = render_to_text(&m, &o);
+ assert_eq!(with_fit, without_fit, "explicit --region must win over --fit");
+ }
+
+ #[test]
+ fn fit_content_none_when_nothing_projects() {
+ // Camera pushed behind the model (z = dist - rz <= 0.1 for every
+ // vertex): everything is culled, so there is no content to frame and
+ // the caller keeps the full frame (None).
+ let mut o = opts(Format::Braille, vec![]);
+ o.auto_dist = false;
+ o.dist = Some(-1.0);
+ assert!(fit_content_region(&cube(), 0.0, 0.0, 0.0, &o).is_none());
  }
 }
 

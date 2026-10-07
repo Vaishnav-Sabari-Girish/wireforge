@@ -1,11 +1,7 @@
+use crate::proximity::{Grid, POINT_TOL};
 use ratatui_wireframe::model::Model;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-
-/// Coordinate tolerance for "duplicate" vertices / "zero-length" edges.
-const EPS: f64 = 1e-6;
-/// Quantization step for the duplicate-vertex hash (>> EPS so exact twins
-const BUCKET: f64 = 1e-4;
 
 /// Tarjan bridge-finding: every edge whose removal disconnects its connected
 /// component (an "open edge" — no cycle covers it). Runs the DFS over EACH
@@ -72,45 +68,88 @@ pub(crate) fn bridges(m: &Model) -> Vec<(usize, usize)> {
     out
 }
 
+/// Per-vertex degree over every edge — the table `check` itself is built on
+/// (out-of-range endpoints are ignored so a corrupt index can never panic).
+pub fn degrees(m: &Model) -> Vec<usize> {
+    let mut deg = vec![0usize; m.vertices.len()];
+    for &(a, b) in &m.edges {
+        // One endpoint at a time: two `get_mut` calls cannot live in the
+        // same borrow expression, and an out-of-range endpoint is skipped.
+        if let Some(x) = deg.get_mut(a) {
+            *x += 1;
+        }
+        if let Some(y) = deg.get_mut(b) {
+            *y += 1;
+        }
+    }
+    deg
+}
+
+/// Vertices of degree exactly 2 — the L2 "non-manifold" (pinch) verdict,
+/// extracted from `check`'s degree scan so every caller counts the same set.
+pub fn non_manifold_vertices(deg: &[usize]) -> Vec<usize> {
+    deg.iter()
+        .enumerate()
+        .filter(|(_, d)| **d == 2)
+        .map(|(i, _)| i)
+        .collect()
+}
+
 /// Run the health check. `strict` upgrades warning-level issues (duplicates,
 pub fn check(m: &Model, strict: bool) -> Value {
  let n = m.vertices.len();
 
- // Degree table (needed by several checks). All edge indices are valid
- // (see the module-level invariant), so `deg[a]` is in range directly.
- let mut deg = vec![0usize; n.max(1)];
- for &(a, b) in &m.edges {
- deg[a] += 1;
- deg[b] += 1;
+ // Degree table (needed by several checks) — built by the shared `degrees`
+ // helper, so `check` counts exactly the degrees any other caller sees.
+ // All edge indices are valid (see the module-level invariant). An EMPTY
+ // model keeps its historical one-slot table, so the scan below still
+ // reports it `broken` (isolated vertex) instead of silently `ok`.
+ let mut deg = degrees(m);
+ if n == 0 {
+  deg.push(0);
  }
 
- // Duplicate vertices: hash by quantized coordinates, compare within bucket.
- let mut buckets: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
- for (i, &(x, y, z)) in m.vertices.iter().enumerate() {
- let key = (
- (x / BUCKET).round() as i64,
- (y / BUCKET).round() as i64,
- (z / BUCKET).round() as i64,
- );
- buckets.entry(key).or_default().push(i);
- }
+ // Duplicate vertices, in TWO categories — the repair action differs:
+ //
+ // * `duplicate_vertices`      — the exact same coordinates (bit pattern).
+ //                               Repair: `wrfm edit --dedupe`.
+ // * `near_duplicate_vertices` — closer than POINT_TOL but not bit-equal
+ //                               (independently sampled copies of one point
+ //                               differ by ~1e-15). Repair: `wrfm edit
+ //                               --weld 1e-6`.
+ //
+ // The near-duplicate scan uses the shared `proximity::Grid`, whose 27-cell
+ // probe also finds pairs that straddle a cell boundary; the old
+ // single-bucket probe silently missed those (regression test:
+ // `check_finds_near_duplicates_across_a_cell_boundary`).
  let mut dup_vertices: Vec<Value> = Vec::new();
- let mut seen_dup = vec![false; n];
- for bucket in buckets.values() {
- for (i, &a) in bucket.iter().enumerate() {
- for &b in &bucket[i + 1..] {
- let (va, vb) = (m.vertices[a], m.vertices[b]);
- let d2 = (va.0 - vb.0).powi(2) + (va.1 - vb.1).powi(2) + (va.2 - vb.2).powi(2);
- if d2 < EPS * EPS && !seen_dup[b] {
- seen_dup[b] = true;
- dup_vertices.push(json!({
-                        "index": b,
-                        "coords": [vb.0, vb.1, vb.2],
-                        "twin": a,
- }));
- }
- }
- }
+ let mut near_vertices: Vec<Value> = Vec::new();
+ {
+  let mut exact: HashMap<(u64, u64, u64), usize> = HashMap::new();
+  let mut grid = Grid::new(POINT_TOL);
+  for (i, &v) in m.vertices.iter().enumerate() {
+   let bits = (v.0.to_bits(), v.1.to_bits(), v.2.to_bits());
+   if let Some(&twin) = exact.get(&bits) {
+    dup_vertices.push(json!({
+                    "index": i,
+                    "coords": [v.0, v.1, v.2],
+                    "twin": twin,
+    }));
+   } else {
+    exact.insert(bits, i);
+    if let Some(twin) = grid.nearest_within(v, &m.vertices, POINT_TOL) {
+     let w = m.vertices[twin];
+     let d = ((v.0 - w.0).powi(2) + (v.1 - w.1).powi(2) + (v.2 - w.2).powi(2)).sqrt();
+     near_vertices.push(json!({
+                        "index": i,
+                        "coords": [v.0, v.1, v.2],
+                        "twin": twin,
+                        "distance": d,
+     }));
+    }
+   }
+   grid.insert(i, v);
+  }
  }
 
  // Zero-length edges.
@@ -123,8 +162,8 @@ pub fn check(m: &Model, strict: bool) -> Value {
  //).
  let (va, vb) = (m.vertices[a], m.vertices[b]);
  let d2 = (va.0 - vb.0).powi(2) + (va.1 - vb.1).powi(2) + (va.2 - vb.2).powi(2);
- if d2 < EPS * EPS {
-            zero_edges.push(json!({ "edge": [a, b] }));
+ if d2 < POINT_TOL * POINT_TOL {
+            zero_edges.push(json!({ "edge": [a, b], "distance": d2.sqrt() }));
  }
  let key = (a.min(b), a.max(b));
  *edge_count.entry(key).or_insert(0) += 1;
@@ -143,7 +182,6 @@ pub fn check(m: &Model, strict: bool) -> Value {
  // Dangling edges (touch a degree-1 vertex) and isolated vertices.
  let mut dangling: Vec<Value> = Vec::new();
  let mut isolated: Vec<usize> = Vec::new();
- let mut non_manifold: Vec<Value> = Vec::new();
  for (i, &d) in deg.iter().enumerate() {
  if d == 0 {
  isolated.push(i);
@@ -154,14 +192,24 @@ pub fn check(m: &Model, strict: bool) -> Value {
                     dangling.push(json!({ "edge": [a, b], "vertex": i, "edge_index": ei }));
  }
  }
- } else if d == 2 {
-            non_manifold.push(json!({ "vertex": i, "degree": 2 }));
+  }
  }
- }
+ // Isolated vertices are reported as objects like every other category
+ // (they used to be bare integers, the one shape outlier in `issues`).
+ let isolated_json: Vec<Value> = isolated.iter().map(|&i| json!({ "index": i })).collect();
+
+ // Degree-2 pinch vertices (see `non_manifold_vertices`).
+ let non_manifold: Vec<Value> = non_manifold_vertices(&deg)
+ .into_iter()
+ .map(|i| json!({ "vertex": i, "degree": 2 }))
+ .collect();
 
  // Verdict.
  let broken = !zero_edges.is_empty() || !dup_edges.is_empty() || !isolated.is_empty();
- let warn = !dup_vertices.is_empty() || !dangling.is_empty() || !non_manifold.is_empty();
+ let warn = !dup_vertices.is_empty()
+ || !near_vertices.is_empty()
+ || !dangling.is_empty()
+ || !non_manifold.is_empty();
  let verdict = if broken || (warn && strict) {
         "broken"
  } else if warn {
@@ -171,14 +219,16 @@ pub fn check(m: &Model, strict: bool) -> Value {
  };
 
  let n_issues = dup_vertices.len()
+ + near_vertices.len()
  + zero_edges.len()
  + dup_edges.len()
  + dangling.len()
  + isolated.len()
  + non_manifold.len();
  let summary = format!(
-        "{n_issues} issue(s): {} duplicate vertices, {} zero-length edges, {} duplicate edges, {} dangling edges, {} isolated vertices, {} non-manifold vertices",
+        "{n_issues} issue(s): {} duplicate vertices, {} near-duplicate vertices, {} zero-length edges, {} duplicate edges, {} dangling edges, {} isolated vertices, {} non-manifold vertices",
  dup_vertices.len(),
+ near_vertices.len(),
  zero_edges.len(),
  dup_edges.len(),
  dangling.len(),
@@ -195,12 +245,14 @@ pub fn check(m: &Model, strict: bool) -> Value {
         "edges": m.edges.len(),
         "issues": {
             "duplicate_vertices": dup_vertices,
+            "near_duplicate_vertices": near_vertices,
             "zero_length_edges": zero_edges,
             "duplicate_edges": dup_edges,
             "dangling_edges": dangling,
-            "isolated_vertices": isolated,
+            "isolated_vertices": isolated_json,
             "non_manifold_vertices": non_manifold,
  },
+        "tolerance": POINT_TOL,
         "quality": quality,
         "verdict": verdict,
         "summary": summary,
@@ -290,6 +342,7 @@ pub fn report_text(name: &str, vertices: usize, edges: usize, c: &serde_json::Va
  out.push('\n');
  for (kind, label) in [
             ("duplicate_vertices", "duplicate vertices"),
+            ("near_duplicate_vertices", "near-duplicate vertices"),
             ("zero_length_edges", "zero-length edges"),
             ("duplicate_edges", "duplicate edges"),
             ("dangling_edges", "dangling edges"),
@@ -309,6 +362,15 @@ pub fn report_text(name: &str, vertices: usize, edges: usize, c: &serde_json::Va
                             item["coords"][2],
                             item["twin"],
  )),
+                        "near_duplicate_vertices" => out.push_str(&format!(
+                            "    vertex {} at [{}, {}, {}] (twin {}, distance {:.3e})\n",
+                            item["index"],
+                            item["coords"][0],
+                            item["coords"][1],
+                            item["coords"][2],
+                            item["twin"],
+                            item["distance"].as_f64().unwrap_or(0.0),
+                        )),
                         "zero_length_edges" => out.push_str(&format!(
                             "    edge [{}, {}]\n",
                             item["edge"][0], item["edge"][1]
@@ -322,13 +384,21 @@ pub fn report_text(name: &str, vertices: usize, edges: usize, c: &serde_json::Va
                             item["edge"][0], item["edge"][1], item["edge_index"], item["vertex"],
  )),
                         "isolated_vertices" => {
-                            out.push_str(&format!("    vertex {}\n", item.as_i64().unwrap_or(-1),))
+                            out.push_str(&format!("    vertex {}\n", item["index"]))
  }
  _ => out.push_str(&format!(
                             "    vertex {} (degree {})\n",
                             item["vertex"], item["degree"],
  )),
  }
+ }
+ // The actionable threshold, printed ONCE and only under the list it
+ // clears: `--weld` takes an explicit tolerance, and this is the value
+ // that repairs exactly the near-duplicates above.
+ if kind == "near_duplicate_vertices" {
+ out.push_str(&format!(
+ "  tolerance: {POINT_TOL:e} world units (repair with `wrfm edit <file> --weld {POINT_TOL:e}`)\n"
+ ));
  }
  }
  }
