@@ -1,4 +1,18 @@
 
+## Unreleased
+
+
+
+### :bug: Bug fixes
+
+- **(input)** Regressions from the kitty keyboard protocol (41ab1c4)
+
+
+### :recycle: Refactoring
+
+- **(wrfm-cli)** Unify the rules, add --weld and --fit content
+
+
 ## v0.7.0 - 2026-08-19
 
 
