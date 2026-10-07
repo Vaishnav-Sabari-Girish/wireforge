@@ -2,8 +2,8 @@ use clap::Parser;
 use crossterm::{
     cursor::{Hide, Show},
     event::{
-        self, Event, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
-        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        self, DisableFocusChange, EnableFocusChange, Event, KeyCode, KeyEventKind, KeyModifiers,
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -22,7 +22,7 @@ use ratatui::style::Style;
 
 use ratatui_wireframe::model::Model;
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     error::Error,
     io::{self, Read},
     path::{Path, PathBuf},
@@ -59,6 +59,11 @@ const SPIN_RATE: f64 = 169.0 / 256.0;
 const RESIZE_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 /// How long to let a file write settle before re-parsing after a change.
 const SETTLE_DELAY: Duration = Duration::from_millis(50);
+/// How long the keyboard may stay silent before a hold is dropped, on a
+/// terminal that never reports a key-up. Silence is the only evidence there
+/// is; 1 s outlasts the default OS initial repeat delay (660 ms on X11) and
+/// keeps a tap's drift short. Terminals that DO report Release never use it.
+const LEGACY_HOLD_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Parser, Debug)]
 #[command(
@@ -528,7 +533,12 @@ struct App {
     one_shot: Option<String>,
     target_file: PathBuf,
     view: ViewState,
-    held: HashSet<Motion>,
+    /// Motion keys that are currently down (value = last Press/Repeat seen).
+    held: HashMap<Motion, Instant>,
+    /// True once the terminal delivered a Release. From then on key-up is
+    /// authoritative, so holds end on Release / FocusLost and are never
+    /// dropped for staying quiet (see `update_held`).
+    release_seen: bool,
     auto_spin: bool,
     hud: Hud,
     show_axes: bool,
@@ -552,7 +562,8 @@ impl App {
             one_shot,
             target_file,
             view: ViewState::default(),
-            held: HashSet::new(),
+            held: HashMap::new(),
+            release_seen: false,
             auto_spin: false,
             hud: Hud::Collapsed,
             show_axes: true,
@@ -578,23 +589,79 @@ impl App {
         }
     }
 
+    /// Record that the keyboard said something at `now`.
+    ///
+    /// On a terminal that never reports key-up this is the only way to tell a
+    /// hold that is still down from one that was released: the OS repeats
+    /// only the most recently pressed key, so a second key silences the
+    /// first, and refreshing per key would drop the earlier one mid-hold
+    /// (press `j`, then `l`, and `j` stops rotating after the timeout).
+    /// Refreshing every hold means silence alone ends them.
+    fn note_key_event(&mut self, now: Instant) {
+        if self.release_seen {
+            return;
+        }
+        for seen in self.held.values_mut() {
+            *seen = now;
+        }
+    }
+
+    /// Mark a motion key as held (Press/Repeat). `update_held` applies the
+    /// continuous motion every frame until Release or the hold timeout.
+    fn hold(&mut self, m: Motion) {
+        self.held.insert(m, Instant::now());
+        self.dirty = true;
+    }
+
     /// Handle one terminal input event. Returns true when the loop must
     fn handle_input(&mut self, ev: Event) -> bool {
-        // Only key events are handled: mouse capture is OFF (native terminal
-        // drag-selection works), so the app never receives mouse events;
-        // Event::Resize is handled by the loop (it needs the Engine).
+        // Key and focus events are the only input handled: mouse capture is
+        // OFF (native terminal drag-selection works), so the app never
+        // receives mouse events; Event::Resize is handled by the loop (it
+        // needs the Engine).
+        // Focus loss: the key-up of a key held across an alt-tab reaches the
+        // other window, so no Release ever arrives — drop the holds here.
+        if let Event::FocusLost = ev {
+            if !self.held.is_empty() {
+                self.held.clear();
+                self.dirty = true;
+            }
+            return false;
+        }
         if let Event::Key(key) = ev {
+            // A Release is direct evidence that the terminal reports key-up:
+            // from here on a hold ends when the key does, never on a timeout.
+            if key.kind == KeyEventKind::Release {
+                self.release_seen = true;
+            } else {
+                self.note_key_event(Instant::now());
+            }
             let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+            // The kitty protocol reports shifted punctuation as the base key
+            // plus the SHIFT modifier (REPORT_ALTERNATE_KEYS is not enabled),
+            // i.e. Shift+'/' arrives as Char('/') rather than Char('?').
+            // Normalise once so every branch below sees the shifted character.
+            let code = match key.code {
+                KeyCode::Char('/') if shift => KeyCode::Char('?'),
+                code => code,
+            };
             // Kitty keyboard protocol: a Release event stops the motion immediately.
             if key.kind == KeyEventKind::Release {
-                if let Some(m) = motion_for(key.code, shift) {
+                if let Some(m) = motion_for(code, shift) {
                     self.held.remove(&m);
                     self.dirty = true;
                 }
                 return false;
             }
-            match key.code {
+            match code {
                 KeyCode::Char('q') | KeyCode::Esc => return true,
+                // Auto-repeat only refreshes the hold: the toggles below fire
+                // once per tap, never at the terminal's repeat rate.
+                _ if key.kind == KeyEventKind::Repeat => {
+                    if let Some(m) = motion_for(code, shift) {
+                        self.hold(m);
+                    }
+                }
                 // One-shot keys act immediately (no debounce).
                 KeyCode::Char('?') => {
                     self.hud = match self.hud {
@@ -634,11 +701,8 @@ impl App {
                 }
                 // Motion keys.
                 _ => {
-                    if let Some(m) = motion_for(key.code, shift) {
-                        // Press/Repeat: the key is held. Continuous motion is applied by
-                        // update_held each frame with dt; Release is handled above.
-                        self.held.insert(m);
-                        self.dirty = true;
+                    if let Some(m) = motion_for(code, shift) {
+                        self.hold(m);
                     }
                 }
             }
@@ -646,12 +710,24 @@ impl App {
         false
     }
 
-    /// Advance held-motion state (tap -> hold -> release) and apply one
-    /// Apply continuous motion to every held key each frame (dt-scaled).
-    /// Keys are added on Press/Repeat and removed on Release (Kitty protocol).
-    fn update_held(&mut self, dt: f64) {
+    /// Apply continuous motion to every held key each frame (dt-scaled), then
+    /// drop the keys that stopped reporting. Release (kitty protocol) and
+    /// FocusLost are the normal stops; the timeout is the only stop on a
+    /// terminal that never sends a Release, and a backstop when one is lost.
+    fn update_held(&mut self, now: Instant, dt: f64) {
+        // With key-up reporting there is nothing to time out: Release ends the
+        // hold and FocusLost covers an alt-tab, so a timeout would only ever
+        // kill a key that is still down. Without it, silence is the only
+        // evidence available and one second of it ends the hold.
+        if !self.release_seen {
+            self.held
+                .retain(|_, seen| now.saturating_duration_since(*seen) <= LEGACY_HOLD_TIMEOUT);
+        }
+        if self.held.is_empty() {
+            return;
+        }
         let move_scale = self.move_scale();
-        for m in &self.held {
+        for m in self.held.keys() {
             continuous_step(&mut self.view, *m, move_scale, dt);
         }
     }
@@ -980,7 +1056,45 @@ fn render_frame(
     Ok(())
 }
 
+/// Undo everything `main` did to the terminal: the keyboard-enhancement flags
+/// (they are sticky — without this the shell would keep receiving escape
+/// codes for modified keys), focus reporting, cursor, alternate screen and
+/// raw mode. Idempotent and a no-op unless raw mode was enabled, so the
+/// guard, the panic hook and the normal exit path can all call it.
+fn restore_terminal() {
+    if !crossterm::terminal::is_raw_mode_enabled().unwrap_or(false) {
+        return;
+    }
+    let mut stdout = io::stdout();
+    let _ = execute!(
+        stdout,
+        PopKeyboardEnhancementFlags,
+        DisableFocusChange,
+        Show,
+        LeaveAlternateScreen
+    );
+    let _ = disable_raw_mode();
+}
+
+/// RAII terminal cleanup. `main` creates it right after `enable_raw_mode`,
+/// so every later exit path (normal return, `?` error, panic) restores the
+/// terminal instead of leaving a half-configured screen behind.
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        restore_terminal();
+    }
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
+    // Restore first, then report the panic: the message would otherwise be
+    // printed inside the alternate screen and the sticky flags would survive.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal();
+        default_hook(info);
+    }));
     let args = Args::parse();
     let target_file = args.file.clone();
 
@@ -1071,6 +1185,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     enable_raw_mode()?;
+    // From here on every exit path (return value, `?` error or panic) must
+    // hand back a usable terminal: the enhancement flags are sticky and would
+    // otherwise leak into the shell. Dropping the guard runs `restore_terminal`.
+    let _terminal = TerminalGuard;
     let mut stdout = io::stdout();
     // Mouse capture stays OFF (native drag-selection) and the cursor is
     // hidden for the session (the L2 direct-write present does not hide it).
@@ -1086,6 +1204,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 | KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
         )
     );
+    // Focus events: the key-up of a key held across an alt-tab goes to the
+    // other window, so the app drops its holds itself on FocusLost.
+    let _ = execute!(stdout, EnableFocusChange);
 
     // Input thread: block in the kernel on the tty, push events through the
     // channel. Started after raw mode so the tty is in the expected state.
@@ -1150,8 +1271,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
                 }
             }
-            // One frame of smooth motion + tap/hold/release timeouts.
-            app.update_held(dt);
+            // One frame of smooth motion + held-key expiry.
+            app.update_held(now, dt);
             if app.auto_spin {
                 // Space auto-spin: rotate the model around its own (local) Y
                 // axis (view::ViewState::spin_local) — a globe turning in
@@ -1205,9 +1326,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break 'main,
             }
-            // Clean up stale held entries (a tap that never confirmed, or a
-            // released hold) without spinning.
-            app.update_held(dt);
+            // Expire held keys that stopped reporting (a lost Release, or a
+            // terminal that never sends one) without spinning.
+            app.update_held(now, dt);
             // Redraw only when something actually changed (dirty-flag).
             if app.dirty {
                 render_frame(&mut app, &mut engine, &mut stdout, &mut terminal)?;
@@ -1216,9 +1337,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let _ = execute!(stdout, PopKeyboardEnhancementFlags);
-    execute!(stdout, Show, LeaveAlternateScreen)?;
-    disable_raw_mode()?;
+    // The TerminalGuard created after enable_raw_mode restores the terminal
+    // (flags, focus reporting, cursor, screen, raw mode) when this returns.
     Ok(())
 }
 
@@ -1843,6 +1963,21 @@ mod tests {
         )));
         assert_eq!(app.hud, Hud::Collapsed);
 
+        // Kitty protocol: Shift+'/' arrives as the base key plus SHIFT
+        // (REPORT_ALTERNATE_KEYS is not pushed), so it must also toggle.
+        app.dirty = false;
+        app.handle_input(Event::Key(KeyEvent::new(
+            KeyCode::Char('/'),
+            KeyModifiers::SHIFT,
+        )));
+        assert_eq!(app.hud, Hud::Expanded);
+        assert!(app.dirty);
+        app.handle_input(Event::Key(KeyEvent::new(
+            KeyCode::Char('/'),
+            KeyModifiers::SHIFT,
+        )));
+        assert_eq!(app.hud, Hud::Collapsed);
+
         // Space toggles auto-spin.
         app.handle_input(Event::Key(KeyEvent::new(
             KeyCode::Char(' '),
@@ -1899,7 +2034,7 @@ mod tests {
             KeyModifiers::NONE,
         )));
         assert!(
-            app.held.contains(&Motion::YawRight),
+            app.held.contains_key(&Motion::YawRight),
             "press must enter continuous state"
         );
         // Auto-repeat: must not add a new entry
@@ -1913,7 +2048,7 @@ mod tests {
             "auto-repeat must not accumulate held entries"
         );
         // Continuous motion is applied by update_held
-        app.update_held(0.016);
+        app.update_held(Instant::now(), 0.016);
         assert_ne!(
             app.view.yaw, yaw0,
             "held key must rotate continuously immediately"
@@ -1939,6 +2074,187 @@ mod tests {
         release.kind = KeyEventKind::Release;
         app.handle_input(Event::Key(release));
         assert!(app.held.is_empty(), "release must stop motion immediately");
+    }
+
+    #[test]
+    fn app_held_key_expires_without_release() {
+        // A terminal without the kitty protocol never sends Release, so the
+        // hold timeout is the only thing that can stop the motion.
+        let mut app = App::new(
+            RenderMode::Braille(Model {
+                vertices: vec![(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)],
+                edges: vec![(0, 1)],
+            }),
+            "cube".to_string(),
+            None,
+            PathBuf::from("cube.wrfm"),
+        );
+        app.handle_input(Event::Key(KeyEvent::new(
+            KeyCode::Right,
+            KeyModifiers::NONE,
+        )));
+        let seen = *app
+            .held
+            .get(&Motion::YawRight)
+            .expect("press must hold the motion");
+        // Exactly at the timeout the key is still down (the bound is <=).
+        app.update_held(seen + LEGACY_HOLD_TIMEOUT, 0.016);
+        assert_eq!(app.held.len(), 1, "the timeout boundary must keep the hold");
+        // One tick past it the key is gone and the model stops by itself.
+        app.update_held(seen + LEGACY_HOLD_TIMEOUT + Duration::from_millis(1), 0.016);
+        assert!(
+            app.held.is_empty(),
+            "a key that stopped reporting must expire"
+        );
+    }
+
+    #[test]
+    fn app_release_seen_holds_never_time_out() {
+        // Once the terminal reports key-up, Release (and FocusLost) end a
+        // hold. A timeout could only ever drop a key that is still down.
+        let mut app = App::new(
+            RenderMode::Braille(Model {
+                vertices: vec![(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)],
+                edges: vec![(0, 1)],
+            }),
+            "cube".to_string(),
+            None,
+            PathBuf::from("cube.wrfm"),
+        );
+        let mut release = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        release.kind = KeyEventKind::Release;
+        app.handle_input(Event::Key(release));
+        assert!(app.release_seen, "a Release must enable key-up reporting");
+        app.handle_input(Event::Key(KeyEvent::new(
+            KeyCode::Right,
+            KeyModifiers::NONE,
+        )));
+        let seen = *app
+            .held
+            .get(&Motion::YawRight)
+            .expect("press must hold the motion");
+        // A minute of silence must not stop the rotation...
+        app.update_held(seen + Duration::from_secs(60), 0.016);
+        assert_eq!(
+            app.held.len(),
+            1,
+            "a hold must survive silence once key-up is reported"
+        );
+        // ...and the Release is what ends it.
+        let mut release = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        release.kind = KeyEventKind::Release;
+        app.handle_input(Event::Key(release));
+        assert!(app.held.is_empty(), "release must stop the motion");
+    }
+
+    #[test]
+    fn app_any_key_event_refreshes_every_hold() {
+        // Without key-up reporting, the OS repeats only the most recently
+        // pressed key, so `l` going down silences `j`. Refreshing per key
+        // would drop `j` mid-hold, which is exactly the reported bug: the
+        // model stops moving down after the timeout but keeps yawing.
+        let mut app = App::new(
+            RenderMode::Braille(Model {
+                vertices: vec![(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)],
+                edges: vec![(0, 1)],
+            }),
+            "cube".to_string(),
+            None,
+            PathBuf::from("cube.wrfm"),
+        );
+        for key in ['j', 'l'] {
+            app.handle_input(Event::Key(KeyEvent::new(
+                KeyCode::Char(key),
+                KeyModifiers::NONE,
+            )));
+        }
+        assert_eq!(app.held.len(), 2, "both motion keys are held");
+        let first = *app
+            .held
+            .get(&Motion::PitchDown)
+            .expect("j must hold the pitch motion");
+        // Two seconds later only `l` is still repeating.
+        let later = first + Duration::from_secs(2);
+        app.note_key_event(later);
+        app.update_held(later, 0.016);
+        assert_eq!(
+            app.held.len(),
+            2,
+            "the key that stopped repeating must survive"
+        );
+        // Silence past the timeout still ends both, so a lost key-up can
+        // never leave the model spinning on its own.
+        app.update_held(
+            later + LEGACY_HOLD_TIMEOUT + Duration::from_millis(1),
+            0.016,
+        );
+        assert!(app.held.is_empty(), "silence must still end the holds");
+    }
+
+    #[test]
+    fn app_focus_lost_drops_held_keys() {
+        // The key-up of a key held across an alt-tab reaches the other
+        // window, so no Release arrives: FocusLost is the only signal.
+        let mut app = App::new(
+            RenderMode::Braille(Model {
+                vertices: vec![(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)],
+                edges: vec![(0, 1)],
+            }),
+            "cube".to_string(),
+            None,
+            PathBuf::from("cube.wrfm"),
+        );
+        app.handle_input(Event::Key(KeyEvent::new(
+            KeyCode::Right,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.held.len(), 1);
+        app.dirty = false;
+        assert!(!app.handle_input(Event::FocusLost));
+        assert!(app.held.is_empty(), "focus loss must stop every hold");
+        assert!(app.dirty, "the cleared hold must repaint");
+    }
+
+    #[test]
+    fn app_key_repeat_only_refreshes_the_hold() {
+        // The kitty protocol reports auto-repeat while a key is held; the
+        // one-shot toggles must fire once per tap instead of on every repeat.
+        let mut app = App::new(
+            RenderMode::Braille(Model {
+                vertices: vec![(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)],
+                edges: vec![(0, 1)],
+            }),
+            "cube".to_string(),
+            None,
+            PathBuf::from("cube.wrfm"),
+        );
+        app.handle_input(Event::Key(KeyEvent::new(
+            KeyCode::Char(' '),
+            KeyModifiers::NONE,
+        )));
+        assert!(app.auto_spin, "press must toggle auto-spin");
+        let mut repeat = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE);
+        repeat.kind = KeyEventKind::Repeat;
+        app.handle_input(Event::Key(repeat));
+        assert!(app.auto_spin, "auto-repeat must not re-trigger a toggle");
+
+        // A repeat of a motion key refreshes the hold instead.
+        app.handle_input(Event::Key(KeyEvent::new(
+            KeyCode::Right,
+            KeyModifiers::NONE,
+        )));
+        let seen = *app
+            .held
+            .get(&Motion::YawRight)
+            .expect("press must hold the motion");
+        let mut repeat = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        repeat.kind = KeyEventKind::Repeat;
+        app.handle_input(Event::Key(repeat));
+        let refreshed = *app
+            .held
+            .get(&Motion::YawRight)
+            .expect("repeat must keep the hold");
+        assert!(refreshed >= seen, "auto-repeat must refresh the hold");
     }
 
     #[test]
