@@ -159,8 +159,8 @@ fn canonical_key(code: KeyCode, mods: KeyModifiers) -> (KeyCode, bool) {
 /// and a shifted chord acts only where the table below lists it: `Shift+0` is
 /// `)` and does nothing, while `Shift+h` is the documented pan. Ctrl binds
 /// quitting (raw mode delivers Ctrl+C / Ctrl+Q as key events, with no
-/// SIGINT) plus the local-frame rotation chords `Ctrl+hjkl` and `Ctrl+e` /
-/// `Ctrl+r` — rotation around the model's own axes instead of the world's;
+/// SIGINT) plus the local-frame rotation chords `Ctrl` + arrows / `hjkl` /
+/// `e` / `r` — rotation around the model's own axes instead of the world's;
 /// every other modifier swallows the key, so a stray `Alt+h` can never
 /// rotate the model.
 fn resolve_key_event(code: KeyCode, mods: KeyModifiers) -> Option<(KeyCode, Action)> {
@@ -173,14 +173,14 @@ fn resolve_key_event(code: KeyCode, mods: KeyModifiers) -> Option<(KeyCode, Acti
     let (base, shift) = canonical_key(code, mods);
     if mods.contains(KeyModifiers::CONTROL) {
         // Ctrl+C / Ctrl+Q quit (raw mode turns them into plain key events,
-        // with no SIGINT); the rotation letters rotate in the model's own
-        // frame. Ctrl + arrows and every other Ctrl chord stay unbound.
+        // with no SIGINT); the rotation arrows and letters rotate in the
+        // model's own frame. Every other Ctrl chord stays unbound.
         let action = match base {
             Char('q') | Char('c') => Action::Quit,
-            Char('h') => Action::Motion(Motion::LocalYawLeft),
-            Char('l') => Action::Motion(Motion::LocalYawRight),
-            Char('k') => Action::Motion(Motion::LocalPitchUp),
-            Char('j') => Action::Motion(Motion::LocalPitchDown),
+            Left | Char('h') => Action::Motion(Motion::LocalYawLeft),
+            Right | Char('l') => Action::Motion(Motion::LocalYawRight),
+            Up | Char('k') => Action::Motion(Motion::LocalPitchUp),
+            Down | Char('j') => Action::Motion(Motion::LocalPitchDown),
             Char('r') => Action::Motion(Motion::LocalRollPlus),
             Char('e') => Action::Motion(Motion::LocalRollMinus),
             _ => return None,
@@ -240,8 +240,13 @@ fn apply_motion_step(view: &mut ViewState, m: Motion, rot: f64, mv: f64) {
         Motion::YawRight => view.add_yaw(-rot),
         Motion::PitchUp => view.add_pitch(-rot),
         Motion::PitchDown => view.add_pitch(rot),
-        Motion::RollPlus => view.roll -= rot,
-        Motion::RollMinus => view.roll += rot,
+        // Screen-space roll: `r` rotates the image counter-clockwise. The
+        // frame picks the axis (here the view axis), never the sense: at the
+        // default view — where the model faces the camera — that reads as the
+        // model's starboard side dipping, the same body-bank direction as
+        // Ctrl+r. `e` is the mirror.
+        Motion::RollPlus => view.roll += rot,
+        Motion::RollMinus => view.roll -= rot,
         // Local-frame rotation: the same step post-multiplied, so the axis
         // rides with the model. Local roll lives in the rotation matrix (see
         // ViewState::add_roll_local), never in the screen-space `roll`.
@@ -249,8 +254,8 @@ fn apply_motion_step(view: &mut ViewState, m: Motion, rot: f64, mv: f64) {
         Motion::LocalYawRight => view.add_yaw_local(-rot),
         Motion::LocalPitchUp => view.add_pitch_local(-rot),
         Motion::LocalPitchDown => view.add_pitch_local(rot),
-        Motion::LocalRollPlus => view.add_roll_local(-rot),
-        Motion::LocalRollMinus => view.add_roll_local(rot),
+        Motion::LocalRollPlus => view.add_roll_local(rot),
+        Motion::LocalRollMinus => view.add_roll_local(-rot),
         // Pan shifts the model in world X/Y at any orientation; the rotation
         // centre is the panned file origin (see view::project_point).
         Motion::MoveLeft => view.pan_x -= mv,
@@ -540,6 +545,7 @@ const HELP: &[&str] = &[
     "  yaw left  Ctrl+h       yaw right  Ctrl+l",
     "  pitch up  Ctrl+k       pitch down Ctrl+j",
     "  roll      Ctrl+r / e",
+    "  Ctrl + arrows work like Ctrl + hjkl",
     "",
     "Keys:",
     "  center    f            fit        Shift+f",
@@ -2164,11 +2170,12 @@ mod tests {
         }
     }
 
-    /// SHIFT is the only modifier that changes an action: Ctrl is reserved for
-    /// quitting (raw mode delivers Ctrl+C / Ctrl+Q as key events, with no
-    /// SIGINT) and every other modifier swallows the key.
+    /// SHIFT is the only modifier that changes an action: Ctrl binds quitting
+    /// (raw mode delivers Ctrl+C / Ctrl+Q as key events, with no SIGINT) plus
+    /// the local-frame rotation letters, and every other modifier swallows the
+    /// key.
     #[test]
-    fn resolve_key_event_reserves_ctrl_for_quitting_and_swallows_alt() {
+    fn resolve_key_event_ctrl_quits_or_rotates_locally_and_alt_swallows() {
         use KeyCode::*;
         assert!(matches!(
             resolve_key_event(Char('c'), KeyModifiers::CONTROL),
@@ -2178,9 +2185,16 @@ mod tests {
             resolve_key_event(Char('q'), KeyModifiers::CONTROL),
             Some((_, Action::Quit))
         ));
-        // Ctrl+h must not rotate the model, and Alt+h must do nothing either.
-        assert_eq!(resolve_key_event(Char('h'), KeyModifiers::CONTROL), None);
-        assert_eq!(resolve_key_event(Left, KeyModifiers::CONTROL), None);
+        // Ctrl+h / Ctrl+Left rotate in the model's own (local) frame;
+        // Alt+h must do nothing either.
+        assert_eq!(
+            resolve_key_event(Char('h'), KeyModifiers::CONTROL),
+            Some((Char('h'), Action::Motion(Motion::LocalYawLeft)))
+        );
+        assert_eq!(
+            resolve_key_event(Left, KeyModifiers::CONTROL),
+            Some((Left, Action::Motion(Motion::LocalYawLeft)))
+        );
         assert_eq!(resolve_key_event(Char('h'), KeyModifiers::ALT), None);
         assert_eq!(resolve_key_event(Char(' '), KeyModifiers::ALT), None);
         // Shift+Tab arrives as BackTab on both paths and still toggles the axes.

@@ -40,6 +40,12 @@ fn rot_y(a: f64) -> Mat3 {
     [[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]]
 }
 
+/// Rotation around the Z axis (positive angle turns +X toward +Y).
+fn rot_z(a: f64) -> Mat3 {
+    let (s, c) = a.sin_cos();
+    [[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]]
+}
+
 /// The six camera degrees of freedom (world-frame yaw/pitch, roll around the view axis).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ViewState {
@@ -93,9 +99,13 @@ impl ViewState {
         self.roll = normalize_angle(self.roll);
     }
 
-    /// Yaw the model around the world Y axis.
+    /// Yaw the model around the world Y axis. One global direction convention:
+    /// positive `d` yaws the model to its own LEFT (its nose turns toward its
+    /// left side — `rot_y` positive is a right-handed turn about +Y, which
+    /// carries the nose toward +X = the object's left when it faces +Z). The
+    /// frame (world vs local) picks the AXIS, never the sense.
     pub fn add_yaw(&mut self, d: f64) {
-        self.rot = mat_mul(rot_y(-d), self.rot);
+        self.rot = mat_mul(rot_y(d), self.rot);
         self.yaw += d;
     }
 
@@ -103,6 +113,35 @@ impl ViewState {
     pub fn add_pitch(&mut self, d: f64) {
         self.rot = mat_mul(rot_x(d), self.rot);
         self.pitch += d;
+    }
+
+    /// Yaw the model around its own (local) Y axis: `add_yaw` with the step
+    /// post-multiplied instead of pre-multiplied, so the axis rides with the
+    /// model instead of staying anchored to the world. The direction is the
+    /// same convention as `add_yaw` (positive = the model's own left): when
+    /// the two axes coincide the two keys produce the same rotation.
+    pub fn add_yaw_local(&mut self, d: f64) {
+        self.rot = mat_mul(self.rot, rot_y(d));
+        self.yaw += d;
+    }
+
+    /// Pitch the model around its own (local) X axis: `add_pitch` with the
+    /// step post-multiplied instead of pre-multiplied.
+    pub fn add_pitch_local(&mut self, d: f64) {
+        self.rot = mat_mul(self.rot, rot_x(d));
+        self.pitch += d;
+    }
+
+    /// Roll the model around its own (local) Z axis, the local counterpart of
+    /// the screen-space `roll`: positive `d` banks the model to its own right
+    /// (right-hand turn about the nose axis, so its starboard side dips) —
+    /// the same sense as `Motion::RollPlus`, applied about the model's own
+    /// axis instead of the view axis. Unlike yaw/pitch it does NOT touch the
+    /// `roll` field: `roll` is the authoritative camera-frame angle applied by
+    /// `project_point`, so ticking it here as well would rotate the image
+    /// twice; the HUD therefore reports world-frame roll only.
+    pub fn add_roll_local(&mut self, d: f64) {
+        self.rot = mat_mul(self.rot, rot_z(d));
     }
 
     /// Spin the model around its own (local) Y axis (Space auto-spin).
@@ -576,8 +615,10 @@ mod tests {
             oy0x.abs() < 1e-6,
             "model Y should start at the screen centre, got {oy0x}"
         );
-        // Yaw right: the model Y axis swings toward screen-right.
-        v.add_yaw(-45.0f64.to_radians());
+        // Yaw left (positive, the object's own left): the model Y axis —
+        // pointing at the camera here — swings toward screen-right, where the
+        // model's own left side (+X) sits at pitch 90.
+        v.add_yaw(45.0f64.to_radians());
         let (oy1x, _) = project_point((0.0, 1.0, 0.0), &v, 100).unwrap();
         assert!(
             oy1x > 0.0,
@@ -594,8 +635,11 @@ mod tests {
 
     #[test]
     fn local_spin_rotates_around_model_y_axis() {
-        // Space auto-spin is about the model's own (local) Y axis, the
-        // opposite of arrow-key yaw (world-frame; see yaw_is_world_frame_at_pitch_90).
+        // Space auto-spin is about the model's own (local) Y axis: the same
+        // rotation sense as arrow-key yaw (both turn positive = the model's
+        // own left), but post-multiplied so the axis rides the model instead
+        // of pre-multiplied onto the world axis (see
+        // yaw_is_world_frame_at_pitch_90).
         let mut v = view();
         v.add_pitch(90.0f64.to_radians());
         let (y0x, y0y) = project_point((0.0, 1.0, 0.0), &v, 100).unwrap();

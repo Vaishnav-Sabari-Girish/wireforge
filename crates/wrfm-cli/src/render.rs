@@ -65,9 +65,9 @@ pub(crate) fn rot_axis(axis: [f64; 3], angle_deg: f64) -> Mat3 {
     ]
 }
 
-/// World-frame model rotation for absolute (pitch, yaw): the model is first pitched around the world X axis, then yawed around the world vertical axis.
+/// World-frame model rotation for absolute (pitch, yaw): the model is first pitched around the world X axis, then yawed around the world vertical axis. The yaw sign follows wireforge's global convention (post-unification): positive yaw turns the object's nose to its own left, so `--yaw 90` shows the object's right side.
 pub(crate) fn world_rot(pitch_deg: f64, yaw_deg: f64) -> Mat3 {
-    mat_mul(rot_y(-yaw_deg.to_radians()), rot_x(pitch_deg.to_radians()))
+    mat_mul(rot_y(yaw_deg.to_radians()), rot_x(pitch_deg.to_radians()))
 }
 
 /// Output format for a rendered frame.
@@ -104,15 +104,17 @@ pub enum View {
     Front,
     /// Yaw 180° — the -Z face.
     Back,
-    /// Yaw -90° — the -X face.
+    /// Yaw -90° — the +X face (the object's own left side; the object faces +Z).
+    /// Positive yaw turns the object's nose to its own left, so revealing its
+    /// left side means yawing right by 90°, i.e. yaw -90.
     Left,
-    /// Yaw +90° — the +X face.
+    /// Yaw +90° — the -X face (the object's own right side).
     Right,
     /// The classic "side" projection (alias for the left view).
     Side,
-    /// Pitch -90° — looking down from +Y (the top).
+    /// Pitch +90° — looking down from +Y (the object's top face).
     Top,
-    /// Pitch +90° — looking up from -Y (the bottom).
+    /// Pitch -90° — looking up from -Y (the object's bottom face).
     Bottom,
     /// 3/4 perspective (pitch 30, yaw 45) — best overall impression.
     Iso,
@@ -159,12 +161,17 @@ impl View {
         match self {
             View::Front => (0.0, 0.0, 0.0),
             View::Back => (0.0, 180.0, 0.0),
+            // Object-side naming (drafting convention): every view name
+            // promises the OBJECT side facing the camera — Left shows the
+            // object's left (+X when it faces +Z), Top shows its top (+Y).
+            // With positive yaw = the object's nose turning to its own left,
+            // Left is yaw -90 and Right is yaw +90.
             View::Left => (0.0, -90.0, 0.0),
             View::Right => (0.0, 90.0, 0.0),
             View::Side => (0.0, -90.0, 0.0),
-            View::Top => (-90.0, 0.0, 0.0),
-            View::Bottom => (90.0, 0.0, 0.0),
-            View::Iso => (30.0, 45.0, 0.0),
+            View::Top => (90.0, 0.0, 0.0),
+            View::Bottom => (-90.0, 0.0, 0.0),
+            View::Iso => (30.0, -45.0, 0.0),
         }
     }
 }
@@ -1287,7 +1294,9 @@ mod tests {
         // World-frame turntable: at pitch 90 the model's own Y axis starts
         // centred and yaw swings it to screen-right (fork's regression
         // test), instead of Euler photo-spinning around the view axis.
-        let rot = world_rot(90.0, -45.0);
+        // Positive yaw = the object's nose turns to its own left, which at
+        // pitch 90 (its Y pointing at the camera) swings that axis right.
+        let rot = world_rot(90.0, 45.0);
         let (ox, _) =
             project_vertex((0.0, 1.0, 0.0), &rot, DEFAULT_DIST, f, 0.0, 0.0, 0.0, 1.0).unwrap();
         assert!(ox > 0.0, "model Y should swing to screen-right, got {ox}");
@@ -1338,12 +1347,44 @@ mod tests {
                 .contains("unknown view 'bogus'")
         );
         assert_eq!(View::parse("side").unwrap(), View::Side);
-        assert_eq!(View::Iso.rotation(), (30.0, 45.0, 0.0));
-        // World-frame turntable: Left = yaw -90 (shows -X face),
-        // Right = yaw +90 (shows +X face).
+        assert_eq!(View::Iso.rotation(), (30.0, -45.0, 0.0));
+        // Object-side naming: Left = yaw -90 (the +X face, the object's left;
+        // positive yaw is the object's nose turning to its own left, so
+        // revealing its left side = yawing right = yaw -90), Right = yaw +90,
+        // Side aliases Left, Top = pitch +90 (+Y face), Bottom = pitch -90
+        // (-Y face).
         assert_eq!(View::Left.rotation(), (0.0, -90.0, 0.0));
         assert_eq!(View::Right.rotation(), (0.0, 90.0, 0.0));
         assert_eq!(View::Side.rotation(), (0.0, -90.0, 0.0));
+        assert_eq!(View::Top.rotation(), (90.0, 0.0, 0.0));
+        assert_eq!(View::Bottom.rotation(), (-90.0, 0.0, 0.0));
+    }
+
+    /// Regression guard against the 2026-10 view-name inversion: each view
+    /// must put the OBJECT side it names nearest the camera (fixed camera at
+    /// +Z looking down -Z, so larger rotated-z = nearer).
+    #[test]
+    fn view_names_show_the_object_side_they_promise() {
+        for (view, named, opposite) in [
+            (View::Front, [0.0, 0.0, 1.0], [0.0, 0.0, -1.0]),
+            (View::Back, [0.0, 0.0, -1.0], [0.0, 0.0, 1.0]),
+            (View::Left, [1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]),
+            (View::Right, [-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]),
+            (View::Side, [1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]),
+            (View::Top, [0.0, 1.0, 0.0], [0.0, -1.0, 0.0]),
+            (View::Bottom, [0.0, -1.0, 0.0], [0.0, 1.0, 0.0]),
+        ] {
+            let (pitch, yaw, _) = view.rotation();
+            let rot = world_rot(pitch, yaw);
+            let depth = |p: [f64; 3]| rot[2][0] * p[0] + rot[2][1] * p[1] + rot[2][2] * p[2];
+            assert!(
+                depth(named) > depth(opposite),
+                "{:?}: the side it names must face the camera (named z={} vs opposite z={})",
+                view,
+                depth(named),
+                depth(opposite)
+            );
+        }
     }
 
     #[test]

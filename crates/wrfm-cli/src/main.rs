@@ -212,7 +212,7 @@ enum Command {
         /// Pitch around the world X axis (degrees).
         #[arg(long, default_value_t = 0.0)]
         pitch: f64,
-        /// Yaw around the world Y axis (turntable, degrees).
+        /// Yaw around the world Y axis (turntable, degrees; positive = the object's nose turns to its own left).
         #[arg(long, default_value_t = 0.0)]
         yaw: f64,
         /// Roll around the view axis (degrees).
@@ -279,7 +279,7 @@ enum Command {
         /// World-frame pitch in degrees (the fork's HUD pitch). Used ONLY for a single explicit-angle frame: --views ''.
         #[arg(long, default_value_t = 0.0)]
         pitch: f64,
-        /// World-frame yaw in degrees (turntable, the fork's HUD yaw). Used ONLY for a single explicit-angle frame: --views ''.
+        /// World-frame yaw in degrees (turntable, the fork's HUD yaw; positive = the object's nose turns to its own left). Used ONLY for a single explicit-angle frame: --views ''.
         #[arg(long, default_value_t = 0.0)]
         yaw: f64,
         /// Roll in degrees around the view axis. Used ONLY for a single explicit-angle frame: --views ''.
