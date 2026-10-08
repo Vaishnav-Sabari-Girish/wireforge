@@ -22,6 +22,9 @@ same numbers.
 * **Safe edits over streams:** `wrfm transform` (rigid: rotate / scale / shear / mirror / translate / pivot / align /
   normalize) and `wrfm edit` (topology: delete / extract / clean / dedupe / weld / merge) print the result to stdout —
   chain with pipes, verify with `wrfm check`.
+* **OBJ into the pipeline:** `wrfm convert --from obj --to wrfm` reads a Wavefront OBJ (a deliberate subset: `v`
+  vertices, `f` face rings, `l` chains — shared edges deduplicated) and prints canonical `.wrfm`. Surface data
+  (`vt`/`vn`/materials) is dropped and `o`/`g` groups are never invented — geometry in, lines out.
 * **Compare:** `wrfm diff` shows exactly what changed between two models (density-grid or structured JSON).
 
 ## Getting started
@@ -167,6 +170,7 @@ wrfm view model.wrfm --yaw 45          # exact per-view facts (occlusion, silhou
 wrfm render model.wrfm --views top     # braille / ascii / grid (--fit content, --region)
 wrfm transform model.wrfm --scale 2    # affine transforms, printed to stdout
 wrfm edit model.wrfm --delete-vertices 0,1   # topology edits (--dedupe / --weld TOL)
+wrfm convert --from obj --to wrfm model.obj  # OBJ -> wrfm (v1's only direction)
 wrfm diff a.wrfm b.wrfm --format json  # structured or density-grid diff
 wrfm format                            # print the .wrfm v1 spec itself
 ```
@@ -188,6 +192,9 @@ wrfm edit model.wrfm --extract-group cabinet \
 # ...or pipe straight into the viewer
 wrfm edit model.wrfm --extract-group cabinet \
   | wrfm transform - --scale 2 | wireforge -
+
+# bring an OBJ into the toolchain, then view it like any other model
+wrfm convert --from obj --to wrfm mouse.obj | wireforge -
 ```
 
 ## Recipes
@@ -237,9 +244,9 @@ script can branch on the number alone:
 | `3` | no result — unreadable file, corrupt model, or usage error (including clap's own argument errors) |
 
 `render` / `info` / `group` / `geometry` / `query` / `view` / `transform` /
-`edit` still emit their result on stdout and only the exit code carries the
-health tier; `check` puts its report on stdout and exits 1 for `warn`,
-2 for `broken`.
+`edit` / `convert` still emit their result on stdout and only the exit code
+carries the health tier; `check` puts its report on stdout and exits 1 for
+`warn`, 2 for `broken`.
 
 ```bash
 wrfm check model.wrfm; echo "exit $?"

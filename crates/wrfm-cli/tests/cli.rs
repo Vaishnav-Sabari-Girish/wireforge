@@ -2498,6 +2498,8 @@ fn help_documents_the_new_flags() {
         (vec!["group", "--help"], "structured facts"),
         (vec!["render", "--help"], "--fit"),
         (vec!["edit", "--help"], "--weld"),
+        (vec!["convert", "--help"], "--from"),
+        (vec!["convert", "--help"], "obj -> wrfm"),
     ] {
         let out = run(&args);
         assert_eq!(out.status.code(), Some(0), "{args:?}: {}", stderr(&out));
@@ -2776,6 +2778,82 @@ e 5 3
         stdout(&t)
     );
     fs::remove_dir_all(&dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// convert: v1 is one direction (obj -> wrfm). The direction and both
+// formats are explicit parameters; anything else is a usage error (exit 3),
+// and a successful conversion emits canonical .wrfm text on stdout with the
+// health tier of the PRODUCED model on the exit code (like transform/edit).
+// ---------------------------------------------------------------------------
+
+/// A minimal OBJ: three vertices and one triangular face.
+const TRI_OBJ: &str = "\
+v 0 0 0
+v 1 0 0
+v 0 1 0
+f 1 2 3
+";
+
+#[test]
+fn convert_obj_to_wrfm_writes_canonical_wrfm_to_stdout() {
+    let dir = scratch("convert_obj_to_wrfm");
+    let path = write(&dir, "tri.obj", TRI_OBJ);
+    let out = run(&[
+        "convert",
+        "--from",
+        "obj",
+        "--to",
+        "wrfm",
+        path.to_str().unwrap(),
+    ]);
+    // The tier (0..=2) is the health verdict; anything else means no
+    // result was produced (3) or a panic (101).
+    let code = out.status.code().unwrap_or(3);
+    assert!(code <= 2, "conversion produced no result: {}", stderr(&out));
+    let s = stdout(&out);
+    assert!(
+        s.starts_with("wrfm 1\nvertices 3   edges 3\n"),
+        "canonical wrfm on stdout, got: {s}"
+    );
+    let back = wrfm::WrfmModel::from_str("roundtrip", &s).expect("output parses");
+    assert_eq!(back.edges.len(), 3, "the face's ring survives");
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn convert_rejects_an_unsupported_direction_with_exit_three() {
+    let out = run(&[
+        "convert",
+        "--from",
+        "wrfm",
+        "--to",
+        "obj",
+        "no-such-file.wrfm",
+    ]);
+    assert_eq!(out.status.code(), Some(3), "stderr: {}", stderr(&out));
+    assert!(stdout(&out).is_empty(), "no result on a usage error");
+    assert!(
+        stderr(&out).contains("unsupported"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn convert_reads_an_obj_stream_from_stdin() {
+    let out = run_stdin(&["convert", "--from", "obj", "--to", "wrfm", "-"], TRI_OBJ);
+    let code = out.status.code().unwrap_or(3);
+    assert!(
+        code <= 2,
+        "stdin conversion produced no result: {}",
+        stderr(&out)
+    );
+    assert!(
+        stdout(&out).starts_with("wrfm 1\nvertices 3   edges 3\n"),
+        "got: {}",
+        stdout(&out)
+    );
 }
 
 // ---------------------------------------------------------------------------

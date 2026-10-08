@@ -1,4 +1,5 @@
 mod check;
+mod convert;
 mod edit;
 mod geometry;
 mod load;
@@ -382,6 +383,20 @@ enum Command {
     },
     /// Print the complete .wrfm v1 format spec (magic, header, groups, precision, streams) to stdout. Learn the format from the CLI itself — no separate manual to keep in sync.
     Format,
+    /// Convert a model between formats. v1 supports exactly one direction: obj -> wrfm.
+    ///
+    /// Faces contribute their ring of edges, `l` its chain (shared edges deduplicate);
+    /// `vt`/`vn`/materials are dropped and `o`/`g` groups are never invented.
+    Convert {
+        /// Path to the input file, or '-' to read it from stdin.
+        file: String,
+        /// Input format: `obj` (the only input v1 reads).
+        #[arg(long)]
+        from: String,
+        /// Output format: `wrfm` (the only output v1 writes).
+        #[arg(long)]
+        to: String,
+    },
 }
 
 fn main() {
@@ -563,6 +578,7 @@ fn main() {
         ),
         Command::Diff { a, b, format } => cmd_diff(&a, &b, &format),
         Command::Format => cmd_format(),
+        Command::Convert { file, from, to } => cmd_convert(&file, &from, &to),
     };
     std::process::exit(code);
 }
@@ -1604,4 +1620,25 @@ fn cmd_format() -> i32 {
     out!("{FORMAT_SPEC}");
     output::flush();
     0
+}
+
+fn cmd_convert(file: &str, from: &str, to: &str) -> i32 {
+    let model = match convert::convert(file, from, to) {
+        Ok(m) => m,
+        Err(e) => return usage(&e),
+    };
+    // Like transform/edit: the model goes to stdout whole, the health tier
+    // of the PRODUCED model travels on the exit code.
+    let rw = ratatui_wireframe::model::Model {
+        vertices: model.vertices,
+        edges: model.edges,
+    };
+    let c = check::check(&rw, false);
+    let verdict = verdict_of(&c);
+    out!(
+        "{}",
+        load::serialize_model(&rw, &model.name, &model.groups, model.version)
+    );
+    output::flush();
+    exit_for(verdict)
 }
