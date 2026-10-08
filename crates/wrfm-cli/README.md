@@ -12,8 +12,8 @@ same numbers.
 ## Features
 
 * **Verify intent, not just health:** `wrfm check` reports L2 health (`ok` / `warn` / `broken`) plus informational
-  quality diagnostics; `wrfm verify` asserts DECLARED intent (size / center / closed / axis / symmetry / groups) with
-  per-expectation deltas and fix commands.
+  quality diagnostics; `wrfm verify` asserts DECLARED intent (size / center / closed / axis / symmetry / groups /
+  redundant vertices) with per-expectation deltas and fix commands.
 * **Facts before pixels:** `wrfm info` / `wrfm geometry` / `wrfm query` compute structured numbers; `wrfm view` gives
   exact per-view occlusion facts — reason precisely without rendering. `wrfm group` prints per-part facts as JSON
   (`jq -r '.groups[] | "\(.name):\(.verdict)"'` for a one-line verdict list).
@@ -86,7 +86,8 @@ alignment add `wrfm geometry wrfm_files/cube.wrfm`.
 ## Verify intent
 
 Assert what a model *should* be — size, center, closedness, axis,
-symmetry or groups — and get pass/fail with deltas and a fix command:
+symmetry, groups or an accepted redundant-vertex count — and get pass/fail
+with deltas and a fix command:
 
 ```bash
 wrfm verify wrfm_files/tetrahedron.wrfm --expect-size 2,2,2 --expect-closed
@@ -95,6 +96,20 @@ wrfm verify wrfm_files/tetrahedron.wrfm --expect-size 2,2,2 --expect-closed
 wrfm verify wrfm_files/tetrahedron.wrfm --expect-size 1,1,1
 # verdict: fail   (exit code 2)
 # suggestion: wrfm transform - --scale-x 0.5 && wrfm transform - --scale-y 0.5 && wrfm transform - --scale-z 0.5
+```
+
+`check` warns about *redundant* vertices: degree-2 midpoints that sit
+dead straight on the chord between their neighbours (degenerate data like
+collapsed control rows — ordinary corners and closed loops are healthy).
+`--expect-redundant N` declares the exact count you accept, so the gate
+still catches a newly introduced one:
+
+```bash
+wrfm verify model.wrfm --expect-redundant 12
+# verdict: pass   (exit code 0) — 12 degenerate midpoints are accepted
+wrfm verify model.wrfm --expect-redundant 0
+# verdict: fail   (exit code 2)
+# suggestion: re-declare with the actual count: --expect-redundant 12
 ```
 
 ## Transform and edit over stdio

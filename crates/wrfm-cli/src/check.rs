@@ -85,17 +85,75 @@ pub fn degrees(m: &Model) -> Vec<usize> {
     deg
 }
 
-/// Vertices of degree exactly 2 — the L2 "non-manifold" (pinch) verdict,
-/// extracted from `check`'s degree scan so every caller counts the same set.
-pub fn non_manifold_vertices(deg: &[usize]) -> Vec<usize> {
+/// A degree-2 vertex that lies within the point-identity tolerance of the
+/// straight chord between its two neighbours is REDUNDANT: the wire passes
+/// straight through it, so it is a degenerate (pinch) midpoint that carries
+/// no shape — an exactly collapsed control grid is full of them (the teapot
+/// case in docs/wrfm-cli-review.md). A degree-2 vertex that actually TURNS
+/// a corner is healthy and is NOT reported; that distinction is the whole
+/// difference from the old blanket "every degree 2 is non-manifold" rule.
+pub fn redundant_vertices(m: &Model, deg: &[usize]) -> Vec<usize> {
     deg.iter()
         .enumerate()
-        .filter(|(_, d)| **d == 2)
+        .filter(|&(i, &d)| d == 2 && is_redundant_midpoint(m, i))
         .map(|(i, _)| i)
         .collect()
 }
 
-/// Run the health check. `strict` upgrades the warning-level issues (duplicate vertices, dangling and non-manifold vertices) to `broken`.
+/// True when the two incident edges of `i` form a straight run through it.
+/// Shapes that leave fewer than two distinct neighbours (self-loops,
+/// duplicated edges — both broken verdicts caught elsewhere) are never
+/// redundant, and a corrupt out-of-range neighbour can never panic.
+fn is_redundant_midpoint(m: &Model, i: usize) -> bool {
+    let mut first: Option<usize> = None;
+    let mut second: Option<usize> = None;
+    for &(a, b) in &m.edges {
+        let other = if a == i {
+            b
+        } else if b == i {
+            a
+        } else {
+            continue;
+        };
+        if first.is_none() {
+            first = Some(other);
+        } else if second.is_none() {
+            second = Some(other);
+        } else {
+            return false; // more than two incident edges
+        }
+    }
+    let (Some(n1), Some(n2)) = (first, second) else {
+        return false;
+    };
+    if n1 == n2 || n1 == i || n2 == i {
+        return false;
+    }
+    let (Some(&p), Some(&a), Some(&b)) =
+        (m.vertices.get(i), m.vertices.get(n1), m.vertices.get(n2))
+    else {
+        return false;
+    };
+    point_segment_distance(p, a, b) < POINT_TOL
+}
+
+/// Distance from `p` to the segment `a..b` (clamped projection, so a point
+/// beyond either end measures to the nearer endpoint). `a == b` degenerates
+/// to a point distance — never a division by zero.
+fn point_segment_distance(p: (f64, f64, f64), a: (f64, f64, f64), b: (f64, f64, f64)) -> f64 {
+    let ab = (b.0 - a.0, b.1 - a.1, b.2 - a.2);
+    let len2 = ab.0 * ab.0 + ab.1 * ab.1 + ab.2 * ab.2;
+    let t = if len2 > 0.0 {
+        let ap = (p.0 - a.0, p.1 - a.1, p.2 - a.2);
+        ((ap.0 * ab.0 + ap.1 * ab.1 + ap.2 * ab.2) / len2).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let q = (a.0 + t * ab.0, a.1 + t * ab.1, a.2 + t * ab.2);
+    ((p.0 - q.0).powi(2) + (p.1 - q.1).powi(2) + (p.2 - q.2).powi(2)).sqrt()
+}
+
+/// Run the health check. `strict` upgrades the warning-level issues (duplicate vertices, dangling and redundant vertices) to `broken`.
 pub fn check(m: &Model, strict: bool) -> Value {
     let n = m.vertices.len();
 
@@ -199,8 +257,10 @@ pub fn check(m: &Model, strict: bool) -> Value {
     // (they used to be bare integers, the one shape outlier in `issues`).
     let isolated_json: Vec<Value> = isolated.iter().map(|&i| json!({ "index": i })).collect();
 
-    // Degree-2 pinch vertices (see `non_manifold_vertices`).
-    let non_manifold: Vec<Value> = non_manifold_vertices(&deg)
+    // Redundant vertices: degree-2 midpoints on the straight chord between
+    // their neighbours (see `redundant_vertices`) — pass-throughs, not
+    // corners.
+    let redundant: Vec<Value> = redundant_vertices(m, &deg)
         .into_iter()
         .map(|i| json!({ "vertex": i, "degree": 2 }))
         .collect();
@@ -210,7 +270,7 @@ pub fn check(m: &Model, strict: bool) -> Value {
     let warn = !dup_vertices.is_empty()
         || !near_vertices.is_empty()
         || !dangling.is_empty()
-        || !non_manifold.is_empty();
+        || !redundant.is_empty();
     let verdict = if broken || (warn && strict) {
         "broken"
     } else if warn {
@@ -225,16 +285,16 @@ pub fn check(m: &Model, strict: bool) -> Value {
         + dup_edges.len()
         + dangling.len()
         + isolated.len()
-        + non_manifold.len();
+        + redundant.len();
     let summary = format!(
-        "{n_issues} issue(s): {} duplicate vertices, {} near-duplicate vertices, {} zero-length edges, {} duplicate edges, {} dangling edges, {} isolated vertices, {} non-manifold vertices",
+        "{n_issues} issue(s): {} duplicate vertices, {} near-duplicate vertices, {} zero-length edges, {} duplicate edges, {} dangling edges, {} isolated vertices, {} redundant vertices",
         dup_vertices.len(),
         near_vertices.len(),
         zero_edges.len(),
         dup_edges.len(),
         dangling.len(),
         isolated.len(),
-        non_manifold.len()
+        redundant.len()
     );
 
     let quality = quality_of(m);
@@ -251,7 +311,7 @@ pub fn check(m: &Model, strict: bool) -> Value {
                "duplicate_edges": dup_edges,
                "dangling_edges": dangling,
                "isolated_vertices": isolated_json,
-               "non_manifold_vertices": non_manifold,
+               "redundant_vertices": redundant,
     },
            "tolerance": POINT_TOL,
            "quality": quality,
@@ -348,7 +408,7 @@ pub fn report_text(name: &str, vertices: usize, edges: usize, c: &serde_json::Va
             ("duplicate_edges", "duplicate edges"),
             ("dangling_edges", "dangling edges"),
             ("isolated_vertices", "isolated vertices"),
-            ("non_manifold_vertices", "non-manifold vertices"),
+            ("redundant_vertices", "redundant vertices"),
         ] {
             let list = issues.get(kind).and_then(|v| v.as_array());
             if let Some(list) = list.filter(|l| !l.is_empty()) {
@@ -387,6 +447,10 @@ pub fn report_text(name: &str, vertices: usize, edges: usize, c: &serde_json::Va
                         "isolated_vertices" => {
                             out.push_str(&format!("    vertex {}\n", item["index"]))
                         }
+                        "redundant_vertices" => out.push_str(&format!(
+                            "    vertex {} (collinear midpoint)\n",
+                            item["vertex"],
+                        )),
                         _ => out.push_str(&format!(
                             "    vertex {} (degree {})\n",
                             item["vertex"], item["degree"],
@@ -617,6 +681,61 @@ mod tests {
         assert_eq!(r["quality"]["orientation"]["z_span"], 4.0);
         assert_eq!(r["quality"]["orientation"]["y_span"], 1.0);
         assert_eq!(r["verdict"], "ok");
+    }
+
+    /// A closed loop: (0,0)-(1,0)-(2,0)-(2,1)-(0,1)-(0,0). Vertex 1 is a
+    /// dead-straight midpoint on the bottom run; the other four turn corners.
+    fn loop_with_midpoint() -> Model {
+        Model {
+            vertices: vec![
+                (0.0, 0.0, 0.0),
+                (1.0, 0.0, 0.0),
+                (2.0, 0.0, 0.0),
+                (2.0, 1.0, 0.0),
+                (0.0, 1.0, 0.0),
+            ],
+            edges: vec![(0, 1), (1, 2), (2, 3), (3, 4), (4, 0)],
+        }
+    }
+
+    #[test]
+    fn redundant_midpoint_is_the_only_degree2_category() {
+        let r = check(&loop_with_midpoint(), false);
+        assert_eq!(r["verdict"], "warn");
+        let items = r["issues"]["redundant_vertices"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["vertex"], 1);
+
+        // Bend the midpoint off the chord: every vertex is now a real
+        // corner and the loop is fully healthy — the old blanket degree-2
+        // rule warned here.
+        let mut bent = loop_with_midpoint();
+        bent.vertices[1] = (1.0, 0.2, 0.0);
+        let r = check(&bent, false);
+        assert_eq!(r["verdict"], "ok");
+        assert!(
+            r["issues"]["redundant_vertices"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn redundancy_threshold_is_the_point_identity_tolerance() {
+        // A shallow but real bend (1e-4 off the chord, 100x POINT_TOL) is
+        // NOT redundant: only a midpoint whose removal stays inside
+        // point-identity granularity counts.
+        let mut m = loop_with_midpoint();
+        m.vertices[1] = (1.0, 1e-4, 0.0);
+        let r = check(&m, false);
+        assert_eq!(r["verdict"], "ok");
+    }
+
+    #[test]
+    fn strict_upgrades_redundant_to_broken() {
+        let r = check(&loop_with_midpoint(), true);
+        assert_eq!(r["verdict"], "broken");
     }
 
     #[test]

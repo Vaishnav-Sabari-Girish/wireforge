@@ -90,7 +90,7 @@ REPAIR MAP (finding -> command)
   zero-length edges              -> wrfm edit --clean
   dangling edges                 -> wrfm edit --clean
   isolated vertices              -> wrfm edit --clean
-  non-manifold (degree-2)        -> no repair action (an accepted state)
+  redundant (collinear degree-2) -> no repair action; declare: wrfm verify --expect-redundant N
 
 OUTPUT ENCODING
   `--format text|json` on the data commands: json is the machine-readable
@@ -105,7 +105,7 @@ Authoritative spec: FORMAT.md (wrfm crate docs).
     name = "wrfm",
     version,
     about = "Read-only streaming CLI for .wrfm 3D wireframe models",
-    after_help = "Every model-input command accepts '-' for stdin. Nothing writes a file: use shell redirection.\nExit codes: 0 ok (clean result / verify pass) · 1 warn (a warning-level health issue; `check` only) · 2 broken (repair required: check broken, an unmet verify declaration, or --strict upgrading a warn) · 3 no result (unreadable file, corrupt model, or usage error).\nPoint identity: vertices strictly closer than 1e-6 world units are the SAME point — `check` reports them as near-duplicate vertices and `wrfm edit --weld 1e-6` merges them (absolute threshold; pass an explicit --weld TOL when the model's units are far from 1).\n--format text|json selects the OUTPUT ENCODING of the data commands: json is the machine-readable form, text is its projection. `render --format` names the render style instead (braille|ascii|grid|both).\nRepair map (finding -> command): duplicate vertices -> --dedupe · near-duplicate vertices -> --weld 1e-6 · duplicate edges -> --dedupe · zero-length or dangling edges -> --clean · isolated vertices -> --clean · non-manifold (degree-2) vertices have no repair action (an accepted state).\nstderr carries diagnostics and errors only — the health verdict travels on the exit code (run `wrfm check` for the report).\nCompose atomic operations with pipes, e.g.:\n  wrfm edit m.wrfm --extract-group body | wrfm transform - --scale 2 --rotate-y 45\n  wrfm transform m.wrfm --mirror x | wrfm edit - --clean\nFormat spec: wrfm format (self-contained; no source needed)."
+    after_help = "Every model-input command accepts '-' for stdin. Nothing writes a file: use shell redirection.\nExit codes: 0 ok (clean result / verify pass) · 1 warn (a warning-level health issue; `check` only) · 2 broken (repair required: check broken, an unmet verify declaration, or --strict upgrading a warn) · 3 no result (unreadable file, corrupt model, or usage error).\nPoint identity: vertices strictly closer than 1e-6 world units are the SAME point — `check` reports them as near-duplicate vertices and `wrfm edit --weld 1e-6` merges them (absolute threshold; pass an explicit --weld TOL when the model's units are far from 1).\n--format text|json selects the OUTPUT ENCODING of the data commands: json is the machine-readable form, text is its projection. `render --format` names the render style instead (braille|ascii|grid|both).\nRepair map (finding -> command): duplicate vertices -> --dedupe · near-duplicate vertices -> --weld 1e-6 · duplicate edges -> --dedupe · zero-length or dangling edges -> --clean · isolated vertices -> --clean · redundant (collinear degree-2) vertices have no repair action — accept them with `wrfm verify --expect-redundant N`.\nstderr carries diagnostics and errors only — the health verdict travels on the exit code (run `wrfm check` for the report).\nCompose atomic operations with pipes, e.g.:\n  wrfm edit m.wrfm --extract-group body | wrfm transform - --scale 2 --rotate-y 45\n  wrfm transform m.wrfm --mirror x | wrfm edit - --clean\nFormat spec: wrfm format (self-contained; no source needed)."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -114,21 +114,21 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Health check (L2 geometry): duplicate vertices, zero-length / duplicate edges, dangling edges, isolated and non-manifold vertices.
+    /// Health check (L2 geometry): duplicate vertices, zero-length / duplicate edges, dangling edges, isolated and redundant (collinear degree-2) vertices.
     Check {
         /// Path to the .wrfm file, or '-' to read the model from stdin.
         file: String,
         /// Scope the check to one group (the verdict is for the part only).
         #[arg(long)]
         group: Option<String>,
-        /// Upgrade warning-level issues (duplicates / dangling / non-manifold) to a broken verdict — without it they report `warn`.
+        /// Upgrade warning-level issues (duplicates / dangling / redundant) to a broken verdict — without it they report `warn`.
         #[arg(long)]
         strict: bool,
         /// text | json. JSON is the one machine-readable health form; text is its projection.
         #[arg(long, default_value = "text")]
         format: String,
     },
-    /// Verify the model against declared intent (size / center / closed / axis / symmetry / groups).
+    /// Verify the model against declared intent (size / center / closed / axis / symmetry / groups / redundant vertices).
     Verify {
         /// Path to the .wrfm file, or '-' to read the model from stdin.
         file: String,
@@ -150,6 +150,9 @@ enum Command {
         /// Expect these named groups to exist (comma list).
         #[arg(long)]
         expect_groups: Option<String>,
+        /// Expect exactly N redundant (collinear degree-2) vertices — declare the degenerate midpoints you accept.
+        #[arg(long)]
+        expect_redundant: Option<usize>,
         /// Relative tolerance for numeric expectations (default 0.05 = 5%).
         #[arg(long, default_value_t = 0.05)]
         tolerance: f64,
@@ -434,6 +437,7 @@ fn main() {
             expect_axis,
             expect_symmetric,
             expect_groups,
+            expect_redundant,
             tolerance,
             group,
         } => cmd_verify(
@@ -444,6 +448,7 @@ fn main() {
             expect_axis.as_deref(),
             expect_symmetric.as_deref(),
             expect_groups.as_deref(),
+            expect_redundant,
             tolerance,
             group.as_deref(),
         ),
@@ -875,6 +880,7 @@ fn cmd_verify(
     expect_axis: Option<&str>,
     expect_symmetric: Option<&str>,
     expect_groups: Option<&str>,
+    expect_redundant: Option<usize>,
     tolerance: f64,
     group: Option<&str>,
 ) -> i32 {
@@ -943,6 +949,7 @@ fn cmd_verify(
         && expect_axis.is_none()
         && expect_symmetric.is_empty()
         && expect_groups.is_empty()
+        && expect_redundant.is_none()
     {
         return usage("wrfm verify needs at least one --expect-* flag");
     }
@@ -954,6 +961,7 @@ fn cmd_verify(
         expect_axis,
         expect_symmetric,
         expect_groups,
+        expect_redundant,
         tolerance,
     };
     let model = match group {

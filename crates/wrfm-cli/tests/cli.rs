@@ -53,9 +53,9 @@ e 3 7
 ";
 
 /// A valid v1 file with two groups: `body` (global vertices 0..3, a
-/// triangle) and `head` (3..6, a triangle) — 6 vertices, 6 edges, every
-/// vertex degree 2 (a `warn`-level health verdict, so these commands exit 1
-/// and only print a stderr note).
+/// triangle) and `head` (3..6, a triangle) — 6 vertices, 6 edges. Every
+/// vertex is a triangle corner: two healthy closed loops, so the whole
+/// model is an `ok` verdict and these commands exit 0.
 const TWO_GROUPS: &str = "\
 wrfm 1
 vertices 6   edges 6
@@ -326,6 +326,26 @@ e 0 1
 e 1 2
 ";
 
+/// A closed loop with ONE dead-straight midpoint: bottom run 0-1-2 is
+/// collinear (vertex 1 is redundant), the other four vertices turn corners.
+/// Every vertex is degree 2 — under the old rule all five warned, now only
+/// the straight-through midpoint does.
+const REDUNDANT_MIDPOINT: &str = "\
+wrfm 1
+vertices 5   edges 5
+
+v 0 0 0
+v 1 0 0
+v 2 0 0
+v 2 1 0
+v 0 1 0
+e 0 1
+e 1 2
+e 2 3
+e 3 4
+e 4 0
+";
+
 /// Two groups (body 0..3, head 3..6) with one cross edge (1,4): the
 /// `adjacent_groups` fixture.
 const BODY_HEAD: &str = "\
@@ -542,20 +562,77 @@ fn check_usage_exit_three() {
 
 #[test]
 fn check_group_scope() {
-    // --group scopes the L2 check to the part: the grouped model is a
-    // `warn` whole-model verdict (degree-2 vertices) but each triangle
-    // part is healthy — wait, degree-2 is a warning in both scopes. Instead
-    // assert the scoped report carries the PART's counts.
+    // --group scopes the L2 check to the part: the scoped report carries
+    // the PART's counts (3 vertices / 3 edges for the body triangle) while
+    // the whole model stays healthy — corner loops have no redundancy.
     let dir = scratch("check_group_scope");
     let path = write(&dir, "two.wrfm", TWO_GROUPS);
     let out = run(&["check", path.to_str().unwrap(), "--group", "body"]);
-    assert_eq!(out.status.code(), Some(1), "degree-2 warns -> exit 1");
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
     let so = stdout(&out);
     assert!(
-        so.starts_with("warn: two (3 vertices, 3 edges)"),
+        so.starts_with("ok: two (3 vertices, 3 edges)"),
         "scoped counts: {so}"
     );
     fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn check_reports_only_collinear_midpoints_as_redundant() {
+    let out = run_stdin(&["check", "-", "--format", "json"], REDUNDANT_MIDPOINT);
+    assert_eq!(out.status.code(), Some(1), "redundant midpoint -> warn");
+    let j = stdout_json(&out);
+    let ids = j["issues"]["redundant_vertices"].as_array().unwrap();
+    assert_eq!(ids.len(), 1, "only the straight-through midpoint: {j}");
+    assert_eq!(ids[0]["vertex"], 1);
+
+    // The text form names the category the same way.
+    let out = run_stdin(&["check", "-"], REDUNDANT_MIDPOINT);
+    assert!(
+        stdout(&out).contains("redundant vertices:"),
+        "stdout: {}",
+        stdout(&out)
+    );
+
+    // Bend the midpoint off the chord: an ordinary corner is healthy, so
+    // the whole loop is `ok` (the old rule warned on every degree-2 vertex).
+    let bent = REDUNDANT_MIDPOINT.replace("v 1 0 0", "v 1 0.2 0");
+    let out = run_stdin(&["check", "-"], &bent);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert!(
+        stdout(&out).starts_with("ok: stdin (5 vertices, 5 edges)"),
+        "stdout: {}",
+        stdout(&out)
+    );
+}
+
+#[test]
+fn verify_expect_redundant_declares_accepted_midpoints() {
+    let out = run_stdin(
+        &["verify", "-", "--expect-redundant", "1"],
+        REDUNDANT_MIDPOINT,
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let j = stdout_json(&out);
+    assert_eq!(j["verdict"], "pass");
+    assert_eq!(j["expectations"][0]["name"], "redundant");
+    assert_eq!(j["expectations"][0]["actual"], 1);
+
+    // A stale declaration is a failed one: the exact count is asserted so a
+    // newly introduced midpoint cannot slip in unnoticed.
+    let out = run_stdin(
+        &["verify", "-", "--expect-redundant", "0"],
+        REDUNDANT_MIDPOINT,
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "unmet declaration -> broken tier"
+    );
+    let j = stdout_json(&out);
+    assert_eq!(j["verdict"], "fail");
+    let s = j["expectations"][0]["suggestion"].as_str().unwrap();
+    assert!(s.contains("--expect-redundant 1"), "suggestion: {s}");
 }
 
 #[test]
@@ -606,7 +683,7 @@ fn info_reports_groups_in_json() {
     let dir = scratch("info_reports_groups_in_json");
     let path = write(&dir, "two.wrfm", TWO_GROUPS);
     let out = run(&["info", path.to_str().unwrap()]);
-    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
     let j = stdout_json(&out);
     assert_eq!(j["version"], 1);
     assert_eq!(j["vertices"], 6);
@@ -626,7 +703,7 @@ fn info_group_scopes_counts_and_bounds() {
     let dir = scratch("info_group_scopes_counts_and_bounds");
     let path = write(&dir, "two.wrfm", TWO_GROUPS);
     let out = run(&["info", path.to_str().unwrap(), "--group", "body"]);
-    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
     let j = stdout_json(&out);
     // The body triangle: 3 vertices, 3 edges, bbox [0,1]^2 at z=0.
     assert_eq!(j["vertices"], 3);
@@ -698,7 +775,7 @@ fn group_all_groups_json() {
     let dir = scratch("group_all_groups_json");
     let path = write(&dir, "two.wrfm", TWO_GROUPS);
     let out = run(&["group", path.to_str().unwrap()]);
-    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
     let j = stdout_json(&out);
     assert_eq!(j["name"], "two");
     let g = j["groups"].as_array().unwrap();
@@ -715,7 +792,7 @@ fn group_named() {
     let dir = scratch("group_named");
     let path = write(&dir, "two.wrfm", TWO_GROUPS);
     let out = run(&["group", path.to_str().unwrap(), "head"]);
-    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
     let j = stdout_json(&out);
     let g = j["groups"].as_array().unwrap();
     assert_eq!(g.len(), 1);
@@ -744,7 +821,7 @@ fn group_reports_adjacent_groups() {
     let dir = scratch("group_reports_adjacent_groups");
     let path = write(&dir, "bh.wrfm", BODY_HEAD);
     let out = run(&["group", path.to_str().unwrap()]);
-    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
     let j = stdout_json(&out);
     let g = j["groups"].as_array().unwrap();
     assert_eq!(g[0]["name"], "body");
@@ -759,7 +836,7 @@ fn group_adjacent_groups_empty_without_cross_edges() {
     let dir = scratch("group_adjacent_groups_empty_without_cross_edges");
     let path = write(&dir, "two.wrfm", TWO_GROUPS);
     let out = run(&["group", path.to_str().unwrap(), "body"]);
-    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
     let j = stdout_json(&out);
     assert_eq!(j["groups"][0]["adjacent_groups"], serde_json::json!({}));
     fs::remove_dir_all(&dir).ok();
@@ -833,7 +910,7 @@ fn geometry_group_scopes_topology() {
     let dir = scratch("geometry_group_scopes_topology");
     let path = write(&dir, "two.wrfm", TWO_GROUPS);
     let out = run(&["geometry", path.to_str().unwrap(), "--group", "body"]);
-    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
     let j = stdout_json(&out);
     // The body triangle: 3 vertices, 3 edges, bbox size [1,1,0].
     assert_eq!(j["topology"]["vertices"], 3);
@@ -909,7 +986,7 @@ fn query_group_scope() {
         "--group",
         "body",
     ]);
-    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
     let so = stdout(&out);
     // The `body` triangle spans x = 0..1 (the whole model spans 0..1 too,
     // but the head group's vertices are excluded from the submodel).
@@ -963,7 +1040,7 @@ fn query_vertices_group() {
         "--group",
         "body",
     ]);
-    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
     let j = stdout_json(&out);
     let vs = j["vertices"].as_array().unwrap();
     let idx: Vec<usize> = vs
@@ -1164,7 +1241,7 @@ fn view_group_scope() {
     let dir = scratch("view_group_scope");
     let path = write(&dir, "two.wrfm", TWO_GROUPS);
     let out = run(&["view", path.to_str().unwrap(), "--group", "body"]);
-    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
     let j = stdout_json(&out);
     assert_eq!(j["totals"]["edges"], 3); // the body triangle
     fs::remove_dir_all(&dir).ok();
@@ -1542,7 +1619,9 @@ fn edit_delete_vertices_remaps_edges() {
     let dir = scratch("edit_delete_vertices_remaps_edges");
     let path = write(&dir, "cube.wrfm", CUBE);
     let out = run(&["edit", path.to_str().unwrap(), "--delete-vertices", "7"]);
-    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    // The deleted corner's neighbours become real corners of the hole —
+    // no redundant midpoints, so the edited model is healthy.
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
     let so = stdout(&out);
     let back = wrfm::WrfmModel::from_str("edited", &so).expect("output parses");
     assert_eq!(back.vertices.len(), 7);
@@ -1573,7 +1652,8 @@ fn edit_extract_group() {
     let dir = scratch("edit_extract_group");
     let path = write(&dir, "two.wrfm", TWO_GROUPS);
     let out = run(&["edit", path.to_str().unwrap(), "--extract-group", "body"]);
-    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    // A lone triangle of corners is a healthy closed loop.
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
     let so = stdout(&out);
     let back = wrfm::WrfmModel::from_str("edited", &so).expect("output parses");
     assert_eq!(back.vertices.len(), 3);
@@ -1867,8 +1947,8 @@ fn diff_scopes_by_extraction_pipelines() {
     // extracting `head` gives an unchanged pair.
     let ea = run(&["edit", a.to_str().unwrap(), "--extract-group", "head"]);
     let eb = run(&["edit", b.to_str().unwrap(), "--extract-group", "head"]);
-    assert_eq!(ea.status.code(), Some(1), "stderr: {}", stderr(&ea));
-    assert_eq!(eb.status.code(), Some(1), "stderr: {}", stderr(&eb));
+    assert_eq!(ea.status.code(), Some(0), "stderr: {}", stderr(&ea));
+    assert_eq!(eb.status.code(), Some(0), "stderr: {}", stderr(&eb));
     let (head_a, head_b) = (stdout(&ea), stdout(&eb));
     let ha = write(&dir, "head-a.wrfm", &head_a);
     let hb = write(&dir, "head-b.wrfm", &head_b);
@@ -2304,9 +2384,9 @@ fn check_always_prints_the_full_report() {
 fn group_always_prints_json() {
     let dir = scratch("group_always_json");
     let path = write(&dir, "two.wrfm", TWO_GROUPS);
-    // The WHOLE model is warn (every vertex is degree 2) -> exit 1.
+    // The WHOLE model is healthy (two corner loops) -> exit 0.
     let out = run(&["group", path.to_str().unwrap()]);
-    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
     let j = stdout_json(&out);
     let names: Vec<&str> = j["groups"]
         .as_array()
@@ -2320,7 +2400,7 @@ fn group_always_prints_json() {
     assert_eq!(j["groups"][0]["verdict"], "ok");
     // Scoped to one group, JSON mode untouched.
     let out = run(&["group", path.to_str().unwrap(), "head"]);
-    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
     let j = stdout_json(&out);
     assert_eq!(j["groups"].as_array().unwrap().len(), 1);
     assert_eq!(j["groups"][0]["name"], "head");
@@ -2343,8 +2423,8 @@ fn render_stderr_stays_empty_for_warn_and_broken() {
     assert!(stderr(&out).is_empty(), "stderr: {}", stderr(&out));
 
     // Warn model: same silence, exit 1.
-    let two = write(&dir, "two.wrfm", TWO_GROUPS);
-    let out = run(&["render", two.to_str().unwrap(), "--format", "grid"]);
+    let warn = write(&dir, "warn.wrfm", REDUNDANT_MIDPOINT);
+    let out = run(&["render", warn.to_str().unwrap(), "--format", "grid"]);
     assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
     assert!(stderr(&out).is_empty(), "stderr: {}", stderr(&out));
     fs::remove_dir_all(&dir).ok();
@@ -2498,6 +2578,7 @@ fn help_documents_the_new_flags() {
         (vec!["group", "--help"], "structured facts"),
         (vec!["render", "--help"], "--fit"),
         (vec!["edit", "--help"], "--weld"),
+        (vec!["verify", "--help"], "--expect-redundant"),
         (vec!["convert", "--help"], "--from"),
         (vec!["convert", "--help"], "obj -> wrfm"),
     ] {

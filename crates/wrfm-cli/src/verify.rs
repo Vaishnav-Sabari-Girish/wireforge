@@ -1,10 +1,11 @@
 //! `wrfm verify` — intent assertions. The agent declares what it WANTED
-//! (size / center / closed / axis / symmetry / groups) and this module
-//! reports pass/fail per expectation, the delta, and an actionable fix
+//! (size / center / closed / axis / symmetry / groups / redundant) and this
+//! module reports pass/fail per expectation, the delta, and an actionable fix
 //! command. Geometry facts come from `crate::geometry::analyze` (the single
-//! authority); open edges come from `crate::check::bridges`.
+//! authority); open edges and the redundant-vertex count come from
+//! `crate::check`.
 
-use crate::check::bridges;
+use crate::check::{bridges, degrees, redundant_vertices};
 use crate::geometry::analyze;
 use ratatui_wireframe::model::Model;
 use serde_json::{Value, json};
@@ -21,6 +22,9 @@ pub struct VerifyOptions<'a> {
     /// Each letter "x" | "y" | "z" (validated by the caller).
     pub expect_symmetric: Vec<&'a str>,
     pub expect_groups: Vec<String>,
+    /// Exact expected count of redundant (collinear degree-2) vertices —
+    /// the accepted degenerate midpoints a `wrfm check` would still warn.
+    pub expect_redundant: Option<usize>,
     /// Relative tolerance for numeric expectations (0.05 = 5%).
     pub tolerance: f64,
 }
@@ -215,6 +219,26 @@ pub fn verify(m: &Model, groups: &[wrfm::Group], opts: &VerifyOptions) -> Value 
         }));
     }
 
+    // --- redundant-vertex expectation (accepted degenerate midpoints) ---
+    if let Some(exp) = opts.expect_redundant {
+        let deg = degrees(m);
+        let actual = redundant_vertices(m, &deg).len();
+        let pass = actual == exp;
+        let suggestion = if pass {
+            String::new()
+        } else {
+            format!("re-declare with the actual count: --expect-redundant {actual}")
+        };
+        expectations.push(json!({
+            "name": "redundant",
+            "expected": exp,
+            "actual": actual,
+            "pass": pass,
+            "delta": actual as i64 - exp as i64,
+            "suggestion": suggestion,
+        }));
+    }
+
     let total = expectations.len();
     let met = expectations
         .iter()
@@ -324,6 +348,7 @@ mod tests {
             expect_axis: None,
             expect_symmetric: Vec::new(),
             expect_groups: Vec::new(),
+            expect_redundant: None,
             tolerance: 0.05,
         }
     }
@@ -403,6 +428,55 @@ mod tests {
         o2.expect_symmetric = vec!["x", "y", "z"];
         let r2 = verify(&shifted, &[], &o2);
         assert_eq!(r2["verdict"], "pass");
+    }
+
+    #[test]
+    fn redundant_assertion_accepts_the_declared_midpoints() {
+        // A closed loop with one dead-straight midpoint: declaring it 1
+        // passes; the exact count means a NEW midpoint fails the gate.
+        let m = Model {
+            vertices: vec![
+                (0.0, 0.0, 0.0),
+                (1.0, 0.0, 0.0),
+                (2.0, 0.0, 0.0),
+                (2.0, 1.0, 0.0),
+                (0.0, 1.0, 0.0),
+            ],
+            edges: vec![(0, 1), (1, 2), (2, 3), (3, 4), (4, 0)],
+        };
+        let mut o = opts();
+        o.expect_redundant = Some(1);
+        let r = verify(&m, &[], &o);
+        assert_eq!(r["verdict"], "pass");
+        assert_eq!(r["expectations"][0]["name"], "redundant");
+        assert_eq!(r["expectations"][0]["actual"], 1);
+
+        o.expect_redundant = Some(0);
+        let r = verify(&m, &[], &o);
+        assert_eq!(r["verdict"], "fail");
+        assert_eq!(r["expectations"][0]["delta"], 1);
+        assert!(
+            r["expectations"][0]["suggestion"]
+                .as_str()
+                .unwrap()
+                .contains("--expect-redundant 1")
+        );
+    }
+
+    #[test]
+    fn redundant_assertion_ignores_real_corners() {
+        // A bent chain: the middle vertex is degree 2 but turns a corner —
+        // not redundant, so 0 passes (dangling ends are a check concern,
+        // not a verify one).
+        let m = Model {
+            vertices: vec![(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0)],
+            edges: vec![(0, 1), (1, 2)],
+        };
+        let mut o = opts();
+        o.expect_redundant = Some(0);
+        let r = verify(&m, &[], &o);
+        assert_eq!(r["verdict"], "pass");
+        assert_eq!(r["expectations"][0]["actual"], 0);
     }
 
     #[test]
