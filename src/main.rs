@@ -121,30 +121,106 @@ enum Motion {
     MoveBack,
 }
 
-/// Map a key (with its modifiers) to a motion. Returns `None` for keys bound to no motion (quit, toggles, unknown).
-fn motion_for(code: KeyCode, shift: bool) -> Option<Motion> {
+/// What one key press does. `Motion` keys are continuous (held until Release,
+/// FocusLost or the legacy timeout); every other action fires once per press.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Action {
+    Quit,
+    Help,
+    Spin,
+    Axes,
+    Center,
+    Fit,
+    Reset,
+    Motion(Motion),
+}
+
+/// Fold one terminal key event into the key's identity (its *base*, un-shifted
+/// form) plus whether SHIFT is in effect, so every later decision sees one
+/// protocol-independent shape instead of two:
+///
+/// * the kitty protocol always reports the **un-shifted** key code together
+///   with the SHIFT modifier (`Shift+h` -> `Char('h')` + SHIFT; `Shift+/` ->
+///   `Char('/')` + SHIFT because `REPORT_ALTERNATE_KEYS` is not pushed);
+/// * a legacy terminal sends the shifted **glyph**, and crossterm additionally
+///   synthesises SHIFT for upper-case letters (`Shift+h` -> `Char('H')` +
+///   SHIFT, `Shift+/` -> `Char('?')` with NO modifier at all).
+///
+/// So an upper-case char implies shift, a known shifted glyph folds back to
+/// its base key + shift, and anything else keeps the SHIFT modifier. The glyph
+/// table assumes a US-layout base key, which is what the bindings below use.
+/// Caps lock therefore counts as shift on the legacy path and is a no-op under
+/// kitty (crossterm drops the kitty caps-lock bit) — the two cannot be told
+/// apart from here.
+fn canonical_key(code: KeyCode, mods: KeyModifiers) -> (KeyCode, bool) {
+    use KeyCode::Char;
+    let shift = mods.contains(KeyModifiers::SHIFT);
+    match code {
+        Char(c) if c.is_uppercase() => (Char(c.to_lowercase().next().unwrap_or(c)), true),
+        Char('?') => (Char('/'), true),
+        Char('_') => (Char('-'), true),
+        Char('+') => (Char('='), true),
+        Char(')') => (Char('0'), true),
+        _ => (code, shift),
+    }
+}
+
+/// Map one terminal key event to the identity its hold is stored under and the
+/// action it performs; `None` for an unbound key (which includes the modifier
+/// keys themselves, reported by the kitty protocol).
+///
+/// SHIFT is the only modifier that changes an action (see `canonical_key`),
+/// and a shifted chord acts only where the table below lists it: `Shift+0` is
+/// `)` and does nothing, while `Shift+h` is the documented pan. Ctrl is
+/// reserved for quitting and every other modifier swallows the key, so a stray
+/// `Alt+h` can never rotate the model.
+fn resolve_key_event(code: KeyCode, mods: KeyModifiers) -> Option<(KeyCode, Action)> {
     use KeyCode::*;
-    Some(match code {
-        // Translation: Shift + arrows / hjkl (right/up), = / - (forward).
-        Left if shift => Motion::MoveLeft,
-        Right if shift => Motion::MoveRight,
-        Up if shift => Motion::MoveUp,
-        Down if shift => Motion::MoveDown,
-        Char('h') | Char('H') if shift => Motion::MoveLeft,
-        Char('l') | Char('L') if shift => Motion::MoveRight,
-        Char('k') | Char('K') if shift => Motion::MoveUp,
-        Char('j') | Char('J') if shift => Motion::MoveDown,
-        Char('=') | Char('+') => Motion::MoveForward,
-        Char('-') => Motion::MoveBack,
-        // Rotation: arrows / hjkl (yaw, pitch), r / e (roll).
-        Left | Char('h') => Motion::YawLeft,
-        Right | Char('l') => Motion::YawRight,
-        Up | Char('k') => Motion::PitchUp,
-        Down | Char('j') => Motion::PitchDown,
-        Char('r') => Motion::RollPlus,
-        Char('e') => Motion::RollMinus,
+    // Alt / Super / Hyper / Meta bind nothing.
+    let other = KeyModifiers::ALT | KeyModifiers::SUPER | KeyModifiers::HYPER | KeyModifiers::META;
+    if mods.intersects(other) {
+        return None;
+    }
+    let (base, shift) = canonical_key(code, mods);
+    if mods.contains(KeyModifiers::CONTROL) {
+        // Raw mode turns Ctrl+C / Ctrl+Q into plain key events (no SIGINT).
+        return matches!(base, Char('q') | Char('c')).then_some((base, Action::Quit));
+    }
+    let action = match (base, shift) {
+        // One-shot keys. Shift is a real chord component, so a shifted key is
+        // bound ONLY where it is listed below: `Shift+0` (which a US layout
+        // types as `)`) is not `0`, and `Shift+Q` is not `q`. The two
+        // exceptions are Space and Esc, which a legacy terminal encodes as the
+        // very same bytes with or without Shift — strictness there could only
+        // make the two terminal paths disagree.
+        (Char('q'), false) | (Esc, _) => Action::Quit,
+        (Char(' '), _) => Action::Spin,
+        // Shift+Tab arrives as BackTab on both paths and IS listed.
+        (Tab, false) | (BackTab, _) => Action::Axes,
+        (Char('0'), false) => Action::Reset,
+        // Help is `?`, i.e. the listed chord shift + `/`.
+        (Char('/'), true) => Action::Help,
+        (Char('f'), true) => Action::Fit,
+        (Char('f'), false) => Action::Center,
+        // Unshifted arrows / hjkl rotate; r / e roll.
+        (Left, false) | (Char('h'), false) => Action::Motion(Motion::YawLeft),
+        (Right, false) | (Char('l'), false) => Action::Motion(Motion::YawRight),
+        (Up, false) | (Char('k'), false) => Action::Motion(Motion::PitchUp),
+        (Down, false) | (Char('j'), false) => Action::Motion(Motion::PitchDown),
+        (Char('r'), false) => Action::Motion(Motion::RollPlus),
+        (Char('e'), false) => Action::Motion(Motion::RollMinus),
+        // The listed shifted chords translate instead.
+        (Left, true) | (Char('h'), true) => Action::Motion(Motion::MoveLeft),
+        (Right, true) | (Char('l'), true) => Action::Motion(Motion::MoveRight),
+        (Up, true) | (Char('k'), true) => Action::Motion(Motion::MoveUp),
+        (Down, true) | (Char('j'), true) => Action::Motion(Motion::MoveDown),
+        // Dolly: `=` / `-` plus their shifted spellings `+` / `_`, which is
+        // how those keys are labelled on several layouts.
+        (Char('='), _) => Action::Motion(Motion::MoveForward),
+        (Char('-'), _) => Action::Motion(Motion::MoveBack),
         _ => return None,
-    })
+    };
+    Some((base, action))
 }
 
 /// One frame of smooth continuous motion for a held key (model follows key).
@@ -504,20 +580,21 @@ fn hud_layout(
 const HELP: &[&str] = &[
     "=== wireforge keys ===",
     "",
-    "Rotate:",
+    "No Shift:",
     "  yaw left  <- / h       yaw right  -> / l",
     "  pitch up  ^ / k        pitch down v / j",
     "  roll      r / e",
+    "  nearer    =            farther   -",
     "",
-    "Move:",
-    "  left      Shift+<- / h  right     Shift+-> / l",
-    "  up        Shift+^ / k   down      Shift+v / j",
-    "  nearer    =             farther   -",
+    "Shift:",
+    "  left      <- / h       right     -> / l",
+    "  up        ^ / k        down      v / j",
     "",
     "Keys:",
     "  center   f          fit       Shift+f",
     "  reset    0          spin      Space",
-    "  axes     Tab        quit      q / Esc",
+    "  axes     Tab        help      ?",
+    "  quit     q / Esc / Ctrl+C",
     "",
     "[?] close help",
 ];
@@ -531,6 +608,16 @@ pub(crate) enum LoopEvent {
     Reload(ReloadEvent),
 }
 
+/// A key that is currently down. Its `motion` is sampled when the key goes
+/// down, so a modifier change mid-hold can never fork one key into two motions.
+#[derive(Debug, Clone, Copy)]
+struct Hold {
+    motion: Motion,
+    /// Last Press/Repeat seen for this key: the clock the legacy (no key-up)
+    /// timeout in `update_held` runs on.
+    seen: Instant,
+}
+
 /// All viewer state owned by the main loop.
 struct App {
     current: RenderMode,
@@ -538,8 +625,10 @@ struct App {
     one_shot: Option<String>,
     target_file: PathBuf,
     view: ViewState,
-    /// Motion keys that are currently down (value = last Press/Repeat seen).
-    held: HashMap<Motion, Instant>,
+    /// Keys currently held down, keyed by their identity (the base key from
+    /// `canonical_key`), so Release finds the right hold even when the
+    /// modifiers changed since the Press.
+    held: HashMap<KeyCode, Hold>,
     /// True once the terminal delivered a Release. From then on key-up is
     /// authoritative, so holds end on Release / FocusLost and are never
     /// dropped for staying quiet (see `update_held`).
@@ -602,16 +691,41 @@ impl App {
         if self.release_seen {
             return;
         }
-        for seen in self.held.values_mut() {
-            *seen = now;
+        for hold in self.held.values_mut() {
+            hold.seen = now;
         }
     }
 
-    /// Mark a motion key as held (Press/Repeat). `update_held` applies the
-    /// continuous motion every frame until Release or the hold timeout.
-    fn hold(&mut self, m: Motion) {
-        self.held.insert(m, Instant::now());
+    /// A motion key went down: sample its action now. The hold is keyed by the
+    /// key's identity, so `Shift+h` and `h` share one slot and can never run
+    /// side by side, and a Repeat of an already-held key only re-arms it.
+    fn hold_key_down(&mut self, hold_id: KeyCode, motion: Motion) {
+        self.held.insert(
+            hold_id,
+            Hold {
+                motion,
+                seen: Instant::now(),
+            },
+        );
         self.dirty = true;
+    }
+
+    /// Auto-repeat only refreshes the clock: a Repeat never re-samples the
+    /// motion, so pressing or releasing Shift mid-hold cannot swap the motion
+    /// out from under a key that is still down.
+    fn hold_key_repeat(&mut self, hold_id: KeyCode) {
+        if let Some(hold) = self.held.get_mut(&hold_id) {
+            hold.seen = Instant::now();
+        }
+    }
+
+    /// Key-up: drop the hold by identity. The modifiers of the Release event
+    /// are irrelevant — they may well differ from the Press (release Shift
+    /// before `h` and the event no longer carries SHIFT).
+    fn hold_key_up(&mut self, hold_id: KeyCode) {
+        if self.held.remove(&hold_id).is_some() {
+            self.dirty = true;
+        }
     }
 
     /// Handle one terminal input event. Returns true when the loop must break (quit).
@@ -629,79 +743,67 @@ impl App {
             }
             return false;
         }
-        if let Event::Key(key) = ev {
-            // A Release is direct evidence that the terminal reports key-up:
-            // from here on a hold ends when the key does, never on a timeout.
-            if key.kind == KeyEventKind::Release {
-                self.release_seen = true;
-            } else {
-                self.note_key_event(Instant::now());
+        let Event::Key(key) = ev else {
+            return false;
+        };
+        // A Release is direct evidence that the terminal reports key-up: from
+        // here on a hold ends when the key does, never on a timeout. It is
+        // matched by IDENTITY, because a Release may carry different modifiers
+        // than the Press (release Shift before `h` and SHIFT is gone) — keying
+        // it by the resulting motion would leave the motion running forever.
+        if key.kind == KeyEventKind::Release {
+            self.release_seen = true;
+            let (hold_id, _) = canonical_key(key.code, key.modifiers);
+            self.hold_key_up(hold_id);
+            return false;
+        }
+        // Any other event is evidence that some key is still down.
+        self.note_key_event(Instant::now());
+        // One event -> one (identity, action). Unbound keys stop here, which
+        // includes the bare modifier keys the kitty protocol reports.
+        let Some((hold_id, action)) = resolve_key_event(key.code, key.modifiers) else {
+            return false;
+        };
+        match action {
+            // Quit applies to Press and Repeat alike (holding `q` quits now).
+            Action::Quit => return true,
+            // A motion key: Press samples the action, Repeat only re-arms it.
+            Action::Motion(motion) => match key.kind {
+                KeyEventKind::Repeat => self.hold_key_repeat(hold_id),
+                _ => self.hold_key_down(hold_id, motion),
+            },
+            // One-shot actions fire once per tap, never at the repeat rate.
+            _ if key.kind == KeyEventKind::Repeat => {}
+            Action::Help => {
+                self.hud = match self.hud {
+                    Hud::Collapsed => Hud::Expanded,
+                    Hud::Expanded => Hud::Collapsed,
+                };
+                self.dirty = true;
             }
-            let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-            // The kitty protocol reports shifted punctuation as the base key
-            // plus the SHIFT modifier (REPORT_ALTERNATE_KEYS is not enabled),
-            // i.e. Shift+'/' arrives as Char('/') rather than Char('?').
-            // Normalise once so every branch below sees the shifted character.
-            let code = match key.code {
-                KeyCode::Char('/') if shift => KeyCode::Char('?'),
-                code => code,
-            };
-            // Kitty keyboard protocol: a Release event stops the motion immediately.
-            if key.kind == KeyEventKind::Release {
-                if let Some(m) = motion_for(code, shift) {
-                    self.held.remove(&m);
-                    self.dirty = true;
-                }
-                return false;
+            Action::Spin => {
+                self.auto_spin = !self.auto_spin;
+                self.dirty = true;
             }
-            match code {
-                KeyCode::Char('q') | KeyCode::Esc => return true,
-                // Auto-repeat only refreshes the hold: the toggles below fire
-                // once per tap, never at the terminal's repeat rate.
-                _ if key.kind == KeyEventKind::Repeat => {
-                    if let Some(m) = motion_for(code, shift) {
-                        self.hold(m);
-                    }
+            Action::Axes => {
+                self.show_axes = !self.show_axes;
+                self.dirty = true;
+            }
+            // Fit: the target at an appropriate distance (dist only — angles
+            // and pan are kept). Center: the file origin on screen (pan only).
+            Action::Fit => {
+                self.fit_if_braille();
+                self.dirty = true;
+            }
+            Action::Center => {
+                self.view.center_origin();
+                self.dirty = true;
+            }
+            Action::Reset => {
+                if let Some(m) = self.current.braille() {
+                    self.view.reset(m);
                 }
-                // One-shot keys act immediately (no debounce).
-                KeyCode::Char('?') => {
-                    self.hud = match self.hud {
-                        Hud::Collapsed => Hud::Expanded,
-                        Hud::Expanded => Hud::Collapsed,
-                    };
-                    self.dirty = true;
-                }
-                KeyCode::Char(' ') => {
-                    self.auto_spin = !self.auto_spin;
-                    self.dirty = true;
-                }
-                KeyCode::Tab => {
-                    self.show_axes = !self.show_axes;
-                    self.dirty = true;
-                }
-                // Shift+f: fit the target to an appropriate distance
-                // (dist only — angles and pan are kept). f: centre the
-                // file origin on screen (pan only).
-                KeyCode::Char('f') | KeyCode::Char('F') if shift => {
-                    self.fit_if_braille();
-                    self.dirty = true;
-                }
-                KeyCode::Char('f') | KeyCode::Char('F') => {
-                    self.view.center_origin();
-                    self.dirty = true;
-                }
-                KeyCode::Char('0') => {
-                    if let Some(m) = self.current.braille() {
-                        self.view.reset(m);
-                    }
-                    self.dirty = true;
-                }
-                // Motion keys.
-                _ => {
-                    if let Some(m) = motion_for(code, shift) {
-                        self.hold(m);
-                    }
-                }
+                self.dirty = true;
             }
         }
         false
@@ -710,22 +812,24 @@ impl App {
     /// Apply continuous motion to every held key each frame (dt-scaled), then
     /// drop the keys that stopped reporting. Release (kitty protocol) and
     /// FocusLost are the normal stops; the timeout is the only stop on a
-    /// terminal that never sends a Release, and a backstop when one is lost.
+    /// terminal that never sends a Release.
     fn update_held(&mut self, now: Instant, dt: f64) {
         // With key-up reporting there is nothing to time out: Release ends the
-        // hold and FocusLost covers an alt-tab, so a timeout would only ever
-        // kill a key that is still down. Without it, silence is the only
-        // evidence available and one second of it ends the hold.
+        // hold and FocusLost covers an alt-tab, so a timeout could only ever
+        // kill a key that is still down — the OS repeats only the most recent
+        // one, so a quiet hold is not evidence of a released key. Without
+        // key-up reporting, silence is the only evidence there is and one
+        // second of it ends the hold.
         if !self.release_seen {
             self.held
-                .retain(|_, seen| now.saturating_duration_since(*seen) <= LEGACY_HOLD_TIMEOUT);
+                .retain(|_, hold| now.saturating_duration_since(hold.seen) <= LEGACY_HOLD_TIMEOUT);
         }
         if self.held.is_empty() {
             return;
         }
         let move_scale = self.move_scale();
-        for m in self.held.keys() {
-            continuous_step(&mut self.view, *m, move_scale, dt);
+        for hold in self.held.values() {
+            continuous_step(&mut self.view, hold.motion, move_scale, dt);
         }
     }
 
@@ -2009,7 +2113,7 @@ mod tests {
             KeyModifiers::NONE,
         )));
         assert!(
-            app.held.contains_key(&Motion::YawRight),
+            app.held.contains_key(&KeyCode::Right),
             "press must enter continuous state"
         );
         // Auto-repeat: must not add a new entry
@@ -2051,6 +2155,186 @@ mod tests {
         assert!(app.held.is_empty(), "release must stop motion immediately");
     }
 
+    /// The same physical input arrives in two shapes: the kitty protocol sends
+    /// the **base** key plus SHIFT, a legacy terminal sends the shifted
+    /// **glyph** (and crossterm additionally synthesises SHIFT for upper-case
+    /// letters). Both must resolve alike — to the same action under the same
+    /// identity when the chord is listed, or to nothing at all when it is not
+    /// (`Shift+0` is `)`, and `)` is not `0`).
+    #[test]
+    fn resolve_key_event_folds_both_terminal_encodings() {
+        use KeyCode::*;
+        // Each row is (kitty form, legacy form, expected action or None).
+        let cases = [
+            // Listed shifted chords: they bind, on both paths.
+            (
+                (Char('h'), KeyModifiers::SHIFT),
+                (Char('H'), KeyModifiers::SHIFT),
+                Some(Action::Motion(Motion::MoveLeft)),
+            ),
+            (
+                (Char('f'), KeyModifiers::SHIFT),
+                (Char('F'), KeyModifiers::SHIFT),
+                Some(Action::Fit),
+            ),
+            (
+                (Char('/'), KeyModifiers::SHIFT),
+                (Char('?'), KeyModifiers::NONE),
+                Some(Action::Help),
+            ),
+            (
+                (Char('-'), KeyModifiers::SHIFT),
+                (Char('_'), KeyModifiers::NONE),
+                Some(Action::Motion(Motion::MoveBack)),
+            ),
+            (
+                (Char('='), KeyModifiers::SHIFT),
+                (Char('+'), KeyModifiers::NONE),
+                Some(Action::Motion(Motion::MoveForward)),
+            ),
+            // Shifted chords that are NOT listed: nothing happens, on either path.
+            (
+                (Char('0'), KeyModifiers::SHIFT),
+                (Char(')'), KeyModifiers::NONE),
+                None,
+            ),
+            (
+                (Char('q'), KeyModifiers::SHIFT),
+                (Char('Q'), KeyModifiers::SHIFT),
+                None,
+            ),
+            (
+                (Char('r'), KeyModifiers::SHIFT),
+                (Char('R'), KeyModifiers::SHIFT),
+                None,
+            ),
+        ];
+        for ((kitty_code, kitty_mods), (legacy_code, legacy_mods), expected) in cases {
+            let label = format!("{kitty_code:?}+{kitty_mods:?} vs {legacy_code:?}+{legacy_mods:?}");
+            let kitty = resolve_key_event(kitty_code, kitty_mods);
+            let legacy = resolve_key_event(legacy_code, legacy_mods);
+            assert_eq!(
+                kitty.as_ref().map(|(_, action)| *action),
+                expected,
+                "kitty: {label}"
+            );
+            assert_eq!(
+                legacy.as_ref().map(|(_, action)| *action),
+                expected,
+                "legacy: {label}"
+            );
+            if let (Some((kitty_id, _)), Some((legacy_id, _))) = (&kitty, &legacy) {
+                assert_eq!(kitty_id, legacy_id, "both must hold the same key: {label}");
+            }
+        }
+    }
+
+    /// Shift is the only chord component that gained a restriction, so every
+    /// plain key must still bind to its documented action.
+    #[test]
+    fn resolve_key_event_keeps_every_unshifted_key_bound() {
+        use KeyCode::*;
+        let documented = [
+            (Char('q'), Action::Quit),
+            (Esc, Action::Quit),
+            (Char(' '), Action::Spin),
+            (Tab, Action::Axes),
+            (Char('0'), Action::Reset),
+            (Char('f'), Action::Center),
+            (Char('r'), Action::Motion(Motion::RollPlus)),
+            (Char('e'), Action::Motion(Motion::RollMinus)),
+            (Char('h'), Action::Motion(Motion::YawLeft)),
+            (Char('='), Action::Motion(Motion::MoveForward)),
+            (Char('-'), Action::Motion(Motion::MoveBack)),
+            (Left, Action::Motion(Motion::YawLeft)),
+        ];
+        for (code, expected) in documented {
+            let (_, action) = resolve_key_event(code, KeyModifiers::NONE)
+                .unwrap_or_else(|| panic!("{code:?} must stay bound"));
+            assert_eq!(action, expected, "{code:?}");
+        }
+    }
+
+    /// SHIFT is the only modifier that changes an action: Ctrl is reserved for
+    /// quitting (raw mode delivers Ctrl+C / Ctrl+Q as key events, with no
+    /// SIGINT) and every other modifier swallows the key.
+    #[test]
+    fn resolve_key_event_reserves_ctrl_for_quitting_and_swallows_alt() {
+        use KeyCode::*;
+        assert!(matches!(
+            resolve_key_event(Char('c'), KeyModifiers::CONTROL),
+            Some((_, Action::Quit))
+        ));
+        assert!(matches!(
+            resolve_key_event(Char('q'), KeyModifiers::CONTROL),
+            Some((_, Action::Quit))
+        ));
+        // Ctrl+h must not rotate the model, and Alt+h must do nothing either.
+        assert_eq!(resolve_key_event(Char('h'), KeyModifiers::CONTROL), None);
+        assert_eq!(resolve_key_event(Left, KeyModifiers::CONTROL), None);
+        assert_eq!(resolve_key_event(Char('h'), KeyModifiers::ALT), None);
+        assert_eq!(resolve_key_event(Char(' '), KeyModifiers::ALT), None);
+        // Shift+Tab arrives as BackTab on both paths and still toggles the axes.
+        assert!(matches!(
+            resolve_key_event(BackTab, KeyModifiers::SHIFT),
+            Some((_, Action::Axes))
+        ));
+    }
+
+    /// Regression: `held` used to be keyed by Motion, so a modifier change
+    /// between Press and Release made key-up resolve to a *different* motion —
+    /// the original one kept running, and with key-up reporting there is no
+    /// timeout left to stop it.
+    #[test]
+    fn shift_change_mid_hold_cannot_leave_a_hold_running() {
+        let mut app = App::new(
+            RenderMode::Braille(Model {
+                vertices: vec![(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)],
+                edges: vec![(0, 1)],
+            }),
+            "cube".to_string(),
+            None,
+            PathBuf::from("cube.wrfm"),
+        );
+        // Press `h` (rotate), then press Shift: the Repeat now spells "move",
+        // but it is still the same key, so there is exactly one hold — and a
+        // Repeat never re-samples the motion it started with.
+        app.handle_input(Event::Key(KeyEvent::new(
+            KeyCode::Char('h'),
+            KeyModifiers::NONE,
+        )));
+        let mut shifted = KeyEvent::new(KeyCode::Char('h'), KeyModifiers::SHIFT);
+        shifted.kind = KeyEventKind::Repeat;
+        app.handle_input(Event::Key(shifted));
+        assert_eq!(app.held.len(), 1, "one key must not fork into two motions");
+        assert!(matches!(
+            app.held[&KeyCode::Char('h')].motion,
+            Motion::YawLeft
+        ));
+        // Release the key while Shift is still down: key-up carries SHIFT and
+        // must still find the hold.
+        let mut release = KeyEvent::new(KeyCode::Char('h'), KeyModifiers::SHIFT);
+        release.kind = KeyEventKind::Release;
+        app.handle_input(Event::Key(release));
+        assert!(app.held.is_empty(), "shifted key-up must stop the hold");
+
+        // The other order: press Shift+h (move), release Shift first, and the
+        // key-up arrives WITHOUT SHIFT. Matching on the motion here is what
+        // used to leave the model panning forever.
+        app.handle_input(Event::Key(KeyEvent::new(
+            KeyCode::Char('h'),
+            KeyModifiers::SHIFT,
+        )));
+        assert!(matches!(
+            app.held[&KeyCode::Char('h')].motion,
+            Motion::MoveLeft
+        ));
+        let mut release = KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE);
+        release.kind = KeyEventKind::Release;
+        app.handle_input(Event::Key(release));
+        assert!(app.held.is_empty(), "unshifted key-up must stop the hold");
+    }
+
     #[test]
     fn app_held_key_expires_without_release() {
         // A terminal without the kitty protocol never sends Release, so the
@@ -2068,10 +2352,11 @@ mod tests {
             KeyCode::Right,
             KeyModifiers::NONE,
         )));
-        let seen = *app
+        let seen = app
             .held
-            .get(&Motion::YawRight)
-            .expect("press must hold the motion");
+            .get(&KeyCode::Right)
+            .expect("press must hold the motion")
+            .seen;
         // Exactly at the timeout the key is still down (the bound is <=).
         app.update_held(seen + LEGACY_HOLD_TIMEOUT, 0.016);
         assert_eq!(app.held.len(), 1, "the timeout boundary must keep the hold");
@@ -2104,10 +2389,11 @@ mod tests {
             KeyCode::Right,
             KeyModifiers::NONE,
         )));
-        let seen = *app
+        let seen = app
             .held
-            .get(&Motion::YawRight)
-            .expect("press must hold the motion");
+            .get(&KeyCode::Right)
+            .expect("press must hold the motion")
+            .seen;
         // A minute of silence must not stop the rotation...
         app.update_held(seen + Duration::from_secs(60), 0.016);
         assert_eq!(
@@ -2144,10 +2430,11 @@ mod tests {
             )));
         }
         assert_eq!(app.held.len(), 2, "both motion keys are held");
-        let first = *app
+        let first = app
             .held
-            .get(&Motion::PitchDown)
-            .expect("j must hold the pitch motion");
+            .get(&KeyCode::Char('j'))
+            .expect("j must hold the pitch motion")
+            .seen;
         // Two seconds later only `l` is still repeating.
         let later = first + Duration::from_secs(2);
         app.note_key_event(later);
@@ -2218,17 +2505,19 @@ mod tests {
             KeyCode::Right,
             KeyModifiers::NONE,
         )));
-        let seen = *app
+        let seen = app
             .held
-            .get(&Motion::YawRight)
-            .expect("press must hold the motion");
+            .get(&KeyCode::Right)
+            .expect("press must hold the motion")
+            .seen;
         let mut repeat = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
         repeat.kind = KeyEventKind::Repeat;
         app.handle_input(Event::Key(repeat));
-        let refreshed = *app
+        let refreshed = app
             .held
-            .get(&Motion::YawRight)
-            .expect("repeat must keep the hold");
+            .get(&KeyCode::Right)
+            .expect("repeat must keep the hold")
+            .seen;
         assert!(refreshed >= seen, "auto-repeat must refresh the hold");
     }
 

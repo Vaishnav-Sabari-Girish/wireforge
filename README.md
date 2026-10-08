@@ -20,9 +20,10 @@ It also allows you to view 3D files using the `ratatui-ratty` crate in the
   or deleted file keeps the last good model on screen and recovers
   automatically. The camera is preserved across reloads.
 * **Interactive 6-DOF Viewport:** Freely rotate (yaw / pitch / roll) and
-  move (Shift + arrows, `=` / `-`) the model with your keyboard, toggle
-  auto-spin with `Space`, center or fit with `f`, and read the current
-  camera from the HUD line. XYZ axes can be toggled with `Tab`.
+  move (Shift + arrows or hjkl, plain `=` / `-`) the model with your
+  keyboard, toggle auto-spin with `Space`, center with `f` or fit with
+  `Shift + f`, and read the current camera from the HUD line. XYZ axes can
+  be toggled with `Tab`.
 * **Stream input:** `wireforge -` reads a model from stdin (or a FIFO such
   as `<( cat model.wrfm )`) as a one-shot preview with no hot-reload.
   Keyboard input still works via the controlling terminal.
@@ -105,15 +106,17 @@ wrfm edit model.wrfm --extract-group cabinet | wrfm transform - --scale 2 | wire
 | `Space` | Toggle automatic spinning |
 | `↑` / `↓` | Rotate Pitch (X-axis) |
 | `←` / `→` | Rotate Yaw (Y-axis) |
+| `h` / `j` / `k` / `l` | Rotate Yaw / Pitch (same as `←` / `→` / `↑` / `↓`) |
 | `r` / `e` | Rotate Roll (Z-axis) |
 | `Shift` + `←` / `→` / `↑` / `↓` | Move the model |
+| `Shift` + `h` / `j` / `k` / `l` | Move the model |
 | `=` / `-` | Move nearer / farther |
 | `f` | Center the file origin |
 | `Shift` + `f` | Fit the model to the view |
 | `0` | Reset rotation and distance |
 | `?` | Toggle the key help overlay |
-| `Tab` | Toggle the XYZ axes |
-| `q` / `Esc` | Quit the application |
+| `Tab` / `Shift` + `Tab` | Toggle the XYZ axes |
+| `q` / `Esc` / `Ctrl` + `C` | Quit the application |
 
 ## The `.wrfm` Format
 
