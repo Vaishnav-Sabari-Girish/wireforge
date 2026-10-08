@@ -139,19 +139,23 @@ enum Action {
 /// form) plus whether SHIFT is in effect, so every later decision sees one
 /// protocol-independent shape instead of two:
 ///
-/// * the kitty protocol always reports the **un-shifted** key code together
-///   with the SHIFT modifier (`Shift+h` -> `Char('h')` + SHIFT; `Shift+/` ->
-///   `Char('/')` + SHIFT because `REPORT_ALTERNATE_KEYS` is not pushed);
-/// * a legacy terminal sends the shifted **glyph**, and crossterm additionally
-///   synthesises SHIFT for upper-case letters (`Shift+h` -> `Char('H')` +
-///   SHIFT, `Shift+/` -> `Char('?')` with NO modifier at all).
+/// * the kitty protocol sends the layout's **shifted glyph** for every key
+///   that has an alternate (`REPORT_ALTERNATE_KEYS` is pushed): `Shift+h` ->
+///   `Char('H')`, `Shift+0` -> `Char(')')` — crossterm applies the alternate
+///   and clears SHIFT. Keys without an alternate keep the modifier instead
+///   (`Shift+Left` -> `Left` + SHIFT, `Shift+Space` -> `Char(' ')` + SHIFT);
+/// * a legacy terminal sends the shifted **glyph** too, and crossterm
+///   additionally synthesises SHIFT for upper-case letters (`Shift+h` ->
+///   `Char('H')` + SHIFT, `Shift+/` -> `Char('?')` with NO modifier at all).
 ///
 /// So an upper-case char implies shift, a known shifted glyph folds back to
 /// its base key + shift, and anything else keeps the SHIFT modifier. The glyph
-/// table assumes a US-layout base key, which is what the bindings below use.
-/// Caps lock therefore counts as shift on the legacy path and is a no-op under
-/// kitty (crossterm drops the kitty caps-lock bit) — the two cannot be told
-/// apart from here.
+/// table maps the four shifted glyphs the bindings use back to their US base
+/// keys — the layouts' own glyphs arrive unchanged, so the same table serves
+/// both paths. Caps lock therefore counts as shift on the legacy path and is
+/// a no-op under kitty (crossterm files the kitty caps-lock bit under
+/// `KeyEventState`, which is never read here) — the two cannot be told apart
+/// from here.
 fn canonical_key(code: KeyCode, mods: KeyModifiers) -> (KeyCode, bool) {
     use KeyCode::Char;
     let shift = mods.contains(KeyModifiers::SHIFT);
@@ -1292,13 +1296,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Mouse capture stays OFF (native drag-selection) and the cursor is
     // hidden for the session (the L2 direct-write present does not hide it).
     execute!(stdout, EnterAlternateScreen, Hide)?;
-    // Enable the Kitty keyboard protocol for Press/Repeat/Release key events.
-    // Keyboard enhancement (kitty protocol) is optional: terminals that don't
-    // support it (e.g. the legacy Windows console API) run without it.
+    // Enable the Kitty keyboard protocol for Press/Repeat/Release key events,
+    // plus alternate key codes so a shifted chord arrives as the glyph the
+    // active layout types (`Shift+0` -> `)`) rather than a layout-dependent
+    // base key — that is what keeps `?` / `_` / `+` / `)` and the strict Shift
+    // rules working on non-US layouts. Keyboard enhancement (kitty protocol)
+    // is optional: terminals that don't support it (e.g. the legacy Windows
+    // console API) run without it, and legacy terminals simply ignore the flag.
     let _ = execute!(
         stdout,
         PushKeyboardEnhancementFlags(
             KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
                 | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
                 | KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
         )
@@ -2054,8 +2063,8 @@ mod tests {
         )));
         assert_eq!(app.hud, Hud::Collapsed);
 
-        // Kitty protocol: Shift+'/' arrives as the base key plus SHIFT
-        // (REPORT_ALTERNATE_KEYS is not pushed), so it must also toggle.
+        // Shift+'/' also arrives as the base key plus SHIFT (a path without
+        // alternate keys), so that shape must toggle too.
         app.dirty = false;
         app.handle_input(Event::Key(KeyEvent::new(
             KeyCode::Char('/'),
@@ -2155,18 +2164,19 @@ mod tests {
         assert!(app.held.is_empty(), "release must stop motion immediately");
     }
 
-    /// The same physical input arrives in two shapes: the kitty protocol sends
-    /// the **base** key plus SHIFT, a legacy terminal sends the shifted
-    /// **glyph** (and crossterm additionally synthesises SHIFT for upper-case
-    /// letters). Both must resolve alike — to the same action under the same
-    /// identity when the chord is listed, or to nothing at all when it is not
-    /// (`Shift+0` is `)`, and `)` is not `0`).
+    /// The same physical input can arrive in two shapes: the **base** key plus
+    /// SHIFT (a path without alternate keys — still accepted) or the shifted
+    /// **glyph** (what a legacy terminal sends, SHIFT synthesised for
+    /// upper-case letters, and what the kitty path now sends for keys with an
+    /// alternate, SHIFT cleared). Both must resolve alike — to the same action
+    /// under the same identity when the chord is listed, or to nothing at all
+    /// when it is not (`Shift+0` is `)`, and `)` is not `0`).
     #[test]
     fn resolve_key_event_folds_both_terminal_encodings() {
         use KeyCode::*;
-        // Each row is (kitty form, legacy form, expected action or None).
+        // Each row is (base+SHIFT form, shifted-glyph form, expected or None).
         let cases = [
-            // Listed shifted chords: they bind, on both paths.
+            // Listed shifted chords: they bind, in either shape.
             (
                 (Char('h'), KeyModifiers::SHIFT),
                 (Char('H'), KeyModifiers::SHIFT),
@@ -2192,7 +2202,7 @@ mod tests {
                 (Char('+'), KeyModifiers::NONE),
                 Some(Action::Motion(Motion::MoveForward)),
             ),
-            // Shifted chords that are NOT listed: nothing happens, on either path.
+            // Shifted chords that are NOT listed: nothing happens, in either shape.
             (
                 (Char('0'), KeyModifiers::SHIFT),
                 (Char(')'), KeyModifiers::NONE),
@@ -2209,24 +2219,52 @@ mod tests {
                 None,
             ),
         ];
-        for ((kitty_code, kitty_mods), (legacy_code, legacy_mods), expected) in cases {
-            let label = format!("{kitty_code:?}+{kitty_mods:?} vs {legacy_code:?}+{legacy_mods:?}");
-            let kitty = resolve_key_event(kitty_code, kitty_mods);
-            let legacy = resolve_key_event(legacy_code, legacy_mods);
+        for ((base_code, base_mods), (glyph_code, glyph_mods), expected) in cases {
+            let label = format!("{base_code:?}+{base_mods:?} vs {glyph_code:?}+{glyph_mods:?}");
+            let base = resolve_key_event(base_code, base_mods);
+            let glyph = resolve_key_event(glyph_code, glyph_mods);
             assert_eq!(
-                kitty.as_ref().map(|(_, action)| *action),
+                base.as_ref().map(|(_, action)| *action),
                 expected,
-                "kitty: {label}"
+                "base+SHIFT: {label}"
             );
             assert_eq!(
-                legacy.as_ref().map(|(_, action)| *action),
+                glyph.as_ref().map(|(_, action)| *action),
                 expected,
-                "legacy: {label}"
+                "glyph: {label}"
             );
-            if let (Some((kitty_id, _)), Some((legacy_id, _))) = (&kitty, &legacy) {
-                assert_eq!(kitty_id, legacy_id, "both must hold the same key: {label}");
+            if let (Some((base_id, _)), Some((glyph_id, _))) = (&base, &glyph) {
+                assert_eq!(base_id, glyph_id, "both must hold the same key: {label}");
             }
         }
+    }
+
+    /// `REPORT_ALTERNATE_KEYS` is pushed, so on the kitty path a shifted chord
+    /// arrives as the glyph the active layout types with SHIFT **cleared**
+    /// (crossterm applies the alternate and drops the modifier). That is the
+    /// legacy shape minus its synthesised SHIFT, so it folds into the same
+    /// identity and action — listed chord or not.
+    #[test]
+    fn alternate_key_glyphs_fold_into_the_same_chords() {
+        use KeyCode::*;
+        let bound = [
+            (Char('H'), Char('h'), Action::Motion(Motion::MoveLeft)),
+            (Char('F'), Char('f'), Action::Fit),
+            (Char('?'), Char('/'), Action::Help),
+            (Char('_'), Char('-'), Action::Motion(Motion::MoveBack)),
+            (Char('+'), Char('='), Action::Motion(Motion::MoveForward)),
+        ];
+        for (glyph, id, expected) in bound {
+            assert_eq!(
+                resolve_key_event(glyph, KeyModifiers::NONE),
+                Some((id, expected)),
+                "glyph {glyph:?} must fold into its listed chord"
+            );
+        }
+        // Chords that are NOT listed stay silent in that shape as well:
+        // `Shift+0` types `)` and must not reset, `Shift+q` must not quit.
+        assert_eq!(resolve_key_event(Char(')'), KeyModifiers::NONE), None);
+        assert_eq!(resolve_key_event(Char('Q'), KeyModifiers::NONE), None);
     }
 
     /// Shift is the only chord component that gained a restriction, so every
