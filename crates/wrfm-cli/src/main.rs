@@ -120,7 +120,7 @@ enum Command {
 /// Scope the check to one group (the verdict is for the part only).
  #[arg(long)]
  group: Option<String>,
-/// Upgrade warning-level issues (duplicates / dangling / non-manifold) to a broken verdict — only a fully clean model
+/// Upgrade warning-level issues (duplicates / dangling / non-manifold) to a broken verdict — without it they report `warn`.
  #[arg(long)]
  strict: bool,
  /// text | json. JSON is the one machine-readable health form; text is its projection.
@@ -380,7 +380,7 @@ enum Command {
  #[arg(long, default_value = "text")]
  format: String,
  },
-/// Print the complete .wrfm v1 format spec (magic, header, groups, precision, streams) to stdout. Learn the format from the CLI itself —
+/// Print the complete .wrfm v1 format spec (magic, header, groups, precision, streams) to stdout. Learn the format from the CLI itself — no separate manual to keep in sync.
  Format,
 }
 

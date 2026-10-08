@@ -95,7 +95,7 @@ pub fn non_manifold_vertices(deg: &[usize]) -> Vec<usize> {
         .collect()
 }
 
-/// Run the health check. `strict` upgrades warning-level issues (duplicates,
+/// Run the health check. `strict` upgrades the warning-level issues (duplicate vertices, dangling and non-manifold vertices) to `broken`.
 pub fn check(m: &Model, strict: bool) -> Value {
  let n = m.vertices.len();
 
@@ -158,8 +158,8 @@ pub fn check(m: &Model, strict: bool) -> Value {
  let mut edge_count: HashMap<(usize, usize), usize> = HashMap::new();
  for &(a, b) in &m.edges {
  // Edge indices are valid (module-level invariant), so `va`/`vb`
- // exist; the old `a < n && b < n` guard was removed (
- //).
+ // exist; the old `a < n && b < n` guard was removed as unreachable: the
+ // module-level invariant already guarantees valid edge indices.
  let (va, vb) = (m.vertices[a], m.vertices[b]);
  let d2 = (va.0 - vb.0).powi(2) + (va.1 - vb.1).powi(2) + (va.2 - vb.2).powi(2);
  if d2 < POINT_TOL * POINT_TOL {

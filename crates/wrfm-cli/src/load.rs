@@ -2,7 +2,7 @@ use ratatui_wireframe::model::Model;
 use std::io::Read;
 use wrfm::WrfmModel;
 
-/// A loaded model plus the parser's metadata (display name, format
+/// A loaded model plus the parser's metadata (display name, format version, groups, source, byte count).
 pub struct Loaded {
  pub model: Model,
  pub name: String,
@@ -16,10 +16,10 @@ pub struct Loaded {
  pub bytes: usize,
 }
 
-/// The failure mode of [`load`] — every variant is a user-facing message
+/// The failure mode of [`load`]: one user-facing message, already formatted for stderr.
 pub struct LoadError(pub String);
 
-/// Load a model from `<file|->`. `-` reads all of stdin once (pipeline
+/// Load a model from `<file|->`. `-` reads all of stdin once (pipeline mode: the stream is buffered in memory).
 pub fn load(source: &str) -> Result<Loaded, LoadError> {
     if source == "-" {
  let mut buf = String::new();
@@ -62,7 +62,7 @@ fn from_text(name: &str, text: &str, source: &str) -> Result<Loaded, LoadError> 
  })
 }
 
-/// Render a `wrfm::LoadError` (I/O vs parse) into the single stderr line
+/// Render a `wrfm::LoadError` (I/O vs parse) into the single stderr line the caller prints.
 fn render_load_error(source: &str, e: &wrfm::LoadError) -> String {
  match e {
         wrfm::LoadError::Io(e) => format!("error: cannot read '{source}': {e}"),
@@ -70,7 +70,7 @@ fn render_load_error(source: &str, e: &wrfm::LoadError) -> String {
  }
 }
 
-/// Serialize a geometry `Model` back to canonical `.wrfm` v1 TEXT (magic +
+/// Serialize a geometry `Model` back to canonical `.wrfm` v1 TEXT (magic + counts header + groups + edges).
 pub fn serialize_model(m: &Model, name: &str, groups: &[wrfm::Group], version: u32) -> String {
  let mut raw = WrfmModel::new(name);
  raw.vertices = m.vertices.clone();

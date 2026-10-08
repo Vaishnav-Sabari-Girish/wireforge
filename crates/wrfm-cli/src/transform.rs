@@ -146,7 +146,7 @@ fn max_span(verts: &[(f64, f64, f64)]) -> f64 {
  (max[0] - min[0]).max(max[1] - min[1]).max(max[2] - min[2])
 }
 
-/// Upper-triangular shears composed as `Sh_xy · Sh_xz · Sh_yz`: `--shear-xy K`: x' = x + K·y · `--shear-xz K`: x' = x + K·z ·
+/// Upper-triangular shears composed as `Sh_xy · Sh_xz · Sh_yz`: `--shear-xy K`: x' = x + K·y · `--shear-xz K`: x' = x + K·z · `--shear-yz K`: y' = y + K·z.
 fn shear(k_xy: f64, k_xz: f64, k_yz: f64) -> [[f64; 3]; 3] {
  let sh_xy = [[1.0, k_xy, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
  let sh_xz = [[1.0, 0.0, k_xz], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];

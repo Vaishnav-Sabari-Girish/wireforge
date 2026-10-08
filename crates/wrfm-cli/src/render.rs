@@ -65,7 +65,7 @@ pub(crate) fn rot_axis(axis: [f64; 3], angle_deg: f64) -> Mat3 {
  ]
 }
 
-/// World-frame model rotation for absolute (pitch, yaw): the model is first pitched around the world X axis, then yawed around the world vertical
+/// World-frame model rotation for absolute (pitch, yaw): the model is first pitched around the world X axis, then yawed around the world vertical axis.
 pub(crate) fn world_rot(pitch_deg: f64, yaw_deg: f64) -> Mat3 {
  mat_mul(rot_y(-yaw_deg.to_radians()), rot_x(pitch_deg.to_radians()))
 }
@@ -180,7 +180,7 @@ pub struct RenderOptions {
  pub yaw_deg: f64,
  pub roll_deg: f64,
  pub format: Format,
-/// Auto camera distance: set the camera distance from the model's geometric-mean extent (the fork's fit_to math). When `false`, use
+/// Auto camera distance: set the camera distance from the model's geometric-mean extent (the fork's fit_to math). When `false`, use `dist` (or the fixed default of 8.0).
  pub auto_dist: bool,
 /// Explicit camera distance (world units); `None` (or 0) = the fixed default (8.0).
  pub dist: Option<f64>,
@@ -188,19 +188,19 @@ pub struct RenderOptions {
  pub pan_x: f64,
 /// Aim-point Y offset in world units (the fork's pan_y), like the TUI's Shift+^/v.
  pub pan_y: f64,
-/// When non-empty, render one frame per standard view (overrides pitch_deg/yaw_deg/roll_deg). Empty = single frame with the explicit
+/// When non-empty, render one frame per standard view (overrides pitch_deg/yaw_deg/roll_deg). Empty = one frame from the explicit angles.
  pub views: Vec<View>,
  /// Density grid columns (used by `Format::Grid` and `diff_wrfm`).
  pub grid_w: usize,
  /// Density grid rows (used by `Format::Grid` and `diff_wrfm`).
  pub grid_h: usize,
-/// Zoom into a sub-region of the projected view, as normalized fractions `(x0, y0, x1, y1)` in 0..1 of the canvas (y grows downward). None =
+/// Zoom into a sub-region of the projected view, as normalized fractions `(x0, y0, x1, y1)` in 0..1 of the canvas (y grows downward). None = no region crop; the whole canvas is rendered.
  pub region: Option<[f64; 4]>,
-/// `--fit content`: crop each frame to the projected content bounding box, so the model fills the canvas. Applied per view AFTER the camera
+/// `--fit content`: crop each frame to the projected content bounding box, so the model fills the canvas. Applied per view AFTER the camera transform, so each view's content fills its canvas.
  pub fit_content: bool,
 }
 
-/// Inter-group adjacency for every group: how many BOUNDARY edges (exactly one endpoint in the group) connect to each OTHER group (the first group
+/// Inter-group adjacency for every group: how many BOUNDARY edges (exactly one endpoint in the group) connect to each OTHER group (the other endpoint is credited to the first group in file order owning it).
 pub(crate) fn adjacent_groups(m: &Model, groups: &[wrfm::Group]) -> Vec<BTreeMap<String, usize>> {
  let n = m.vertices.len();
  // Global vertex -> first group (file order) that owns it.
@@ -306,7 +306,7 @@ pub(crate) fn group_facts(m: &Model, g: &wrfm::Group, adjacent: &BTreeMap<String
  })
 }
 
-/// A group-scoped sub-model: vertices = `V_g` plus the OUT-OF-GROUP endpoints of boundary edges (so every edge in `E_g`
+/// A group-scoped sub-model: vertices = `V_g` plus the OUT-OF-GROUP endpoints of boundary edges (so every edge in `E_g` is kept, its outside endpoints added as extras).
 pub(crate) fn submodel_for_group(m: &Model, g: &wrfm::Group) -> Model {
  let s = g.vertex_start.min(m.vertices.len());
  let e = g.vertex_end.min(m.vertices.len());
@@ -358,7 +358,7 @@ pub fn bounds(m: &Model) -> ([f64; 3], [f64; 3]) {
  (min, max)
 }
 
-/// The model's comprehensive length (the fork's `model_extent`): the geometric mean of the three bounding-box dimensions (dx * dy * dz)^(1/3),
+/// The model's comprehensive length (the fork's `model_extent`): the geometric mean of the three bounding-box dimensions, i.e. (dx * dy * dz)^(1/3).
 pub fn model_extent(m: &Model) -> f64 {
  let (min, max) = bounds(m);
  let (dx, dy, dz) = (
@@ -375,7 +375,7 @@ pub fn auto_dist(m: &Model) -> f64 {
  r / (FOV_DEG / 2.0).to_radians().tan() * FIT_MARGIN
 }
 
-/// Project one model-space vertex to canvas pixel coordinates (origin at the view centre, +x right, +y up) using the fork's projection: world-frame
+/// Project one model-space vertex to canvas pixel coordinates (origin at the view centre, +x right, +y up) using the fork's projection: world-frame rotation and pan, camera distance, roll about the pivot, then the focal-length divide.
 #[allow(clippy::too_many_arguments)] // mirrors the fork's project_point signature
 pub(crate) fn project_vertex(
  p: (f64, f64, f64),
@@ -746,7 +746,7 @@ pub struct DiffOptions {
  pub grid_h: usize,
 }
 
-/// Compare two models by rendering both to density grids at the same view and reporting per-cell deltas. Mirrors Blender MCP's "verify against
+/// Compare two models by rendering both to density grids at the same view and reporting per-cell deltas. Mirrors Blender MCP's "verify against" workflow.
 pub fn diff_to_text(a: &Model, b: &Model, opts: &DiffOptions, detail: bool) -> String {
  let (pitch, yaw, roll) = opts.view.rotation();
  let (w, h) = (opts.width, opts.height);

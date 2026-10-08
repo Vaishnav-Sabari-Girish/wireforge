@@ -22,7 +22,7 @@ struct Proj {
  depth: f64,
 }
 
-/// Project every vertex with the same world-frame math as the fork
+/// Project every vertex with the fork's world-frame math (rotate, pan, roll, focal divide).
 fn project(m: &Model, p: &ViewParams) -> Vec<Option<Proj>> {
  let rot = world_rot(p.pitch_deg, p.yaw_deg);
  let f = 100.0;
@@ -69,7 +69,7 @@ struct ScreenGrid {
 }
 
 impl ScreenGrid {
-/// Sample an edge every `step` screen units, calling
+/// Sample an edge every `step` screen units, calling `f` with the grid cell (and its interpolated depth) each sample lands in.
  fn for_each_sample(&self, p1: &Proj, p2: &Proj, mut f: impl FnMut(usize, usize, f64)) {
  let (dx, dy) = (p2.px - p1.px, p2.py - p1.py);
  let len = (dx * dx + dy * dy).sqrt();
@@ -134,7 +134,7 @@ fn convex_hull(pts: &[(f64, f64, usize)]) -> Vec<usize> {
  lower.into_iter().map(|i| p[i].2).collect()
 }
 
-/// Compute per-view facts: visible edges (z-buffer occlusion), silhouette,
+/// Compute per-view facts: visible and occluded edges (z-buffer occlusion), screen extent, totals and the silhouette (screen-space hull).
 pub fn analyze(m: &Model, p: &ViewParams) -> Value {
  let proj = project(m, p);
 

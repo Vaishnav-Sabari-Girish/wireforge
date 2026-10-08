@@ -11,7 +11,7 @@ fn v3(a: [f64; 3]) -> Value {
  json!([r3(a[0]), r3(a[1]), r3(a[2])])
 }
 
-/// Arithmetic mean of the vertices (a wireframe's natural "centre of mass"
+/// Arithmetic mean of the vertices (a wireframe's natural "centre of mass").
 fn centroid(m: &Model) -> [f64; 3] {
  let n = m.vertices.len() as f64;
  let mut c = [0.0; 3];
@@ -105,7 +105,7 @@ fn jacobi_eigen(mut a: [[f64; 3]; 3]) -> ([f64; 3], [[f64; 3]; 3]) {
  (evals, evecs)
 }
 
-/// Principal axes (PCA) of the vertex cloud: covariance eigenvectors sorted
+/// Principal axes (PCA) of the vertex cloud: covariance eigenvectors sorted by decreasing eigenvalue.
 pub(crate) fn principal_axes(m: &Model) -> ([[f64; 3]; 3], [f64; 3]) {
  let c = centroid(m);
  let mut cov = [[0.0; 3]; 3];
@@ -171,7 +171,7 @@ pub fn analyze(m: &Model) -> Value {
  analyze_impl(m, false)
 }
 
-/// Like [`analyze`], with the `--full` extras: the PCA eigenvalues (the
+/// Like [`analyze`], plus the `--full` extras: the PCA eigenvalues (the vertex cloud's variance along each principal axis).
 pub fn analyze_full(m: &Model) -> Value {
  analyze_impl(m, true)
 }

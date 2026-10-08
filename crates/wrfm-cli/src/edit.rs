@@ -7,7 +7,7 @@ fn doomed(mark: &[bool], i: usize) -> bool {
  mark.get(i).copied().unwrap_or(true)
 }
 
-/// Delete vertices (set semantics — duplicates are fine) and EVERY edge touching them; remap all remaining edge indices into the new vertex
+/// Delete vertices (set semantics — duplicates are fine) and EVERY edge touching them; remap all remaining edge indices into the new vertex list.
 pub fn delete_vertices(m: &Model, remove: &[usize]) -> Model {
  let mut mark = vec![false; m.vertices.len()];
  for &i in remove {
@@ -57,7 +57,7 @@ pub fn delete_edges(m: &Model, remove: &[usize]) -> Model {
  }
 }
 
-/// Extract a group as its own model: vertices = the group's own `V_g` (global range `[vertex_start, vertex_end)`), edges = the group's
+/// Extract a group as its own model: vertices = the group's own `V_g` (global range `[vertex_start, vertex_end)`), edges = the edges whose both endpoints lie inside it, rebased to the new list.
 pub fn extract_group(m: &Model, g: &wrfm::Group) -> Model {
  let s = g.vertex_start.min(m.vertices.len());
  let e = g.vertex_end.min(m.vertices.len());
@@ -75,7 +75,7 @@ pub fn extract_group(m: &Model, g: &wrfm::Group) -> Model {
  }
 }
 
-/// Remap group index ranges after deleting vertices: `new_start = start - |removed before start|`, `new_end = new_start +
+/// Remap group index ranges after deleting vertices: `new_start = start - |removed before start|`, `new_end = new_start + |kept in the old range|`.
 pub fn remap_groups(groups: &[wrfm::Group], remove: &[usize]) -> Vec<wrfm::Group> {
  let doomed: HashSet<usize> = remove.iter().copied().collect();
  groups
@@ -174,7 +174,7 @@ pub fn clean(m: &Model) -> (Model, Vec<usize>) {
  )
 }
 
-/// `dedupe`: merge duplicate vertices (EXACT same (x,y,z) — the bit pattern, since `f64` is not reliably hashable) and drop duplicate /
+/// `dedupe`: merge duplicate vertices (EXACT same (x,y,z) — the bit pattern, since `f64` is not reliably hashable) and drop duplicate or collapsed edges.
 pub fn dedupe(m: &Model) -> (Model, Vec<usize>) {
  use std::collections::HashMap;
 

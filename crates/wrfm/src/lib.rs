@@ -42,7 +42,6 @@ pub struct WrfmModel {
 }
 
 impl Default for WrfmModel {
-    /// `version` defaults to 1 (never 0) and `groups` to empty.
     /// `version` defaults to 1 (never 0), `groups` to empty.
     ///
     /// ```
@@ -67,7 +66,6 @@ impl Default for WrfmModel {
 }
 
 impl WrfmModel {
-    /// Create an empty model with the given display name.
     /// Create an empty v1 model with the given display `name`.
     ///
     /// ```
@@ -90,7 +88,6 @@ impl WrfmModel {
         }
     }
 
-    /// Parse a model directly from a string (useful for include_str!).
     /// Parses a model directly from a string (useful for include_str!).
     ///
     /// The input must be v1: a `wrfm 1` magic line, a
@@ -116,12 +113,11 @@ impl WrfmModel {
         Self::parse_with(name, input, false)
     }
 
-    /// Parse with `strict` controlling whether unknown lines are rejected; the magic, header and counts are always enforced.
     /// Parses a model with `strict` controlling whether unknown lines are
     /// rejected (`UnknownDirective`) or silently skipped.
     ///
     /// The v1 magic, header and declared counts are REQUIRED in both modes —
-    /// they are structural, not a policy . Out-of-range edge
+    /// they are structural, not a policy. Out-of-range edge
     /// indices are never tolerated, regardless of `strict`.
     ///
     /// ```
@@ -486,7 +482,6 @@ impl WrfmModel {
     }
 
     /// Load the `.wrfm` file from a path; the model name is the file stem.
-    /// Load the `.wrfm` file from a path; the model name is the file stem.
     /// Returns a [`LoadError`] for I/O failures or parse errors.
     ///
     /// ```
@@ -514,7 +509,6 @@ impl WrfmModel {
     }
 
     /// Save the model to a `.wrfm` file in canonical v1.
-    /// Save the model to a `.wrfm` file in canonical v1 :
     /// `wrfm 1`, a counts header, optional `group` sections and then all
     /// edges. Coordinates use the shortest round-trip representation.
     ///
@@ -655,8 +649,6 @@ pub struct Group {
 }
 
 /// Which declared count (vertices or edges) disagreed with the parsed content.
-/// Which declared count disagreed with the parsed content
-/// ([`ParseError::CountMismatch`]).
 ///
 /// ```
 /// use wrfm::{CountKind, ParseError, WrfmModel};
@@ -682,7 +674,6 @@ pub enum CountKind {
     Edges,
 }
 
-/// A structured parse error with exact position, source context and a classified detail.
 /// A structured parse error with exact position, source context and a
 /// classified detail. `no_std`-safe (core + alloc only).
 ///
@@ -1154,7 +1145,6 @@ impl std::error::Error for LoadError {
     }
 }
 
-/// `ParseError` is a leaf error: `source()` is `None`.
 /// [`ParseError`] is a leaf error: it has no source (`source()` is `None`).
 ///
 /// ```
