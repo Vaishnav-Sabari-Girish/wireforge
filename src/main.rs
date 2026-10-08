@@ -295,13 +295,13 @@ fn probe_bytes(buf: &[u8]) -> Result<(), String> {
     if looks_like_obj(head) {
         return Err(
             "OBJ content: wireforge reads .wrfm only -- convert it first: \
-             `wrfm convert --from obj --to wrfm <file> | wireforge -`"
+             `wrfm convert <file> | wireforge -`"
                 .to_string(),
         );
     }
     Err(
         "unrecognized file format: no wrfm magic line (`wrfm <version>`). \
-         Got an OBJ file? Convert it first: `wrfm convert --from obj --to wrfm <file>`"
+         Got an OBJ file? Convert it first: `wrfm convert <file>`"
             .to_string(),
     )
 }
