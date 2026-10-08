@@ -867,6 +867,28 @@ fn check_resize(app: &mut App, engine: &mut Engine, timers: &mut TimerScheduler)
     timers.schedule(TimerId::ResizeCheck, Instant::now() + RESIZE_CHECK_INTERVAL);
 }
 
+/// Fire every timer due at `now` through its dedicated handler. Called from
+/// both loop modes — and after each idle event, so a steady event stream can
+/// never postpone a due timer.
+fn fire_due_timers(
+    app: &mut App,
+    engine: &mut Engine,
+    timers: &mut TimerScheduler,
+    watch: &mut Option<ReloadWatch>,
+    now: Instant,
+) {
+    for id in timers.fire_due(now) {
+        match id {
+            TimerId::ReloadParse => apply_reload_parse(app, timers),
+            TimerId::ReloadPoll => poll_reload(watch, app, timers),
+            TimerId::ResizeCheck => check_resize(app, engine, timers),
+            other => {
+                app.handle_timer(other, now);
+            }
+        }
+    }
+}
+
 /// Copy rows `[y0, y1)` of the HUD buffer into the screen (chars + fg).
 fn blit_hud_rows(screen: &mut render::Screen, hud: &Buffer, y0: u16, y1: u16) {
     let (w, _) = screen.size();
@@ -1212,16 +1234,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
             // Timers can fire mid-animation too (status expiry, reload).
-            for id in timers.fire_due(now) {
-                match id {
-                    TimerId::ReloadParse => apply_reload_parse(&mut app, &mut timers),
-                    TimerId::ReloadPoll => poll_reload(&mut watch, &mut app, &mut timers),
-                    TimerId::ResizeCheck => check_resize(&mut app, &mut engine, &mut timers),
-                    other => {
-                        app.handle_timer(other, now);
-                    }
-                }
-            }
+            fire_due_timers(&mut app, &mut engine, &mut timers, &mut watch, now);
             // One frame of smooth motion + held-key expiry.
             app.update_held(now, dt);
             if app.auto_spin {
@@ -1246,34 +1259,28 @@ fn main() -> Result<(), Box<dyn Error>> {
                 },
             };
             match msg {
-                Ok(ev) => match ev {
-                    LoopEvent::Input(Event::Resize(cols, rows)) => {
-                        engine.resize(cols as usize, rows as usize);
-                        app.dirty = true;
-                    }
-                    LoopEvent::Input(ev) => {
-                        if app.handle_input(ev) {
-                            break 'main;
+                Ok(ev) => {
+                    match ev {
+                        LoopEvent::Input(Event::Resize(cols, rows)) => {
+                            engine.resize(cols as usize, rows as usize);
+                            app.dirty = true;
+                        }
+                        LoopEvent::Input(ev) => {
+                            if app.handle_input(ev) {
+                                break 'main;
+                            }
+                        }
+                        LoopEvent::Reload(rel) => {
+                            handle_reload_event_loop(&mut app, &mut timers, rel);
                         }
                     }
-                    LoopEvent::Reload(rel) => {
-                        handle_reload_event_loop(&mut app, &mut timers, rel);
-                    }
-                },
+                    // Due timers also advance while events keep arriving, so a
+                    // steady stream cannot starve them until the queue drains.
+                    fire_due_timers(&mut app, &mut engine, &mut timers, &mut watch, now);
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     // The kernel woke us exactly at the earliest deadline.
-                    for id in timers.fire_due(now) {
-                        match id {
-                            TimerId::ReloadParse => apply_reload_parse(&mut app, &mut timers),
-                            TimerId::ReloadPoll => poll_reload(&mut watch, &mut app, &mut timers),
-                            TimerId::ResizeCheck => {
-                                check_resize(&mut app, &mut engine, &mut timers)
-                            }
-                            other => {
-                                app.handle_timer(other, now);
-                            }
-                        }
-                    }
+                    fire_due_timers(&mut app, &mut engine, &mut timers, &mut watch, now);
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break 'main,
             }
