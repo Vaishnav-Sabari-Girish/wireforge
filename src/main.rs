@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use crossterm::{
     cursor::{Hide, Show},
     event::{
@@ -19,7 +19,7 @@ use ratatui_wireframe::model::Model;
 use std::{
     collections::HashMap,
     error::Error,
-    io::{self, Read},
+    io::{self, IsTerminal, Read},
     path::{Path, PathBuf},
     sync::mpsc::{self, Sender},
     thread,
@@ -66,8 +66,8 @@ const LEGACY_HOLD_TIMEOUT: Duration = Duration::from_secs(1);
     about = "TUI editor and viewer for .wrfm 3D models"
 )]
 struct Args {
-    #[arg(required = true)]
-    file: PathBuf,
+    /// `.wrfm` file to open, or `-` to read from stdin (the default when stdin is not a terminal)
+    file: Option<PathBuf>,
 }
 
 /// HUD folding state: `?` toggles Collapsed <-> Expanded.
@@ -253,7 +253,6 @@ fn is_fifo_path(_path: &Path) -> bool {
 /// Verify a controlling terminal is available when stdin is a pipe.
 #[cfg(unix)]
 fn ensure_keyboard_terminal() -> Result<(), String> {
-    use std::io::IsTerminal;
     if std::io::stdin().is_terminal() {
         return Ok(());
     }
@@ -1033,7 +1032,20 @@ fn main() -> Result<(), Box<dyn Error>> {
         default_hook(info);
     }));
     let args = Args::parse();
-    let target_file = args.file.clone();
+    // No FILE: read stdin when it is not a terminal (`cat m.wrfm | wireforge`).
+    // On a terminal the argument is genuinely missing, so fail the way clap
+    // would — same message and exit code 2 — instead of blocking on stdin EOF.
+    let target_file = match args.file {
+        Some(file) => file,
+        None if !io::stdin().is_terminal() => PathBuf::from("-"),
+        None => Args::command()
+            .error(
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "the following required arguments were not provided:\n  <FILE>\n\n  \
+                 provide a .wrfm file path, or `-` (or a pipe) to read the model from stdin",
+            )
+            .exit(),
+    };
 
     // Regular files probe PROBE_BYTES and keep hot-reload; `-`/FIFO read the
     // whole stream once as one-shot previews (no hot-reload).
