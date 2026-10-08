@@ -22,10 +22,27 @@ echo "Running Clippy (Workspace)..."
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 echo "Fixing all markdown files..."
-# 1. Find every .md file, explicitly IGNORING the target/ and .git/ folders
-find . -type d \( -name target -o -name .git \) -prune -o -type f -name "*.md" ! -name "CHANGELOG.md" -exec rumdl check --fix {} +
+# 1. Find every .md file, explicitly IGNORING the target/ and .git/ folders.
+#    Paths git ignores (a local docs/ directory, say) are skipped as well:
+#    rumdl has no business rewriting them, and step 2 would fail on them.
+find . -type d \( -name target -o -name .git \) -prune -o -type f -name "*.md" ! -name "CHANGELOG.md" -exec sh -c '
+  for f do
+    if ! git ls-files --error-unmatch -- "$f" >/dev/null 2>&1 && git check-ignore -q -- "$f"; then
+      continue
+    fi
+    rumdl check --fix "$f"
+  done
+' sh {} +
 
-# 2. Stage the fixed files so they make it into the commit
-find . -type d \( -name target -o -name .git \) -prune -o -type f -name "*.md" ! -name "CHANGELOG.md" -exec git add {} +
+# 2. Stage the fixed files so they make it into the commit. `git add` refuses
+#    ignored paths and `set -e` would abort the commit, so the same filter.
+find . -type d \( -name target -o -name .git \) -prune -o -type f -name "*.md" ! -name "CHANGELOG.md" -exec sh -c '
+  for f do
+    if ! git ls-files --error-unmatch -- "$f" >/dev/null 2>&1 && git check-ignore -q -- "$f"; then
+      continue
+    fi
+    git add -- "$f"
+  done
+' sh {} +
 
 exit 0
