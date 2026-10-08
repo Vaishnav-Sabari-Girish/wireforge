@@ -51,9 +51,10 @@ const ROT_RATE: f64 = 169.0 / 128.0;
 /// Smooth continuous translation rate: fraction of the model extent moved per second.
 const MOVE_RATE: f64 = 83.0 / 128.0;
 
-/// How long a hot-reload status line stays on screen before it is cleared
-const STATUS_TIMEOUT: Duration = Duration::from_secs(4);
-/// Auto-spin yaw rate (radians per second). 169/256 = 0.66015625 (~1.1x
+/// How long the transient reload status line (row 1) stays on screen
+/// before it is cleared and those rows go back to the model canvas.
+const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+/// Auto-spin yaw rate (radians per second): 169/256 = 0.66015625, a dyadic (exact-in-binary) constant.
 const SPIN_RATE: f64 = 169.0 / 256.0;
 /// How often the idle loop re-checks the terminal size (resize fallback).
 const RESIZE_CHECK_INTERVAL: Duration = Duration::from_millis(500);
@@ -101,7 +102,7 @@ enum Hud {
     Expanded,
 }
 
-/// One continuous degree of freedom. Split into rotation (rotate) and
+/// One continuous degree of freedom: rotation (yaw / pitch / roll) and translation (pan / dolly).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Motion {
     // Rotation (world-frame: fixed world axes).
@@ -120,7 +121,7 @@ enum Motion {
     MoveBack,
 }
 
-/// Map a key (with its modifiers) to a motion. Returns `None` for keys that
+/// Map a key (with its modifiers) to a motion. Returns `None` for keys bound to no motion (quit, toggles, unknown).
 fn motion_for(code: KeyCode, shift: bool) -> Option<Motion> {
     use KeyCode::*;
     Some(match code {
@@ -151,7 +152,7 @@ fn continuous_step(view: &mut ViewState, m: Motion, scale: f64, dt: f64) {
     apply_motion_step(view, m, ROT_RATE * dt, scale * MOVE_RATE * dt);
 }
 
-/// Apply one motion step. Translation moves along the view's local axes
+/// Apply one motion step: rotation around the world axes, pan in world X/Y, dolly along the view axis.
 fn apply_motion_step(view: &mut ViewState, m: Motion, rot: f64, mv: f64) {
     match m {
         // World-frame rotation: yaw/pitch pre-multiply the model->world
@@ -177,10 +178,10 @@ fn apply_motion_step(view: &mut ViewState, m: Motion, rot: f64, mv: f64) {
     view.normalize();
 }
 
-/// A file format detected by probing the file's bytes (mpv-style
+/// A file format detected by probing the file's first bytes (mpv-style sniffing).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FileFormat {
-    /// A v1 `.wrfm` file: line 1 is the `wrfm <version>` magic
+    /// A v1 `.wrfm` file: line 1 is the `wrfm <version>` magic.
     Wrfm,
     /// A Wavefront `.obj` file: `v`/`f`/`vt`/`vn` lines (rendered by ratty).
     Obj,
@@ -189,7 +190,7 @@ enum FileFormat {
 /// How many leading bytes are probed to detect the file format.
 const PROBE_BYTES: usize = 4096;
 
-/// True when `path` is a FIFO (named pipe, e.g. bash's `<( cmd )` process
+/// True when `path` is a FIFO (named pipe, e.g. bash's `<( cmd )` process substitution).
 #[cfg(unix)]
 fn is_fifo_path(path: &Path) -> bool {
     use std::os::unix::fs::FileTypeExt;
@@ -363,7 +364,7 @@ fn load_model_from_text(name: &str, text: &str) -> Result<(RenderMode, String), 
     }
 }
 
-/// Apply a successful reload: swap in the new render and name. The user's
+/// Apply a successful reload: swap in the new render and name; the camera pose stays as the user left it.
 fn apply_reload(
     current: &mut RenderMode,
     name: &mut String,
@@ -421,15 +422,15 @@ enum ReloadOutcome {
     FileRemoved,
 }
 
-/// The most recent hot-reload action, kept for the `x` status panel. Unlike
+/// The most recent hot-reload action: an outcome plus its detail, the input to `status_line`.
 #[derive(Debug, Clone, PartialEq)]
 struct ReloadRecord {
     outcome: ReloadOutcome,
-    /// The action's detail: the full parse-error report for ParseError, a
+    /// The action's detail: the full parse-error report for `ParseError`, a one-line note for the other outcomes.
     detail: String,
 }
 
-/// The transient HUD event line for a reload outcome — one of the four
+/// The transient row-1 status label for a reload outcome — one of the three fixed labels.
 fn hud_status_for(outcome: ReloadOutcome) -> &'static str {
     match outcome {
         ReloadOutcome::Ok => "hot-reloaded",
@@ -439,29 +440,34 @@ fn hud_status_for(outcome: ReloadOutcome) -> &'static str {
 }
 
 #[cfg_attr(not(test), allow(dead_code))] // exercised by the status-expiry unit tests
-/// True when the status line's display deadline has passed (or no deadline
+/// True when the armed status-line deadline has passed; `None` (nothing showing) never expires.
 fn status_expired(deadline: Option<Instant>, now: Instant) -> bool {
     deadline.is_some_and(|d| now >= d)
 }
 
-/// Lines for the `x` status panel: the most recent reload action and its
-fn reload_panel_lines(record: Option<&ReloadRecord>) -> Vec<String> {
-    let mut lines = vec!["=== reload status (x closes) ===".to_string()];
-    lines.push(String::new());
-    match record {
-        None => lines.push("no reload action yet".to_string()),
-        Some(r) => {
-            let outcome = match r.outcome {
-                ReloadOutcome::Ok => "ok",
-                ReloadOutcome::ParseError => "parse error",
-                ReloadOutcome::FileRemoved => "file removed",
+/// The transient status line under Row 0: the outcome label plus a
+/// COMPACT detail. For a parse error only the report's first line survives
+/// (`<kind> at line L, column C`): the line must stay ONE row tall, so the
+/// rustc-style body (source line + caret) is not shown.
+fn status_line(record: &ReloadRecord) -> String {
+    let label = hud_status_for(record.outcome);
+    match record.outcome {
+        ReloadOutcome::Ok => label.to_string(),
+        ReloadOutcome::FileRemoved => format!("{label}; keeping last model"),
+        ReloadOutcome::ParseError => {
+            // detail = "Parse Error: error: <kind> at line L, column C\n..."
+            let Some(first) = record.detail.lines().next() else {
+                return label.to_string();
             };
-            lines.push(format!("outcome: {outcome}"));
-            lines.push(String::new());
-            lines.extend(r.detail.lines().map(str::to_string));
+            let head = first.strip_prefix("Parse Error: ").unwrap_or(first);
+            let head = head.strip_prefix("error: ").unwrap_or(head);
+            if head.is_empty() {
+                label.to_string()
+            } else {
+                format!("{label}: {head}")
+            }
         }
     }
-    lines
 }
 
 /// HUD layout: Row 0 is the fixed model + view line; below it the transient event region.
@@ -474,7 +480,7 @@ fn hud_layout(
     one_shot: Option<&str>,
 ) -> (String, Vec<String>, u16) {
     // In one-shot (stdin / FIFO) mode Row 0 advertises that the preview will
-    // NOT auto-refresh, so the user is never surprised (
+    // NOT auto-refresh, so Row 0 warns up front and the user is never surprised.
     let label = one_shot.unwrap_or(name);
     let mut row0 = format!(
         "Wireforge: {} | yaw={:.2} pitch={:.2} roll={:.2} dist={:.2} pan=({:.2},{:.2})",
@@ -511,8 +517,7 @@ const HELP: &[&str] = &[
     "Keys:",
     "  center   f          fit       Shift+f",
     "  reset    0          spin      Space",
-    "  keys     ?          axes      Tab",
-    "  status   x          quit      q / Esc",
+    "  axes     Tab        quit      q / Esc",
     "",
     "[?] close help",
 ];
@@ -543,8 +548,6 @@ struct App {
     hud: Hud,
     show_axes: bool,
     status_msg: String,
-    reload_record: Option<ReloadRecord>,
-    show_reload_panel: bool,
     /// True when the screen must be repainted before the loop blocks again.
     dirty: bool,
 }
@@ -568,8 +571,6 @@ impl App {
             hud: Hud::Collapsed,
             show_axes: true,
             status_msg: String::new(),
-            reload_record: None,
-            show_reload_panel: false,
             dirty: true,
         }
     }
@@ -613,7 +614,7 @@ impl App {
         self.dirty = true;
     }
 
-    /// Handle one terminal input event. Returns true when the loop must
+    /// Handle one terminal input event. Returns true when the loop must break (quit).
     fn handle_input(&mut self, ev: Event) -> bool {
         // Key and focus events are the only input handled: mouse capture is
         // OFF (native terminal drag-selection works), so the app never
@@ -668,10 +669,6 @@ impl App {
                         Hud::Collapsed => Hud::Expanded,
                         Hud::Expanded => Hud::Collapsed,
                     };
-                    self.dirty = true;
-                }
-                KeyCode::Char('x') => {
-                    self.show_reload_panel = !self.show_reload_panel;
                     self.dirty = true;
                 }
                 KeyCode::Char(' ') => {
@@ -761,7 +758,7 @@ impl Engine {
         }
     }
 
-    /// Terminal resize: reallocate the screen and drop the HUD buffer (it
+    /// Terminal resize: reallocate the screen and drop the HUD buffer (it was sized for the old screen).
     fn resize(&mut self, w: usize, h: usize) {
         self.screen.resize(w, h);
         self.hud_buf = None;
@@ -781,7 +778,7 @@ fn spawn_input_thread(tx: Sender<LoopEvent>) {
         });
 }
 
-/// Parse and apply a reload without blocking: the loop schedules the parse
+/// Parse the target file and apply it on success, keeping the last good model on failure; called from the ReloadParse timer so the event loop never blocks on parsing.
 fn handle_reload_changed(
     current: &mut RenderMode,
     name: &mut String,
@@ -802,16 +799,16 @@ fn handle_reload_changed(
     }
 }
 
-/// Show a reload outcome: transient HUD line (cleared after STATUS_TIMEOUT)
+/// Show a reload outcome on the row-1 status line (cleared after
+/// STATUS_TIMEOUT): the ONE compact line, never the full report.
 fn show_reload_status(app: &mut App, timers: &mut TimerScheduler, record: ReloadRecord) {
     let now = Instant::now();
-    app.status_msg = hud_status_for(record.outcome).to_string();
+    app.status_msg = status_line(&record);
     timers.schedule(TimerId::StatusExpiry, now + STATUS_TIMEOUT);
-    app.reload_record = Some(record);
     app.dirty = true;
 }
 
-/// Handle a reload event from the inotify thread or the poll watch. A
+/// Handle a reload event from the inotify thread or the poll watch. A change is deferred by `SETTLE_DELAY` so a half-written file settles; a missing file reports on the status line at once.
 fn handle_reload_event_loop(
     app: &mut App,
     timers: &mut TimerScheduler,
@@ -846,7 +843,7 @@ fn apply_reload_parse(app: &mut App, timers: &mut TimerScheduler) {
     show_reload_status(app, timers, record);
 }
 
-/// The ReloadPoll fallback timer fired: stat the file, handle the event,
+/// The ReloadPoll fallback timer fired: stat the file, handle the event and re-arm the poll timer.
 fn poll_reload(watch: &mut Option<ReloadWatch>, app: &mut App, timers: &mut TimerScheduler) {
     if let Some(w) = watch.as_mut() {
         let event = w.poll();
@@ -855,7 +852,7 @@ fn poll_reload(watch: &mut Option<ReloadWatch>, app: &mut App, timers: &mut Time
     }
 }
 
-/// Fallback resize detection (timer-driven): compare the terminal size
+/// Fallback resize detection (timer-driven): resize and mark dirty when the terminal size no longer matches the screen.
 fn check_resize(app: &mut App, engine: &mut Engine, timers: &mut TimerScheduler) {
     if let Ok((cols, rows)) = crossterm::terminal::size() {
         let (w, h) = engine.screen.size();
@@ -908,10 +905,8 @@ fn render_frame(
             // Row 0 is the fixed model+view line; the transient event region
             // occupies rows 1..1+event_rows; the canvas starts below both.
             let canvas_top = 1 + event_rows;
-            let overlay = if app.show_reload_panel {
-                Some(reload_panel_lines(app.reload_record.as_ref()))
-            } else if app.hud == Hud::Expanded {
-                Some(HELP.iter().map(|s| s.to_string()).collect())
+            let overlay = if app.hud == Hud::Expanded {
+                Some(HELP.iter().map(|s| s.to_string()).collect::<Vec<_>>())
             } else {
                 None
             };
@@ -1551,7 +1546,7 @@ mod tests {
         assert!(load_model(&p).is_err(), "a deleted file must fail to load");
     }
 
-    // --- Hot-reload invariant ( /) ---
+    // --- Hot-reload invariants (ok / error / missing) ---
 
     #[test]
     fn reload_preserves_view() {
@@ -1716,7 +1711,7 @@ mod tests {
         );
     }
 
-    // --- HUD layout ( /) ---
+    // --- HUD layout (status line / event rows) ---
 
     #[test]
     fn status_expired_after_timeout() {
@@ -1740,7 +1735,7 @@ mod tests {
 
     #[test]
     fn hud_status_for_maps_all_four_states() {
-        // Every reload outcome has a HUD line (transient 4 s); the four
+        // Every reload outcome has a HUD line (transient 5 s); the four
         // states are ok / parse error / file removed (Unchanged shows
         // nothing — it never produces a record).
         assert_eq!(hud_status_for(ReloadOutcome::Ok), "hot-reloaded");
@@ -1749,39 +1744,31 @@ mod tests {
     }
 
     #[test]
-    fn reload_panel_lines_show_outcome_and_persistent_detail() {
-        // The `x` panel shows the most recent action + its full detail
-        // (not transient): Ok / ParseError / no-action-yet all render.
+    fn status_line_is_single_and_compact() {
+        // The row-1 status is ONE line: the outcome label plus a compact
+        // detail (the parse error's first line only, never the report body).
         let ok = ReloadRecord {
             outcome: ReloadOutcome::Ok,
             detail: "model reloaded".to_string(),
         };
-        let lines = reload_panel_lines(Some(&ok));
-        assert!(lines.iter().any(|l| l == "outcome: ok"), "{lines:?}");
-        assert!(lines.iter().any(|l| l == "model reloaded"), "{lines:?}");
+        assert_eq!(status_line(&ok), "hot-reloaded");
 
         let err = ReloadRecord {
             outcome: ReloadOutcome::ParseError,
             detail: "Parse Error: error: invalid vertex at line 4, column 1\n 4 | v 1 1\n   |   ^^"
                 .to_string(),
         };
-        let lines = reload_panel_lines(Some(&err));
-        assert!(
-            lines.iter().any(|l| l == "outcome: parse error"),
-            "{lines:?}"
-        );
-        // The detail is kept line by line so a multiline parse report
-        // renders fully in the panel.
-        assert!(
-            lines.iter().any(|l| l.contains("invalid vertex")),
-            "{lines:?}"
-        );
+        let line = status_line(&err);
+        assert_eq!(line, "parse error: invalid vertex at line 4, column 1");
+        assert!(!line.contains('\n'), "the report body must be cut: {line}");
 
-        let none = reload_panel_lines(None);
-        assert!(
-            none.iter().any(|l| l.contains("no reload action yet")),
-            "{none:?}"
-        );
+        let removed = ReloadRecord {
+            outcome: ReloadOutcome::FileRemoved,
+            detail: "file removed (deleted or renamed away); keeping last model".to_string(),
+        };
+        let line = status_line(&removed);
+        assert!(!line.contains('\n'), "must stay one row: {line}");
+        assert!(line.contains("keeping last model"), "{line}");
     }
 
     #[test]
@@ -1832,7 +1819,7 @@ mod tests {
         assert_eq!(events.len(), 40, "all lines are kept for rendering");
     }
 
-    // ---------- stream input ( ----------
+    // ---------- stream input (stdin / FIFO one-shot) ----------
 
     #[test]
     fn probe_bytes_wrfm_magic() {
@@ -1914,7 +1901,7 @@ mod tests {
     #[test]
     fn hud_one_shot_label_in_row_zero() {
         // In one-shot mode Row 0 advertises the no-hot-reload preview so the
-        // user is never surprised (
+        // user is never surprised by a preview that never refreshes.
         let view = ViewState::default();
         let (row0, _, _) = hud_layout(
             "stdin",
@@ -1933,7 +1920,7 @@ mod tests {
         assert!(row0b.starts_with("Wireforge: cube |"), "row0: {row0b}");
     }
 
-    // ---------- event loop ( ----------
+    // ---------- event loop (input / holds) ----------
 
     #[test]
     fn app_handle_input_toggles() {
@@ -1994,18 +1981,6 @@ mod tests {
         let before = app.show_axes;
         app.handle_input(Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
         assert_ne!(app.show_axes, before);
-
-        // 'x' toggles the reload panel.
-        app.handle_input(Event::Key(KeyEvent::new(
-            KeyCode::Char('x'),
-            KeyModifiers::NONE,
-        )));
-        assert!(app.show_reload_panel);
-        app.handle_input(Event::Key(KeyEvent::new(
-            KeyCode::Char('x'),
-            KeyModifiers::NONE,
-        )));
-        assert!(!app.show_reload_panel);
 
         // q / Esc quit.
         assert!(app.handle_input(Event::Key(KeyEvent::new(
@@ -2289,7 +2264,11 @@ mod tests {
         let missing = handle_reload_event_loop(&mut app, &mut timers, ReloadEvent::Missing);
         assert!(missing);
         assert!(app.status_msg.contains("removed"));
-        assert!(app.reload_record.is_some());
+        assert!(
+            !app.status_msg.contains('\n'),
+            "the status must stay a single row: {:?}",
+            app.status_msg
+        );
         // Clear the pending parse so the status-expiry timer is the earliest.
         timers.cancel(TimerId::ReloadParse);
         assert!(timers.earliest().is_some(), "status expiry must be armed");

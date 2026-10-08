@@ -113,7 +113,6 @@ wrfm edit model.wrfm --extract-group cabinet | wrfm transform - --scale 2 | wire
 | `0` | Reset rotation and distance |
 | `?` | Toggle the key help overlay |
 | `Tab` | Toggle the XYZ axes |
-| `x` | Toggle the reload-status panel |
 | `q` / `Esc` | Quit the application |
 
 ## The `.wrfm` Format

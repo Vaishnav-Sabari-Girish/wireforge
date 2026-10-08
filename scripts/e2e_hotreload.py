@@ -11,27 +11,28 @@ different):
   1. initial render shows the model name and camera HUD
   2. replacing the file with a 3x bigger model -> "hot-reloaded" AND a
      large canvas redraw (the swapped model's projection differs)
-  3. writing a broken (half-written) file -> the HUD shows "parse error"
-     (transient) and the `x` panel shows the full report, TUI stays alive
-  4. deleting the file -> the HUD shows "file removed" (transient); the
-     `x` panel records it too, still alive
+  3. writing a broken (half-written) file -> row 1 shows the COMPACT line
+     "parse error: <kind> at line L, column C", TUI stays alive
+  4. deleting the file -> row 1 shows "file removed; keeping last model",
+     still alive
   5. re-creating the file -> reloads again ("hot-reloaded" on the HUD)
   6. 'q' quits cleanly (process exits with status 0)
 
-The HUD event line shows ONE of the four reload states (ok / parse error /
-file removed) for 4 s and then clears; the `x` reload-status panel keeps
-the most recent action + full detail (persistent, not 4-second).
+The reload outcome is ONE compact status line on row 1 (right below the
+header), shown for 5 s and then cleared. There is no persistent panel
+anymore, so a parse error's detail rides on that same first line.
 
 Matching notes (why fragments instead of full strings): ratatui renders
 with diff-based cell updates, so a captured stream only contains the
 cells that CHANGED between frames - spaces and identical characters are
 skipped (e.g. the stream shows "hot-re<CSI>loaded" for "hot-reloaded").
 So we match against the reliably-rewritten fragments ("hot-reload",
-"parseerror", "fileremoved", "invalidvertex", "keepinglastmodel") after
-stripping
-ANSI sequences, and use the numeric `dist=` change as the model-swap
-proof. ANSI_CSI strips ESC [ ... <letter> (cursor positioning, SGR,
-private modes); ANSI_OSC strips ESC ] ... BEL/ST just in case.
+"moved", "invalidvertex", "lastmode") after stripping ANSI sequences,
+and the space-free needles go through `wait_for_compact`, which strips
+spaces from the captured text as well (an unchanged blank cell never
+reaches the stream either). We also use the numeric `dist=` change as the
+model-swap proof. ANSI_CSI strips ESC [ ... <letter> (cursor positioning,
+SGR, private modes); ANSI_OSC strips ESC ] ... BEL/ST just in case.
 
 Usage:  scripts/e2e_hotreload.py [path/to/wireforge-binary]
 Defaults to ./target/debug/wireforge (run `cargo build` first).
@@ -116,6 +117,22 @@ class Tui:
         while time.monotonic() < end:
             self.drain(0.4)
             if needle in self.text():
+                return True
+        print(f"--- timed out waiting for {needle!r}; output tail:")
+        print(self.text()[-2000:])
+        return False
+
+    def wait_for_compact(self, needle: str, timeout: float = 8.0) -> bool:
+        """Match a SPACE-FREE needle against the space-stripped stream.
+
+        The diff-based renderer skips every cell that did not change, so a
+        blank cell inside a status line often never reaches the captured
+        stream; spaces must therefore not be part of a match.
+        """
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            self.drain(0.4)
+            if needle in self.text().replace(" ", ""):
                 return True
         print(f"--- timed out waiting for {needle!r}; output tail:")
         print(self.text()[-2000:])
@@ -218,19 +235,22 @@ def main() -> int:
                 f.write("wrfm 1\nvertices 2   edges 1\nv 0 0 0\nv 1 1\ne 0 1\n")  # truncated vertex line
             checks.append(("hud parse error", tui.wait_for("parse")))
             checks.append(("alive after parse error", tui.proc.poll() is None))
-            tui.press(b"x")  # open the reload-status panel for the report
-            checks.append(("x panel parse error detail", tui.wait_for("invalidvertex")))
-            tui.press(b"x")  # close the panel
+            # The report's first line rides on the SAME transient row now.
+            checks.append(
+                ("status parse error detail", tui.wait_for_compact("parseerror:invalidvertex"))
+            )
             tui.clear()
 
-            # 4. Delete the file -> the HUD shows "file removed" (transient);
-            #    the `x` panel records it too (unique detail needle).
+            # 4. Delete the file -> the HUD shows "file removed" (transient)
+            #    with its detail on the same row.
             os.remove(model)
             checks.append(("hud file removed", tui.wait_for("moved")))
             checks.append(("alive after delete", tui.proc.poll() is None))
-            tui.press(b"x")  # open the panel (still the parse error record)
-            checks.append(("x panel file removed", tui.wait_for("keepinglastmodel")))
-            tui.press(b"x")  # close the panel
+            # "lastmode" holds in BOTH backgrounds: the parse-error line
+            # shares the final `l` of "model" (skipped by the diff renderer)
+            # and a canvas cell never equals ASCII, while the space-stripped
+            # match ignores the blanks.
+            checks.append(("status file removed detail", tui.wait_for_compact("lastmode")))
             tui.clear()
 
             # 5. Re-create the file -> reloads again.
