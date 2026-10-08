@@ -83,8 +83,7 @@ impl Grid {
                     };
                     for &j in cands {
                         let q = points[j];
-                        let d2 =
-                            (p.0 - q.0).powi(2) + (p.1 - q.1).powi(2) + (p.2 - q.2).powi(2);
+                        let d2 = (p.0 - q.0).powi(2) + (p.1 - q.1).powi(2) + (p.2 - q.2).powi(2);
                         if d2 < tol2 {
                             best = Some(best.map_or(j, |b| b.min(j)));
                         }

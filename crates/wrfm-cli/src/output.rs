@@ -86,7 +86,10 @@ mod tests {
         let closed = AtomicBool::new(false);
         let mut w = Failing(io::ErrorKind::BrokenPipe);
         write_or_ignore(&mut w, format_args!("first"), &closed, "stdout");
-        assert!(closed.load(Ordering::Relaxed), "the stream is marked closed");
+        assert!(
+            closed.load(Ordering::Relaxed),
+            "the stream is marked closed"
+        );
         // A second write is a no-op (it must not reach the failing writer at
         // all — a panicking one would still fail here).
         struct Explodes;

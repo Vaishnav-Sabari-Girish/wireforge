@@ -902,7 +902,13 @@ fn query_cross_section() {
 fn query_group_scope() {
     let dir = scratch("query_group_scope");
     let path = write(&dir, "two.wrfm", TWO_GROUPS);
-    let out = run(&["query", path.to_str().unwrap(), "profile", "--group", "body"]);
+    let out = run(&[
+        "query",
+        path.to_str().unwrap(),
+        "profile",
+        "--group",
+        "body",
+    ]);
     assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
     let so = stdout(&out);
     // The `body` triangle spans x = 0..1 (the whole model spans 0..1 too,
@@ -2010,10 +2016,7 @@ fn format_teaches_streams_contract() {
     assert!(so.contains("0 ok · 1 warn"), "stdout:\n{so}");
     assert!(so.contains("2 broken (repair required"), "stdout:\n{so}");
     assert!(so.contains("3 no result"), "stdout:\n{so}");
-    assert!(
-        so.contains("--strict upgrading a warn"),
-        "stdout:\n{so}"
-    );
+    assert!(so.contains("--strict upgrading a warn"), "stdout:\n{so}");
 }
 
 #[test]
@@ -2106,12 +2109,7 @@ fn verify_no_expectations_exit_three() {
 fn verify_parse_error_exit_three() {
     let dir = scratch("verify_parse_error_exit_three");
     let path = write(&dir, "cube.wrfm", CUBE);
-    let out = run(&[
-        "verify",
-        path.to_str().unwrap(),
-        "--expect-size",
-        "1,,2",
-    ]);
+    let out = run(&["verify", path.to_str().unwrap(), "--expect-size", "1,,2"]);
     assert_eq!(out.status.code(), Some(3), "stderr: {}", stderr(&out));
     assert!(
         stderr(&out).contains("expect_size must be 'x,y,z'"),
@@ -2186,7 +2184,11 @@ fn verify_group_scopes_expectations() {
         "--expect-size",
         "1,1,1",
     ]);
-    assert_eq!(out.status.code(), Some(2), "unmet intent -> repair required");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "unmet intent -> repair required"
+    );
     let v = stdout_json(&out);
     assert_eq!(v["verdict"], "fail");
     // --expect-groups still checks the FULL group list (head exists even
@@ -2536,11 +2538,7 @@ fn check_reports_near_duplicates_and_weld_clears_them() {
     // NEAR_TWIN also has dangling edges, so this asserts the tolerance line
     // stays attached to the near-duplicate list instead of repeating once
     // per problem section.
-    assert_eq!(
-        so.matches("tolerance: 1e-6").count(),
-        1,
-        "stdout: {so}"
-    );
+    assert_eq!(so.matches("tolerance: 1e-6").count(), 1, "stdout: {so}");
 
     // Near-duplicates are NOT bit-identical: the exact counter stays empty.
     let j = stdout_json(&run(&["check", f, "--format", "json"]));
@@ -2659,7 +2657,14 @@ fn check_json_is_the_machine_form() {
         assert!(stderr(&out).is_empty(), "stderr: {}", stderr(&out));
         let j = stdout_json(&out);
         for key in [
-            "name", "source", "vertices", "edges", "tolerance", "verdict", "summary", "issues",
+            "name",
+            "source",
+            "vertices",
+            "edges",
+            "tolerance",
+            "verdict",
+            "summary",
+            "issues",
             "quality",
         ] {
             assert!(j.get(key).is_some(), "check --format json lacks {key}: {j}");
@@ -2681,13 +2686,22 @@ fn check_json_is_the_machine_form() {
 fn query_profile_json_edge_cover_is_ordered() {
     let dir = scratch("query_profile_json_edge_cover_is_ordered");
     let path = write(&dir, "cube.wrfm", CUBE);
-    let out = run(&["query", path.to_str().unwrap(), "profile", "--format", "json"]);
+    let out = run(&[
+        "query",
+        path.to_str().unwrap(),
+        "profile",
+        "--format",
+        "json",
+    ]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
     let j = stdout_json(&out);
     for axis in ["x", "y", "z"] {
         let c = j["profile"][axis]["edge_cover"].as_array().unwrap();
         let (lo, hi) = (c[0].as_f64().unwrap(), c[1].as_f64().unwrap());
-        assert!(lo <= hi, "{axis}: edge_cover must be ordered, got {lo}..{hi}");
+        assert!(
+            lo <= hi,
+            "{axis}: edge_cover must be ordered, got {lo}..{hi}"
+        );
         assert_eq!((lo, hi), (0.0, 1.0), "{axis}: union of the edges' extents");
         assert_eq!(j["profile"][axis]["span"], 1.0);
     }
