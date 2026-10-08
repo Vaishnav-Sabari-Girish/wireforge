@@ -21,9 +21,9 @@ contract:
      controlling terminal fails fast with a clear "cannot open a terminal
      for keyboard input (/dev/tty)" message (never a cryptic ENXIO).
 
-(The obj-over-stdin route to ratty is covered by the `ratty`-gated unit
-test `load_model_from_text_obj_routes_to_ratty` — it needs no PTY and runs
-under `cargo test --features ratty`.)
+(OBJ over stdin is covered by the unit test
+`load_model_from_text_obj_errors_with_a_convert_hint` — it needs no PTY
+and runs under a plain `cargo test`.)
 
 Matching notes (why fragments instead of full strings): ratatui renders
 with diff-based cell updates, so a captured stream only contains the cells

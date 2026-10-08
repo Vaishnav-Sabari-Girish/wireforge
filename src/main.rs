@@ -10,15 +10,10 @@ use crossterm::{
 };
 
 use ratatui::{
-    Terminal,
-    backend::CrosstermBackend,
     buffer::Buffer,
     layout::Rect,
     widgets::{Block, Borders, Paragraph, Widget},
 };
-
-#[cfg(feature = "ratty")]
-use ratatui::style::Style;
 
 use ratatui_wireframe::model::Model;
 use std::{
@@ -39,9 +34,6 @@ mod view;
 use reload::{ReloadEvent, ReloadWatch};
 use timer::{TimerId, TimerScheduler};
 use view::ViewState;
-
-#[cfg(feature = "ratty")]
-use ratatui_ratty::{ObjectFormat, RattyGraphic, RattyGraphicSettings};
 
 // Speed constants are dyadic fractions (exact in binary) with ~1.3x
 // translation / ~1.1x rotation speedup over the upstream values.
@@ -71,28 +63,11 @@ const LEGACY_HOLD_TIMEOUT: Duration = Duration::from_secs(1);
     name = "wireforge",
     author,
     version,
-    about = "TUI editor and viewer for .wrfm and .obj 3D models"
+    about = "TUI editor and viewer for .wrfm 3D models"
 )]
 struct Args {
     #[arg(required = true)]
     file: PathBuf,
-}
-
-/// State enum to track which rendering engine we are using.
-enum RenderMode {
-    Braille(Model),
-    #[cfg(feature = "ratty")]
-    Hardware3D(RattyGraphic<'static>),
-}
-
-impl RenderMode {
-    fn braille(&self) -> Option<&Model> {
-        match self {
-            RenderMode::Braille(m) => Some(m),
-            #[cfg(feature = "ratty")]
-            RenderMode::Hardware3D(_) => None,
-        }
-    }
 }
 
 /// HUD folding state: `?` toggles Collapsed <-> Expanded.
@@ -258,15 +233,6 @@ fn apply_motion_step(view: &mut ViewState, m: Motion, rot: f64, mv: f64) {
     view.normalize();
 }
 
-/// A file format detected by probing the file's first bytes (mpv-style sniffing).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FileFormat {
-    /// A v1 `.wrfm` file: line 1 is the `wrfm <version>` magic.
-    Wrfm,
-    /// A Wavefront `.obj` file: `v`/`f`/`vt`/`vn` lines (rendered by ratty).
-    Obj,
-}
-
 /// How many leading bytes are probed to detect the file format.
 const PROBE_BYTES: usize = 4096;
 
@@ -309,8 +275,10 @@ fn ensure_keyboard_terminal() -> Result<(), String> {
     Ok(())
 }
 
-/// Probe a byte buffer for wrfm / obj markers.
-fn probe_bytes(buf: &[u8]) -> Result<FileFormat, String> {
+/// Probe a byte buffer: `.wrfm` magic passes, OBJ content gets a pointer
+/// to the converter, everything else is unrecognized. The magic always
+/// wins (obj-looking markers later in the head do not matter).
+fn probe_bytes(buf: &[u8]) -> Result<(), String> {
     // Lossy: a stray non-UTF-8 byte must never decide the format.
     let head = String::from_utf8_lossy(buf);
     // Strip a leading BOM like the wrfm parser does, so a BOM before the
@@ -321,12 +289,26 @@ fn probe_bytes(buf: &[u8]) -> Result<FileFormat, String> {
     // The magic is a short line, so it always fits within PROBE_BYTES.
     let first_line = head.lines().next().unwrap_or("");
     if first_line.split_whitespace().next() == Some("wrfm") {
-        return Ok(FileFormat::Wrfm);
+        return Ok(());
     }
 
-    // Otherwise scan for obj markers: a magic-less `v`/`e` file is
-    // unrecognized; only `v`-without-`e` or real obj markers (`f`/`vt`/`vn`)
-    // route to obj.
+    if looks_like_obj(head) {
+        return Err(
+            "OBJ content: wireforge reads .wrfm only -- convert it first: \
+             `wrfm convert --from obj --to wrfm <file> | wireforge -`"
+                .to_string(),
+        );
+    }
+    Err(
+        "unrecognized file format: no wrfm magic line (`wrfm <version>`). \
+         Got an OBJ file? Convert it first: `wrfm convert --from obj --to wrfm <file>`"
+            .to_string(),
+    )
+}
+
+/// True for the OBJ marker shapes the converter accepts: real markers
+/// (`f`/`vt`/`vn`), or vertices without wrfm edges (a bare point cloud).
+fn looks_like_obj(head: &str) -> bool {
     let mut has_vertex = false;
     let mut has_wrfm_edge = false;
     let mut has_obj_marker = false;
@@ -342,19 +324,11 @@ fn probe_bytes(buf: &[u8]) -> Result<FileFormat, String> {
             _ => {}
         }
     }
-
-    if has_obj_marker || (has_vertex && !has_wrfm_edge) {
-        Ok(FileFormat::Obj)
-    } else {
-        Err(
-            "unrecognized file format: no wrfm magic line (`wrfm <version>`) or obj (`v`/`f`/`vt`/`vn`) markers"
- .to_string(),
- )
-    }
+    has_obj_marker || (has_vertex && !has_wrfm_edge)
 }
 
-/// Probe the file's content for wrfm / obj markers.
-fn probe_format(target_file: &Path) -> Result<FileFormat, String> {
+/// Probe the file's content; errors are path-prefixed.
+fn probe_format(target_file: &Path) -> Result<(), String> {
     let mut buf = [0u8; PROBE_BYTES];
     let mut file = std::fs::File::open(target_file)
         .map_err(|e| format!("cannot open '{}': {e}", target_file.display()))?;
@@ -364,94 +338,31 @@ fn probe_format(target_file: &Path) -> Result<FileFormat, String> {
     probe_bytes(&buf[..n]).map_err(|e| format!("'{}': {e}", target_file.display()))
 }
 
-/// Route a file to the correct parser or widget.
-fn load_model(target_file: &Path) -> Result<(RenderMode, String), String> {
-    match probe_format(target_file)? {
-        FileFormat::Wrfm => {
-            let wrfm_data = WrfmModel::from_file(target_file).map_err(|e| e.to_string())?;
-            let model = Model {
-                vertices: wrfm_data.vertices,
-                edges: wrfm_data.edges,
-            };
-            Ok((RenderMode::Braille(model), wrfm_data.name))
-        }
-        FileFormat::Obj => {
-            #[cfg(feature = "ratty")]
-            {
-                let name = target_file
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("OBJ Model")
-                    .to_string();
-                let abs_path = std::fs::canonicalize(target_file)
-                    .unwrap_or_else(|_| target_file.to_path_buf());
-                let path_str = abs_path.to_string_lossy().into_owned();
-                let settings = RattyGraphicSettings::new(path_str)
-                    .id(1)
-                    .format(ObjectFormat::Obj)
-                    .scale(0.30)
-                    .brightness(1.5);
-                let graphic = RattyGraphic::new(settings);
-                if let Err(e) = graphic.register() {
-                    return Err(format!("Ratty Registration Error: {e}"));
-                }
-                Ok((RenderMode::Hardware3D(graphic), name))
-            }
-            #[cfg(not(feature = "ratty"))]
-            {
-                Err(
-                    "OBJ parsing requires the 'ratty' feature. Recompile with --features ratty"
-                        .to_string(),
-                )
-            }
-        }
-    }
+/// Validate the stream as `.wrfm`, then parse the file.
+fn load_model(target_file: &Path) -> Result<(Model, String), String> {
+    probe_format(target_file)?;
+    let wrfm_data = WrfmModel::from_file(target_file).map_err(|e| e.to_string())?;
+    let model = Model {
+        vertices: wrfm_data.vertices,
+        edges: wrfm_data.edges,
+    };
+    Ok((model, wrfm_data.name))
 }
 
-/// Route a stream buffer (stdin / FIFO) to the correct parser or widget.
-fn load_model_from_text(name: &str, text: &str) -> Result<(RenderMode, String), String> {
-    match probe_bytes(text.as_bytes())? {
-        FileFormat::Wrfm => {
-            let wrfm_data = WrfmModel::from_str(name, text).map_err(|e| e.to_string())?;
-            let model = Model {
-                vertices: wrfm_data.vertices,
-                edges: wrfm_data.edges,
-            };
-            Ok((RenderMode::Braille(model), wrfm_data.name))
-        }
-        FileFormat::Obj => {
-            #[cfg(feature = "ratty")]
-            {
-                let settings = RattyGraphicSettings::new(format!("{name}.obj"))
-                    .id(1)
-                    .format(ObjectFormat::Obj)
-                    .scale(0.30)
-                    .brightness(1.5);
-                let graphic = RattyGraphic::new(settings);
-                if let Err(e) = graphic.register_payload(text.as_bytes()) {
-                    return Err(format!("Ratty Registration Error: {e}"));
-                }
-                Ok((RenderMode::Hardware3D(graphic), name.to_string()))
-            }
-            #[cfg(not(feature = "ratty"))]
-            {
-                Err(
-                    "OBJ parsing requires the 'ratty' feature. Recompile with --features ratty"
-                        .to_string(),
-                )
-            }
-        }
-    }
+/// Validate a stream (stdin / FIFO) as `.wrfm`, then parse it; `name` labels it.
+fn load_model_from_text(name: &str, text: &str) -> Result<(Model, String), String> {
+    probe_bytes(text.as_bytes())?;
+    let wrfm_data = WrfmModel::from_str(name, text).map_err(|e| e.to_string())?;
+    let model = Model {
+        vertices: wrfm_data.vertices,
+        edges: wrfm_data.edges,
+    };
+    Ok((model, wrfm_data.name))
 }
 
 /// Apply a successful reload: swap in the new render and name; the camera pose stays as the user left it.
-fn apply_reload(
-    current: &mut RenderMode,
-    name: &mut String,
-    new_render: RenderMode,
-    new_name: String,
-) {
-    *current = new_render;
+fn apply_reload(current: &mut Model, name: &mut String, new_model: Model, new_name: String) {
+    *current = new_model;
     *name = new_name;
 }
 
@@ -459,7 +370,7 @@ fn apply_reload(
 /// Apply one hot-reload poll result to the running viewer.
 fn handle_reload_event(
     event: ReloadEvent,
-    current: &mut RenderMode,
+    current: &mut Model,
     name: &mut String,
     target_file: &Path,
 ) -> Option<ReloadRecord> {
@@ -470,8 +381,8 @@ fn handle_reload_event(
             // last good model and retries on the next poll.
             std::thread::sleep(SETTLE_DELAY);
             Some(match load_model(target_file) {
-                Ok((new_render, new_name)) => {
-                    apply_reload(current, name, new_render, new_name);
+                Ok((new_model, new_name)) => {
+                    apply_reload(current, name, new_model, new_name);
                     ReloadRecord {
                         outcome: ReloadOutcome::Ok,
                         detail: "model reloaded".to_string(),
@@ -624,7 +535,7 @@ struct Hold {
 
 /// All viewer state owned by the main loop.
 struct App {
-    current: RenderMode,
+    current: Model,
     name: String,
     one_shot: Option<String>,
     target_file: PathBuf,
@@ -646,12 +557,7 @@ struct App {
 }
 
 impl App {
-    fn new(
-        current: RenderMode,
-        name: String,
-        one_shot: Option<String>,
-        target_file: PathBuf,
-    ) -> Self {
+    fn new(current: Model, name: String, one_shot: Option<String>, target_file: PathBuf) -> Self {
         App {
             current,
             name,
@@ -670,17 +576,7 @@ impl App {
 
     /// Translation speed scales with the model's geometric-mean extent.
     fn move_scale(&self) -> f64 {
-        self.current
-            .braille()
-            .map(view::model_extent)
-            .unwrap_or(1.0)
-    }
-
-    /// Auto-fit the camera to the braille model (Shift+f).
-    fn fit_if_braille(&mut self) {
-        if let Some(m) = self.current.braille() {
-            self.view.fit_to(m);
-        }
+        view::model_extent(&self.current)
     }
 
     /// Record that the keyboard said something at `now`.
@@ -796,7 +692,7 @@ impl App {
             // Fit: the target at an appropriate distance (dist only — angles
             // and pan are kept). Center: the file origin on screen (pan only).
             Action::Fit => {
-                self.fit_if_braille();
+                self.view.fit_to(&self.current);
                 self.dirty = true;
             }
             Action::Center => {
@@ -804,9 +700,7 @@ impl App {
                 self.dirty = true;
             }
             Action::Reset => {
-                if let Some(m) = self.current.braille() {
-                    self.view.reset(m);
-                }
+                self.view.reset(&self.current);
                 self.dirty = true;
             }
         }
@@ -888,13 +782,13 @@ fn spawn_input_thread(tx: Sender<LoopEvent>) {
 
 /// Parse the target file and apply it on success, keeping the last good model on failure; called from the ReloadParse timer so the event loop never blocks on parsing.
 fn handle_reload_changed(
-    current: &mut RenderMode,
+    current: &mut Model,
     name: &mut String,
     target_file: &Path,
 ) -> ReloadRecord {
     match load_model(target_file) {
-        Ok((new_render, new_name)) => {
-            apply_reload(current, name, new_render, new_name);
+        Ok((new_model, new_name)) => {
+            apply_reload(current, name, new_model, new_name);
             ReloadRecord {
                 outcome: ReloadOutcome::Ok,
                 detail: "model reloaded".to_string(),
@@ -987,175 +881,115 @@ fn blit_hud_rows(screen: &mut render::Screen, hud: &Buffer, y0: u16, y1: u16) {
 }
 
 /// Render the current state into the terminal.
-#[cfg_attr(not(feature = "ratty"), allow(unused_variables))]
 fn render_frame(
     app: &mut App,
     engine: &mut Engine,
     stdout: &mut io::Stdout,
-    terminal: &mut Option<ratatui::Terminal<CrosstermBackend<io::Stdout>>>,
 ) -> Result<(), Box<dyn Error>> {
-    match &app.current {
-        RenderMode::Braille(_) => {
-            let (w, h) = engine.screen.size();
-            if w == 0 || h == 0 {
-                return Ok(());
-            }
-            let w16 = w as u16;
-            let h16 = h as u16;
-            let (row0, event_lines, event_rows) = hud_layout(
-                &app.name,
-                &app.view,
-                &app.status_msg,
-                h16,
-                app.hud == Hud::Collapsed,
-                app.one_shot.as_deref(),
-            );
-            // Row 0 is the fixed model+view line; the transient event region
-            // occupies rows 1..1+event_rows; the canvas starts below both.
-            let canvas_top = 1 + event_rows;
-            let overlay = if app.hud == Hud::Expanded {
-                Some(HELP.iter().map(|s| s.to_string()).collect::<Vec<_>>())
-            } else {
-                None
-            };
+    let (w, h) = engine.screen.size();
+    if w == 0 || h == 0 {
+        return Ok(());
+    }
+    let w16 = w as u16;
+    let h16 = h as u16;
+    let (row0, event_lines, event_rows) = hud_layout(
+        &app.name,
+        &app.view,
+        &app.status_msg,
+        h16,
+        app.hud == Hud::Collapsed,
+        app.one_shot.as_deref(),
+    );
+    // Row 0 is the fixed model+view line; the transient event region
+    // occupies rows 1..1+event_rows; the canvas starts below both.
+    let canvas_top = 1 + event_rows;
+    let overlay = if app.hud == Hud::Expanded {
+        Some(HELP.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    } else {
+        None
+    };
 
-            // Reuse a persistent ratatui Buffer for the cold overlays.
-            let needs_realloc = engine
-                .hud_buf
-                .as_ref()
-                .is_none_or(|b| b.area.width != w16 || b.area.height != h16);
-            if needs_realloc {
-                engine.hud_buf = Some(Buffer::empty(Rect::new(0, 0, w16, h16)));
-            } else if let Some(b) = engine.hud_buf.as_mut() {
-                b.reset();
-            }
+    // Reuse a persistent ratatui Buffer for the cold overlays.
+    let needs_realloc = engine
+        .hud_buf
+        .as_ref()
+        .is_none_or(|b| b.area.width != w16 || b.area.height != h16);
+    if needs_realloc {
+        engine.hud_buf = Some(Buffer::empty(Rect::new(0, 0, w16, h16)));
+    } else if let Some(b) = engine.hud_buf.as_mut() {
+        b.reset();
+    }
 
-            // Row 0 + transient event rows (always present above the canvas).
-            {
-                let hud = engine.hud_buf.as_mut().unwrap();
-                Paragraph::new(row0).render(Rect::new(0, 0, w16, 1), hud);
-                for (i, line) in event_lines.iter().enumerate() {
-                    let row = 1 + i as u16;
-                    if row >= canvas_top {
-                        break;
-                    }
-                    Paragraph::new(line.as_str()).render(Rect::new(0, row, w16, 1), hud);
-                }
+    // Row 0 + transient event rows (always present above the canvas).
+    {
+        let hud = engine.hud_buf.as_mut().unwrap();
+        Paragraph::new(row0).render(Rect::new(0, 0, w16, 1), hud);
+        for (i, line) in event_lines.iter().enumerate() {
+            let row = 1 + i as u16;
+            if row >= canvas_top {
+                break;
             }
-
-            // The overlay (help / reload panel) or the model canvas fills
-            // everything below the HUD rows.
-            let canvas_area = if let Some(lines) = overlay {
-                let top = canvas_top;
-                let height = h16.saturating_sub(top);
-                let area = Rect::new(0, top, w16, height);
-                let block = Block::default().borders(Borders::ALL);
-                let inner = block.inner(area);
-                let hud = engine.hud_buf.as_mut().unwrap();
-                block.render(area, hud);
-                for (i, line) in lines.iter().enumerate() {
-                    if i as u16 >= inner.height {
-                        break;
-                    }
-                    Paragraph::new(line.as_str())
-                        .render(Rect::new(inner.x, inner.y + i as u16, inner.width, 1), hud);
-                }
-                None
-            } else {
-                Some(Rect::new(
-                    0,
-                    canvas_top,
-                    w16,
-                    h16.saturating_sub(canvas_top),
-                ))
-            };
-
-            // Copy the HUD rows into the screen.
-            {
-                let screen = &mut engine.screen;
-                let hud = engine.hud_buf.as_ref().unwrap();
-                blit_hud_rows(screen, hud, 0, canvas_top);
-            }
-
-            if let Some(area) = canvas_area {
-                // Model canvas: rasterize into the screen directly.
-                let cw = area.width as usize;
-                let ch = area.height as usize;
-                if cw > 0 && ch > 0 {
-                    engine.raster.resize(cw, ch);
-                    if let Some(model) = app.current.braille() {
-                        engine.raster.render(
-                            model,
-                            &app.view,
-                            (0, canvas_top as usize, cw, ch),
-                            app.show_axes,
-                            &mut engine.screen,
-                        );
-                    }
-                }
-            } else {
-                // Overlay region: copy the panel/help text from the buffer.
-                let screen = &mut engine.screen;
-                let hud = engine.hud_buf.as_ref().unwrap();
-                blit_hud_rows(screen, hud, canvas_top, h16);
-            }
-
-            // Present: packed-cell diff + one batched write.
-            engine.screen.present(stdout)?;
-        }
-        #[cfg(feature = "ratty")]
-        RenderMode::Hardware3D(_) => {
-            // Push the accumulated angles to the ratty emulator (best-effort).
-            if let RenderMode::Hardware3D(graphic) = &mut app.current {
-                graphic.settings_mut().rotation = [
-                    app.view.pitch as f32,
-                    app.view.yaw as f32,
-                    app.view.roll as f32,
-                ];
-                let _ = graphic.update();
-            }
-            // The ratty path keeps using ratatui's Terminal untouched
-            // (the .obj path is unchanged at every level).
-            if let Some(t) = terminal.as_mut() {
-                t.draw(|f| {
-                    let area = f.area();
-                    let title = format!(
-                        "Wireforge: {} | yaw={:.2} pitch={:.2} roll={:.2} dist={:.2}",
-                        app.name, app.view.yaw, app.view.pitch, app.view.roll, app.view.dist
-                    );
-                    let block = Block::default().borders(Borders::ALL).title(title);
-                    let inner = block.inner(area);
-                    let (_, event_lines, event_rows) = hud_layout(
-                        &app.name,
-                        &app.view,
-                        &app.status_msg,
-                        inner.height,
-                        false,
-                        app.one_shot.as_deref(),
-                    );
-                    for (i, line) in event_lines.iter().enumerate() {
-                        if i as u16 >= event_rows {
-                            break;
-                        }
-                        f.render_widget(
-                            Paragraph::new(line.as_str()).style(Style::default()),
-                            Rect::new(inner.x, inner.y + i as u16, inner.width, 1),
-                        );
-                    }
-                    let graphic_area = Rect::new(
-                        inner.x,
-                        inner.y + event_rows,
-                        inner.width,
-                        inner.height.saturating_sub(event_rows),
-                    );
-                    f.render_widget(block, area);
-                    if let RenderMode::Hardware3D(graphic) = &app.current {
-                        f.render_widget(graphic, graphic_area);
-                    }
-                })?;
-            }
+            Paragraph::new(line.as_str()).render(Rect::new(0, row, w16, 1), hud);
         }
     }
+
+    // The overlay (help / reload panel) or the model canvas fills
+    // everything below the HUD rows.
+    let canvas_area = if let Some(lines) = overlay {
+        let top = canvas_top;
+        let height = h16.saturating_sub(top);
+        let area = Rect::new(0, top, w16, height);
+        let block = Block::default().borders(Borders::ALL);
+        let inner = block.inner(area);
+        let hud = engine.hud_buf.as_mut().unwrap();
+        block.render(area, hud);
+        for (i, line) in lines.iter().enumerate() {
+            if i as u16 >= inner.height {
+                break;
+            }
+            Paragraph::new(line.as_str())
+                .render(Rect::new(inner.x, inner.y + i as u16, inner.width, 1), hud);
+        }
+        None
+    } else {
+        Some(Rect::new(
+            0,
+            canvas_top,
+            w16,
+            h16.saturating_sub(canvas_top),
+        ))
+    };
+
+    // Copy the HUD rows into the screen.
+    {
+        let screen = &mut engine.screen;
+        let hud = engine.hud_buf.as_ref().unwrap();
+        blit_hud_rows(screen, hud, 0, canvas_top);
+    }
+
+    if let Some(area) = canvas_area {
+        // Model canvas: rasterize into the screen directly.
+        let cw = area.width as usize;
+        let ch = area.height as usize;
+        if cw > 0 && ch > 0 {
+            engine.raster.resize(cw, ch);
+            engine.raster.render(
+                &app.current,
+                &app.view,
+                (0, canvas_top as usize, cw, ch),
+                app.show_axes,
+                &mut engine.screen,
+            );
+        }
+    } else {
+        // Overlay region: copy the panel/help text from the buffer.
+        let screen = &mut engine.screen;
+        let hud = engine.hud_buf.as_ref().unwrap();
+        blit_hud_rows(screen, hud, canvas_top, h16);
+    }
+
+    // Present: packed-cell diff + one batched write.
+    engine.screen.present(stdout)?;
     Ok(())
 }
 
@@ -1223,7 +1057,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         std::process::exit(1);
     }
 
-    let (current_render, model_name) = if one_shot.is_some() {
+    let (current_model, model_name) = if one_shot.is_some() {
         // Stream path: read all of stdin (or the FIFO) once, probe the
         // whole BUFFER (not the path), parse, and never poll.
         let mut buf = String::new();
@@ -1322,18 +1156,15 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // L2 engine + viewer state.
     let (cols, rows) = crossterm::terminal::size()?;
-    let mut app = App::new(current_render, model_name, one_shot, target_file.clone());
-    app.fit_if_braille();
+    let mut app = App::new(current_model, model_name, one_shot, target_file.clone());
+    app.view.fit_to(&app.current);
     let mut engine = Engine::new(cols as usize, rows as usize);
-    let mut terminal: Option<ratatui::Terminal<CrosstermBackend<io::Stdout>>> =
-        Some(Terminal::new(CrosstermBackend::new(io::stdout()))?);
-
     let mut timers = TimerScheduler::new();
     let mut last = Instant::now();
 
     // Initial frame: the previous screen is all-space, so the first present
     // writes every non-space cell (same first-frame semantics as before).
-    render_frame(&mut app, &mut engine, &mut stdout, &mut terminal)?;
+    render_frame(&mut app, &mut engine, &mut stdout)?;
     app.dirty = false;
     if watch.is_some() {
         timers.schedule(TimerId::ReloadPoll, Instant::now() + reload::POLL_INTERVAL);
@@ -1388,7 +1219,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 app.view.spin_local(SPIN_RATE * dt);
                 app.view.normalize();
             }
-            render_frame(&mut app, &mut engine, &mut stdout, &mut terminal)?;
+            render_frame(&mut app, &mut engine, &mut stdout)?;
         } else {
             // Idle: block until the earliest pending timer or an event —
             // the thread is parked in the kernel (0% CPU).
@@ -1439,7 +1270,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             app.update_held(now, dt);
             // Redraw only when something actually changed (dirty-flag).
             if app.dirty {
-                render_frame(&mut app, &mut engine, &mut stdout, &mut terminal)?;
+                render_frame(&mut app, &mut engine, &mut stdout)?;
                 app.dirty = false;
             }
         }
@@ -1489,7 +1320,7 @@ mod tests {
             "wrfm 1\nvertices 2   edges 1\n\nv 0 0 0\nv 1 1 1\ne 0 1\n",
         );
         let (mode, name) = load_model(&p).expect("valid wrfm must load");
-        let m = mode.braille().expect("wrfm loads as a braille model");
+        let m = mode;
         assert_eq!(m.vertices.len(), 2);
         assert_eq!(m.edges.len(), 1);
         assert_eq!(
@@ -1508,7 +1339,7 @@ mod tests {
             "wrfm 1\nvertices 2   edges 1\n\nv 0 0 0\nv 1 1 1\ne 0 1\n",
         );
         let (mode, name) = load_model(&p).expect("wrfm content in a .txt must open");
-        let m = mode.braille().expect("wrfm loads as a braille model");
+        let m = mode;
         assert_eq!(m.vertices.len(), 2);
         assert_eq!(m.edges.len(), 1);
         assert_eq!(name, "model");
@@ -1538,25 +1369,23 @@ mod tests {
     }
 
     #[test]
-    fn open_detection_obj_content_probes_as_obj() {
-        // Real obj content probes as obj regardless of the feature flag;
-        // loading it requires the ratty feature (spec: "or 'requires ratty'
-        // without the feature").
+    fn open_detection_obj_content_points_at_the_converter() {
+        // Real OBJ content: the probe points at `wrfm convert` and loading
+        // fails with the same hint — never a silent empty model.
         let p = temp_file("cube.obj", "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n");
-        assert_eq!(probe_format(&p).unwrap(), FileFormat::Obj);
-        #[cfg(not(feature = "ratty"))]
-        {
-            let err = load_model(&p).err().expect("obj without ratty must fail");
-            assert!(err.contains("ratty"), "error should mention ratty: {err}");
-        }
+        let err = probe_format(&p).unwrap_err();
+        assert!(err.contains("wrfm convert"), "hint: {err}");
+        let err = load_model(&p).err().expect("obj file must not load");
+        assert!(err.contains("wrfm convert"), "error: {err}");
     }
 
     #[test]
-    fn open_detection_vertex_only_probes_as_obj() {
-        // A file with only `v ` lines (no `e `) still probes as obj
-        // (v-only is an obj marker, not a wrfm without the magic).
+    fn open_detection_vertex_only_points_at_the_converter() {
+        // A file with only `v ` lines (no `e `) is an OBJ point cloud:
+        // v-only is an obj marker, not a wrfm without the magic.
         let p = temp_wrfm("vertex-only", "v 0 0 0\nv 1 1 1\n");
-        assert_eq!(probe_format(&p).unwrap(), FileFormat::Obj);
+        let err = probe_format(&p).unwrap_err();
+        assert!(err.contains("wrfm convert"), "hint: {err}");
     }
 
     #[test]
@@ -1566,12 +1395,8 @@ mod tests {
         // obj — it is "unrecognized".
         let v_e = temp_wrfm("v-e", "v 0 0 0\nv 1 1 1\ne 0 1\n");
         assert!(
-            !matches!(probe_format(&v_e), Ok(FileFormat::Wrfm)),
+            probe_format(&v_e).is_err(),
             "v/e without magic must not probe as wrfm"
-        );
-        assert!(
-            !matches!(probe_format(&v_e), Ok(FileFormat::Obj)),
-            "v/e without magic must not probe as obj"
         );
         let err = load_model(&v_e).err().expect("v/e without magic must fail");
         assert!(err.contains("unrecognized"), "error: {err}");
@@ -1579,7 +1404,7 @@ mod tests {
         // Edge-only or marker-less content is likewise never wrfm.
         let edge_only = temp_wrfm("edge-only", "e 0 1\n");
         assert!(
-            !matches!(probe_format(&edge_only), Ok(FileFormat::Wrfm)),
+            probe_format(&edge_only).is_err(),
             "an edge-only file is not wrfm by the detection contract"
         );
         let comment_only = temp_wrfm("comment-only", "# just a comment\n");
@@ -1595,9 +1420,9 @@ mod tests {
             "magic-obj",
             "wrfm 1\nvertices 2   edges 1\n\nv 0 0 0\nv 1 0 0\ne 0 1\nf 1 2 3\n",
         );
-        assert_eq!(probe_format(&p).unwrap(), FileFormat::Wrfm);
+        probe_format(&p).expect("magic wins");
         let (mode, _) = load_model(&p).expect("magic must win over obj markers");
-        let m = mode.braille().expect("wrfm loads as a braille model");
+        let m = mode;
         assert_eq!(m.vertices.len(), 2);
         assert_eq!(m.edges.len(), 1);
     }
@@ -1675,12 +1500,12 @@ mod tests {
         );
         let (mut current, mut name) = load_model(&small).unwrap();
         let mut view = ViewState::default();
-        view.fit_to(current.braille().unwrap());
+        view.fit_to(&current);
         view.add_yaw(1.0); // user turned the model
         let dist_before = view.dist;
 
-        let (new_render, new_name) = load_model(&big).unwrap();
-        apply_reload(&mut current, &mut name, new_render, new_name);
+        let (new_model, new_name) = load_model(&big).unwrap();
+        apply_reload(&mut current, &mut name, new_model, new_name);
         assert_eq!(view.dist, dist_before, "distance must be preserved");
         assert!((view.yaw - 1.0).abs() < 1e-9, "rotation must be preserved");
         assert_eq!(name, big.file_stem().unwrap().to_str().unwrap());
@@ -1695,7 +1520,7 @@ mod tests {
         let bad = temp_wrfm("bad", "wrfm 1\nvertices 1   edges 1\n\nv 0 0 0\ne 0 1\n");
         assert!(load_model(&bad).is_err());
         assert_eq!(
-            current.braille().unwrap().vertices.len(),
+            current.vertices.len(),
             1,
             "the old model must still be held"
         );
@@ -1711,8 +1536,8 @@ mod tests {
         );
         let (mut current, mut name) = load_model(&p).unwrap();
         let mut view = ViewState::default();
-        view.fit_to(current.braille().unwrap());
-        let vertices_before = current.braille().unwrap().vertices.len();
+        view.fit_to(&current);
+        let vertices_before = current.vertices.len();
 
         fs::write(&p, "this is garbage\n").unwrap();
         let record = handle_reload_event(ReloadEvent::Changed, &mut current, &mut name, &p)
@@ -1728,7 +1553,7 @@ mod tests {
             record.detail
         );
         assert_eq!(
-            current.braille().unwrap().vertices.len(),
+            current.vertices.len(),
             vertices_before,
             "garbage must never replace the on-screen model"
         );
@@ -1743,8 +1568,8 @@ mod tests {
         );
         let (mut current, mut name) = load_model(&p).unwrap();
         let mut view = ViewState::default();
-        view.fit_to(current.braille().unwrap());
-        let vertices_before = current.braille().unwrap().vertices.len();
+        view.fit_to(&current);
+        let vertices_before = current.vertices.len();
 
         fs::remove_file(&p).unwrap();
         let record = handle_reload_event(ReloadEvent::Missing, &mut current, &mut name, &p)
@@ -1760,7 +1585,7 @@ mod tests {
             record.detail
         );
         assert_eq!(
-            current.braille().unwrap().vertices.len(),
+            current.vertices.len(),
             vertices_before,
             "deletion must never replace the on-screen model"
         );
@@ -1776,14 +1601,14 @@ mod tests {
         );
         let (mut current, mut name) = load_model(&p).unwrap();
         let mut view = ViewState::default();
-        view.fit_to(current.braille().unwrap());
+        view.fit_to(&current);
 
         // First break it: garbage -> Parse Error, model kept.
         fs::write(&p, "garbage\n").unwrap();
         let record =
             handle_reload_event(ReloadEvent::Changed, &mut current, &mut name, &p).unwrap();
         assert_eq!(record.outcome, ReloadOutcome::ParseError);
-        let kept = current.braille().unwrap().vertices.len();
+        let kept = current.vertices.len();
 
         // Then fix it: replaces + success.
         fs::write(
@@ -1800,7 +1625,7 @@ mod tests {
             record.detail
         );
         assert_eq!(
-            current.braille().unwrap().vertices.len(),
+            current.vertices.len(),
             4,
             "a fixed file must replace the model (was {kept})"
         );
@@ -1816,7 +1641,7 @@ mod tests {
         );
         let (mut current, mut name) = load_model(&p).unwrap();
         let mut view = ViewState::default();
-        view.fit_to(current.braille().unwrap());
+        view.fit_to(&current);
         assert_eq!(
             handle_reload_event(ReloadEvent::Unchanged, &mut current, &mut name, &p,),
             None,
@@ -1939,20 +1764,10 @@ mod tests {
         // The buffer probe (used by stdin/FIFO) is the same content-first
         // authority as the file probe: `wrfm <version>` first line -> wrfm.
         let buf = b"wrfm 1\nvertices 2   edges 1\n\nv 0 0 0\nv 1 1 1\ne 0 1\n";
-        assert_eq!(probe_bytes(buf).unwrap(), FileFormat::Wrfm);
+        probe_bytes(buf).expect("wrfm magic probes as wrfm");
         // The magic wins even with obj-looking markers later.
         let buf2 = b"wrfm 1\nf 1 2 3\n";
-        assert_eq!(probe_bytes(buf2).unwrap(), FileFormat::Wrfm);
-    }
-
-    #[test]
-    fn probe_bytes_obj_markers() {
-        assert_eq!(
-            probe_bytes(b"v 0 0 0\nv 1 0 0\nf 1 2 3\n").unwrap(),
-            FileFormat::Obj
-        );
-        // v-only (no `e` line) is an obj marker too.
-        assert_eq!(probe_bytes(b"v 0 0 0\nv 1 1 1\n").unwrap(), FileFormat::Obj);
+        probe_bytes(buf2).expect("magic wins over obj markers");
     }
 
     #[test]
@@ -1973,7 +1788,7 @@ mod tests {
             "wrfm 1\nvertices 2   edges 1\n\nv 0 0 0\nv 1 1 1\ne 0 1\n",
         )
         .expect("wrfm stream must load");
-        let m = mode.braille().expect("wrfm loads as a braille model");
+        let m = mode;
         assert_eq!(m.vertices.len(), 2);
         assert_eq!(m.edges.len(), 1);
         assert_eq!(name, "stream");
@@ -1987,28 +1802,24 @@ mod tests {
         assert!(err.contains("unrecognized"), "error: {err}");
     }
 
+    /// OBJ content must point at the converter — wireforge itself reads
+    /// .wrfm only (the ratty/OBJ rendering path is gone).
     #[test]
-    fn load_model_from_text_obj_routes_to_ratty() {
-        // With the ratty feature a real obj stream routes to the Hardware3D
-        // path (register_payload, no temp file); without it, it must fail
-        // with the feature hint.
+    fn probe_bytes_obj_content_points_at_the_converter() {
+        let err = probe_bytes(b"v 0 0 0\nv 1 0 0\nf 1 2 3\n").unwrap_err();
+        assert!(err.contains("wrfm convert"), "hint: {err}");
+        // The v-without-e heuristic (a bare point cloud) routes there too.
+        let err = probe_bytes(b"v 0 0 0\nv 1 1 1\n").unwrap_err();
+        assert!(err.contains("wrfm convert"), "hint: {err}");
+    }
+
+    #[test]
+    fn load_model_from_text_obj_errors_with_a_convert_hint() {
         let text = "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n";
-        #[cfg(feature = "ratty")]
-        {
-            let (mode, name) = load_model_from_text("cube", text).expect("obj stream must load");
-            assert!(
-                matches!(mode, RenderMode::Hardware3D(_)),
-                "obj routes to ratty"
-            );
-            assert_eq!(name, "cube");
-        }
-        #[cfg(not(feature = "ratty"))]
-        {
-            let err = load_model_from_text("cube", text)
-                .err()
-                .expect("obj without ratty must fail");
-            assert!(err.contains("ratty"), "error: {err}");
-        }
+        let err = load_model_from_text("cube", text)
+            .err()
+            .expect("obj stream must not load");
+        assert!(err.contains("wrfm convert"), "error: {err}");
     }
 
     #[test]
@@ -2038,10 +1849,10 @@ mod tests {
     #[test]
     fn app_handle_input_toggles() {
         let mut app = App::new(
-            RenderMode::Braille(Model {
+            Model {
                 vertices: vec![(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)],
                 edges: vec![(0, 1)],
-            }),
+            },
             "cube".to_string(),
             None,
             PathBuf::from("cube.wrfm"),
@@ -2106,15 +1917,15 @@ mod tests {
     #[test]
     fn app_handle_input_motion_press_starts_continuous() {
         let mut app = App::new(
-            RenderMode::Braille(Model {
+            Model {
                 vertices: vec![(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)],
                 edges: vec![(0, 1)],
-            }),
+            },
             "cube".to_string(),
             None,
             PathBuf::from("cube.wrfm"),
         );
-        app.view.fit_to(app.current.braille().unwrap());
+        app.view.fit_to(&app.current);
         let yaw0 = app.view.yaw;
         // Press: enter continuous state (motion applied by update_held)
         app.handle_input(Event::Key(KeyEvent::new(
@@ -2146,10 +1957,10 @@ mod tests {
     #[test]
     fn app_key_release_removes_held_entry() {
         let mut app = App::new(
-            RenderMode::Braille(Model {
+            Model {
                 vertices: vec![(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)],
                 edges: vec![(0, 1)],
-            }),
+            },
             "cube".to_string(),
             None,
             PathBuf::from("cube.wrfm"),
@@ -2326,10 +2137,10 @@ mod tests {
     #[test]
     fn shift_change_mid_hold_cannot_leave_a_hold_running() {
         let mut app = App::new(
-            RenderMode::Braille(Model {
+            Model {
                 vertices: vec![(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)],
                 edges: vec![(0, 1)],
-            }),
+            },
             "cube".to_string(),
             None,
             PathBuf::from("cube.wrfm"),
@@ -2378,10 +2189,10 @@ mod tests {
         // A terminal without the kitty protocol never sends Release, so the
         // hold timeout is the only thing that can stop the motion.
         let mut app = App::new(
-            RenderMode::Braille(Model {
+            Model {
                 vertices: vec![(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)],
                 edges: vec![(0, 1)],
-            }),
+            },
             "cube".to_string(),
             None,
             PathBuf::from("cube.wrfm"),
@@ -2411,10 +2222,10 @@ mod tests {
         // Once the terminal reports key-up, Release (and FocusLost) end a
         // hold. A timeout could only ever drop a key that is still down.
         let mut app = App::new(
-            RenderMode::Braille(Model {
+            Model {
                 vertices: vec![(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)],
                 edges: vec![(0, 1)],
-            }),
+            },
             "cube".to_string(),
             None,
             PathBuf::from("cube.wrfm"),
@@ -2453,10 +2264,10 @@ mod tests {
         // would drop `j` mid-hold, which is exactly the reported bug: the
         // model stops moving down after the timeout but keeps yawing.
         let mut app = App::new(
-            RenderMode::Braille(Model {
+            Model {
                 vertices: vec![(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)],
                 edges: vec![(0, 1)],
-            }),
+            },
             "cube".to_string(),
             None,
             PathBuf::from("cube.wrfm"),
@@ -2496,10 +2307,10 @@ mod tests {
         // The key-up of a key held across an alt-tab reaches the other
         // window, so no Release arrives: FocusLost is the only signal.
         let mut app = App::new(
-            RenderMode::Braille(Model {
+            Model {
                 vertices: vec![(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)],
                 edges: vec![(0, 1)],
-            }),
+            },
             "cube".to_string(),
             None,
             PathBuf::from("cube.wrfm"),
@@ -2520,10 +2331,10 @@ mod tests {
         // The kitty protocol reports auto-repeat while a key is held; the
         // one-shot toggles must fire once per tap instead of on every repeat.
         let mut app = App::new(
-            RenderMode::Braille(Model {
+            Model {
                 vertices: vec![(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)],
                 edges: vec![(0, 1)],
-            }),
+            },
             "cube".to_string(),
             None,
             PathBuf::from("cube.wrfm"),
@@ -2563,10 +2374,10 @@ mod tests {
     fn reload_event_loop_schedules_deferred_parse() {
         let mut timers = TimerScheduler::new();
         let mut app = App::new(
-            RenderMode::Braille(Model {
+            Model {
                 vertices: vec![(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)],
                 edges: vec![(0, 1)],
-            }),
+            },
             "cube".to_string(),
             None,
             PathBuf::from("cube.wrfm"),

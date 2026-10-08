@@ -7,9 +7,6 @@ which can be natively consumed by the
 [`ratatui-wireframe`](https://crates.io/crates/ratatui-wireframe) rendering
 crate.
 
-It also allows you to view 3D files using the `ratatui-ratty` crate in the
-[`ratty`](https://github.com/orhun/ratty) terminal emulator.
-
 ## Features
 
 * **Instant Hot-Reloading:** Open a `.wrfm` file in your favorite text editor
@@ -41,11 +38,6 @@ It also allows you to view 3D files using the `ratatui-ratty` crate in the
 yay -S wireforge
 # OR 
 paru -S wireforge
-
-# With 3D model support
-yay -S wireforge-ratty
-# OR 
-paru -S wireforge-ratty
 ```
 
 ### crates.io
@@ -53,9 +45,6 @@ paru -S wireforge-ratty
 ```bash
 # Without 3D
 cargo install wireforge
-
-# With 3D model support 
-cargo install wireforge --features ratty
 ```
 
 ### Build from source
@@ -64,8 +53,6 @@ cargo install wireforge --features ratty
 git clone https://github.com/Vaishnav-Sabari-Girish/wireforge.git
 cd wireforge
 cargo build --release
-# For 3D model support
-cargo build --release --features ratty
 ```
 
 ## Usage
@@ -80,10 +67,11 @@ wireforge path/to/model.wrfm
 wireforge cube.wrfm
 ```
 
-You can also point it to `.obj` files for 3D viewing
+OBJ files are converted first with `wrfm convert` (part of
+[`wrfm-cli`](crates/wrfm-cli/README.md)), then piped in like any other model:
 
 ```bash
-wireforge mouse.obj
+wrfm convert --from obj --to wrfm mouse.obj | wireforge -
 ```
 
 Or pipe a model in for a one-shot preview (no hot-reload):
