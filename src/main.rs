@@ -12,7 +12,7 @@ use crossterm::{
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    widgets::{Block, Borders, Paragraph, Widget},
+    widgets::{Block, BorderType, Borders, Padding, Paragraph, Widget},
 };
 
 use ratatui_wireframe::model::Model;
@@ -87,6 +87,13 @@ enum Motion {
     PitchDown,
     RollPlus,
     RollMinus,
+    // Rotation (local-frame: the model's own axes).
+    LocalYawLeft,
+    LocalYawRight,
+    LocalPitchUp,
+    LocalPitchDown,
+    LocalRollPlus,
+    LocalRollMinus,
     // Translation (absolute world coordinates).
     MoveLeft,
     MoveRight,
@@ -150,9 +157,12 @@ fn canonical_key(code: KeyCode, mods: KeyModifiers) -> (KeyCode, bool) {
 ///
 /// SHIFT is the only modifier that changes an action (see `canonical_key`),
 /// and a shifted chord acts only where the table below lists it: `Shift+0` is
-/// `)` and does nothing, while `Shift+h` is the documented pan. Ctrl is
-/// reserved for quitting and every other modifier swallows the key, so a stray
-/// `Alt+h` can never rotate the model.
+/// `)` and does nothing, while `Shift+h` is the documented pan. Ctrl binds
+/// quitting (raw mode delivers Ctrl+C / Ctrl+Q as key events, with no
+/// SIGINT) plus the local-frame rotation chords `Ctrl+hjkl` and `Ctrl+e` /
+/// `Ctrl+r` — rotation around the model's own axes instead of the world's;
+/// every other modifier swallows the key, so a stray `Alt+h` can never
+/// rotate the model.
 fn resolve_key_event(code: KeyCode, mods: KeyModifiers) -> Option<(KeyCode, Action)> {
     use KeyCode::*;
     // Alt / Super / Hyper / Meta bind nothing.
@@ -162,8 +172,20 @@ fn resolve_key_event(code: KeyCode, mods: KeyModifiers) -> Option<(KeyCode, Acti
     }
     let (base, shift) = canonical_key(code, mods);
     if mods.contains(KeyModifiers::CONTROL) {
-        // Raw mode turns Ctrl+C / Ctrl+Q into plain key events (no SIGINT).
-        return matches!(base, Char('q') | Char('c')).then_some((base, Action::Quit));
+        // Ctrl+C / Ctrl+Q quit (raw mode turns them into plain key events,
+        // with no SIGINT); the rotation letters rotate in the model's own
+        // frame. Ctrl + arrows and every other Ctrl chord stay unbound.
+        let action = match base {
+            Char('q') | Char('c') => Action::Quit,
+            Char('h') => Action::Motion(Motion::LocalYawLeft),
+            Char('l') => Action::Motion(Motion::LocalYawRight),
+            Char('k') => Action::Motion(Motion::LocalPitchUp),
+            Char('j') => Action::Motion(Motion::LocalPitchDown),
+            Char('r') => Action::Motion(Motion::LocalRollPlus),
+            Char('e') => Action::Motion(Motion::LocalRollMinus),
+            _ => return None,
+        };
+        return Some((base, action));
     }
     let action = match (base, shift) {
         // One-shot keys. Shift is a real chord component, so a shifted key is
@@ -207,7 +229,8 @@ fn continuous_step(view: &mut ViewState, m: Motion, scale: f64, dt: f64) {
     apply_motion_step(view, m, ROT_RATE * dt, scale * MOVE_RATE * dt);
 }
 
-/// Apply one motion step: rotation around the world axes, pan in world X/Y, dolly along the view axis.
+/// Apply one motion step: rotation around the world axes (or, local-frame,
+/// the model's own axes), pan in world X/Y, dolly along the view axis.
 fn apply_motion_step(view: &mut ViewState, m: Motion, rot: f64, mv: f64) {
     match m {
         // World-frame rotation: yaw/pitch pre-multiply the model->world
@@ -219,6 +242,15 @@ fn apply_motion_step(view: &mut ViewState, m: Motion, rot: f64, mv: f64) {
         Motion::PitchDown => view.add_pitch(rot),
         Motion::RollPlus => view.roll -= rot,
         Motion::RollMinus => view.roll += rot,
+        // Local-frame rotation: the same step post-multiplied, so the axis
+        // rides with the model. Local roll lives in the rotation matrix (see
+        // ViewState::add_roll_local), never in the screen-space `roll`.
+        Motion::LocalYawLeft => view.add_yaw_local(rot),
+        Motion::LocalYawRight => view.add_yaw_local(-rot),
+        Motion::LocalPitchUp => view.add_pitch_local(-rot),
+        Motion::LocalPitchDown => view.add_pitch_local(rot),
+        Motion::LocalRollPlus => view.add_roll_local(-rot),
+        Motion::LocalRollMinus => view.add_roll_local(rot),
         // Pan shifts the model in world X/Y at any orientation; the rotation
         // centre is the panned file origin (see view::project_point).
         Motion::MoveLeft => view.pan_x -= mv,
@@ -497,18 +529,23 @@ const HELP: &[&str] = &[
     "No Shift:",
     "  yaw left  <- / h       yaw right  -> / l",
     "  pitch up  ^ / k        pitch down v / j",
-    "  roll      r / e",
-    "  nearer    =            farther   -",
+    "  roll      r / e        farther    -",
+    "  nearer    =",
     "",
     "Shift:",
-    "  left      <- / h       right     -> / l",
-    "  up        ^ / k        down      v / j",
+    "  left      <- / h       right      -> / l",
+    "  up        ^ / k        down       v / j",
+    "",
+    "Ctrl (around the model's own axes):",
+    "  yaw left  Ctrl+h       yaw right  Ctrl+l",
+    "  pitch up  Ctrl+k       pitch down Ctrl+j",
+    "  roll      Ctrl+r / e",
     "",
     "Keys:",
-    "  center   f          fit       Shift+f",
-    "  reset    0          spin      Space",
-    "  axes     Tab        help      ?",
-    "  quit     q / Esc / Ctrl+C",
+    "  center    f            fit        Shift+f",
+    "  reset     0            spin       Space",
+    "  axes      Tab          help       ?",
+    "  quit      q / Esc / Ctrl+C",
     "",
     "[?] close help",
 ];
@@ -596,8 +633,9 @@ impl App {
     }
 
     /// A motion key went down: sample its action now. The hold is keyed by the
-    /// key's identity, so `Shift+h` and `h` share one slot and can never run
-    /// side by side, and a Repeat of an already-held key only re-arms it.
+    /// key's identity, so `Shift+h`, `Ctrl+h` and `h` share one slot and can
+    /// never run side by side, and a Repeat of an already-held key only
+    /// re-arms it.
     fn hold_key_down(&mut self, hold_id: KeyCode, motion: Motion) {
         self.held.insert(
             hold_id,
@@ -960,7 +998,10 @@ fn render_frame(
         let top = canvas_top;
         let height = h16.saturating_sub(top);
         let area = Rect::new(0, top, w16, height);
-        let block = Block::default().borders(Borders::ALL);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .padding(Padding::new(2, 2, 1, 1));
         let inner = block.inner(area);
         let hud = engine.hud_buf.as_mut().unwrap();
         block.render(area, hud);
