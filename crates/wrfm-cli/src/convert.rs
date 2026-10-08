@@ -1,5 +1,8 @@
-//! `wrfm convert` — format conversion. v1 supports exactly ONE direction:
-//! `--from obj --to wrfm`; any other pair is a usage error (exit 3).
+//! `wrfm convert` — turn an OBJ model into `.wrfm`. The input format is
+//! detected from the CONTENT (extension-independent, so a piped stream
+//! behaves exactly like a file); `.wrfm` input is rejected as already
+//! converted and anything without OBJ geometry is unrecognized — a mistyped
+//! path can never silently produce an empty model.
 //!
 //! The OBJ reader is a deliberate subset: geometry in, lines out.
 //! `v` defines vertices, `f` contributes the ring of edges around each
@@ -11,25 +14,38 @@ use std::collections::HashSet;
 use std::io::Read;
 use wrfm::WrfmModel;
 
-/// Read `source` (`<path>`, or `-` for stdin) as format `from` and return
-/// the model to emit as format `to`.
-///
-/// The direction is validated BEFORE any I/O: an unsupported pair fails
-/// fast as a usage error and never touches the filesystem.
-pub fn convert(source: &str, from: &str, to: &str) -> Result<WrfmModel, String> {
-    // Validate the direction BEFORE any I/O: an unsupported pair is a
-    // usage error that must never touch the filesystem (or block on stdin).
-    if from != "obj" || to != "wrfm" {
-        return Err(format!(
-            "unsupported conversion: --from {from} --to {to} \
-             (v1 supports only --from obj --to wrfm)"
-        ));
-    }
+/// Convert the model read from `source` (`<path>`, or `-` for stdin) to
+/// `.wrfm` — v1's only direction (obj -> wrfm).
+pub fn convert(source: &str) -> Result<WrfmModel, String> {
     let text = read_source(source)?;
-    obj_to_wrfm(&text).map_err(|e| {
-        let origin = if source == "-" { "stdin" } else { source };
-        format!("{origin}: {e}")
-    })
+    // Strip a UTF-8 BOM: a BOM before the first record must not hide it
+    // from detection or from the parser (where it would silently drop the
+    // first vertex).
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    let origin = if source == "-" { "stdin" } else { source };
+    detect_obj(text).map_err(|e| format!("{origin}: {e}"))?;
+    obj_to_wrfm(text).map_err(|e| format!("{origin}: {e}"))
+}
+
+/// Content-first input detection: a `wrfm <version>` magic line means the
+/// input is already `.wrfm`; at least one geometry record (`v`/`f`/`l` —
+/// the records this reader converts) makes it OBJ; anything else is
+/// unrecognized.
+fn detect_obj(text: &str) -> Result<(), String> {
+    let first_line = text.lines().next().unwrap_or("");
+    if first_line.split_whitespace().next() == Some("wrfm") {
+        return Err("input is already .wrfm — convert only reads OBJ".to_string());
+    }
+    let has_geometry = text.lines().any(|raw| {
+        let line = raw.trim_start();
+        !line.is_empty()
+            && !line.starts_with('#')
+            && matches!(line.split_whitespace().next(), Some("v" | "f" | "l"))
+    });
+    if !has_geometry {
+        return Err("unrecognized input: expected OBJ geometry (v / f / l records)".to_string());
+    }
+    Ok(())
 }
 
 /// Read `<path>` (or all of stdin for `-`) as UTF-8 text.
@@ -287,18 +303,26 @@ f 1 2 3
     }
 
     #[test]
-    fn unsupported_direction_is_an_error() {
-        let missing = "no-such-file-convert-test.obj";
-        let err = convert(missing, "wrfm", "obj").expect_err("only obj -> wrfm");
-        assert!(err.contains("unsupported"), "{err}");
-        // The supported direction gets PAST validation and fails on I/O
-        // instead — proving the direction check happens before touching
-        // the source.
-        let err = convert(missing, "obj", "wrfm").expect_err("missing source is I/O");
-        assert!(
-            !err.contains("unsupported"),
-            "obj -> wrfm is supported: {err}"
-        );
+    fn detection_rejects_wrfm_and_garbage() {
+        // An already-converted model is not OBJ input.
+        let err = detect_obj("wrfm 1\nvertices 0   edges 0\n").expect_err("wrfm is not OBJ");
+        assert!(err.contains("already .wrfm"), "{err}");
+        // No OBJ geometry at all: never a silent empty model.
+        let err = detect_obj("# just a comment\nmtllib scene.mtl\n").expect_err("no geometry");
+        assert!(err.contains("unrecognized"), "{err}");
+        // Any geometry record this reader converts makes it OBJ — even a
+        // bare point cloud.
+        detect_obj("v 0 0 0\n").expect("v is a geometry record");
+        detect_obj("f 1 2 3\n").expect("f is a geometry record");
+        detect_obj("l 1 2\n").expect("l is a geometry record");
+    }
+
+    #[test]
+    fn a_missing_source_is_an_io_error() {
+        // Detection only ever runs on content that was actually read.
+        let err = convert("no-such-file-convert-test.obj").expect_err("missing source");
+        assert!(err.contains("cannot read"), "{err}");
+        assert!(!err.contains("unrecognized"), "{err}");
     }
 
     #[test]

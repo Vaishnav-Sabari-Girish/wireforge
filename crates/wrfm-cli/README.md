@@ -22,9 +22,10 @@ same numbers.
 * **Safe edits over streams:** `wrfm transform` (rigid: rotate / scale / shear / mirror / translate / pivot / align /
   normalize) and `wrfm edit` (topology: delete / extract / clean / dedupe / weld / merge) print the result to stdout —
   chain with pipes, verify with `wrfm check`.
-* **OBJ into the pipeline:** `wrfm convert --from obj --to wrfm` reads a Wavefront OBJ (a deliberate subset: `v`
-  vertices, `f` face rings, `l` chains — shared edges deduplicated) and prints canonical `.wrfm`. Surface data
-  (`vt`/`vn`/materials) is dropped and `o`/`g` groups are never invented — geometry in, lines out.
+* **OBJ into the pipeline:** `wrfm convert` reads a Wavefront OBJ (a deliberate subset: `v` vertices, `f` face
+  rings, `l` chains — shared edges deduplicated) and prints canonical `.wrfm`. The input format is detected from
+  the content, so stdin and files behave the same. Surface data (`vt`/`vn`/materials) is dropped and `o`/`g`
+  groups are never invented — geometry in, lines out.
 * **Compare:** `wrfm diff` shows exactly what changed between two models (density-grid or structured JSON).
 
 ## Getting started
@@ -185,7 +186,7 @@ wrfm view model.wrfm --yaw 45          # exact per-view facts (occlusion, silhou
 wrfm render model.wrfm --views top     # braille / ascii / grid (--fit content, --region)
 wrfm transform model.wrfm --scale 2    # affine transforms, printed to stdout
 wrfm edit model.wrfm --delete-vertices 0,1   # topology edits (--dedupe / --weld TOL)
-wrfm convert --from obj --to wrfm model.obj  # OBJ -> wrfm (v1's only direction)
+wrfm convert model.obj                 # OBJ -> wrfm (input format detected from the content)
 wrfm diff a.wrfm b.wrfm --format json  # structured or density-grid diff
 wrfm format                            # print the .wrfm v1 spec itself
 ```
@@ -209,7 +210,7 @@ wrfm edit model.wrfm --extract-group cabinet \
   | wrfm transform - --scale 2 | wireforge -
 
 # bring an OBJ into the toolchain, then view it like any other model
-wrfm convert --from obj --to wrfm mouse.obj | wireforge -
+wrfm convert mouse.obj | wireforge -
 ```
 
 ## Recipes

@@ -71,7 +71,7 @@ OBJ files are converted first with `wrfm convert` (part of
 [`wrfm-cli`](crates/wrfm-cli/README.md)), then piped in like any other model:
 
 ```bash
-wrfm convert --from obj --to wrfm mouse.obj | wireforge -
+wrfm convert mouse.obj | wireforge -
 ```
 
 Or pipe a model in for a one-shot preview (no hot-reload):

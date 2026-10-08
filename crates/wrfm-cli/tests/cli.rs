@@ -2579,7 +2579,6 @@ fn help_documents_the_new_flags() {
         (vec!["render", "--help"], "--fit"),
         (vec!["edit", "--help"], "--weld"),
         (vec!["verify", "--help"], "--expect-redundant"),
-        (vec!["convert", "--help"], "--from"),
         (vec!["convert", "--help"], "obj -> wrfm"),
     ] {
         let out = run(&args);
@@ -2862,10 +2861,11 @@ e 5 3
 }
 
 // ---------------------------------------------------------------------------
-// convert: v1 is one direction (obj -> wrfm). The direction and both
-// formats are explicit parameters; anything else is a usage error (exit 3),
-// and a successful conversion emits canonical .wrfm text on stdout with the
-// health tier of the PRODUCED model on the exit code (like transform/edit).
+// convert: OBJ in, .wrfm out. The input format is detected from the CONTENT
+// (extension-independent, so stdin works the same); anything that is not OBJ
+// geometry exits 3, and a successful conversion emits canonical .wrfm text on
+// stdout with the health tier of the PRODUCED model on the exit code (like
+// transform/edit).
 // ---------------------------------------------------------------------------
 
 /// A minimal OBJ: three vertices and one triangular face.
@@ -2880,14 +2880,7 @@ f 1 2 3
 fn convert_obj_to_wrfm_writes_canonical_wrfm_to_stdout() {
     let dir = scratch("convert_obj_to_wrfm");
     let path = write(&dir, "tri.obj", TRI_OBJ);
-    let out = run(&[
-        "convert",
-        "--from",
-        "obj",
-        "--to",
-        "wrfm",
-        path.to_str().unwrap(),
-    ]);
+    let out = run(&["convert", path.to_str().unwrap()]);
     // The tier (0..=2) is the health verdict; anything else means no
     // result was produced (3) or a panic (101).
     let code = out.status.code().unwrap_or(3);
@@ -2903,19 +2896,21 @@ fn convert_obj_to_wrfm_writes_canonical_wrfm_to_stdout() {
 }
 
 #[test]
-fn convert_rejects_an_unsupported_direction_with_exit_three() {
-    let out = run(&[
-        "convert",
-        "--from",
-        "wrfm",
-        "--to",
-        "obj",
-        "no-such-file.wrfm",
-    ]);
+fn convert_rejects_non_obj_input_with_exit_three() {
+    // Already converted: nothing to do.
+    let out = run_stdin(&["convert", "-"], CUBE);
     assert_eq!(out.status.code(), Some(3), "stderr: {}", stderr(&out));
-    assert!(stdout(&out).is_empty(), "no result on a usage error");
+    assert!(stdout(&out).is_empty(), "no result on a rejected input");
     assert!(
-        stderr(&out).contains("unsupported"),
+        stderr(&out).contains("already .wrfm"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    // No OBJ geometry at all: unrecognized, never a silent empty model.
+    let out = run_stdin(&["convert", "-"], "# nothing here\n");
+    assert_eq!(out.status.code(), Some(3), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("unrecognized"),
         "stderr: {}",
         stderr(&out)
     );
@@ -2923,7 +2918,7 @@ fn convert_rejects_an_unsupported_direction_with_exit_three() {
 
 #[test]
 fn convert_reads_an_obj_stream_from_stdin() {
-    let out = run_stdin(&["convert", "--from", "obj", "--to", "wrfm", "-"], TRI_OBJ);
+    let out = run_stdin(&["convert", "-"], TRI_OBJ);
     let code = out.status.code().unwrap_or(3);
     assert!(
         code <= 2,
@@ -2935,6 +2930,24 @@ fn convert_reads_an_obj_stream_from_stdin() {
         "got: {}",
         stdout(&out)
     );
+}
+
+#[test]
+fn convert_strips_a_leading_bom() {
+    // A UTF-8 BOM before the first record must not hide it: detection and
+    // parsing both see the stripped content (an unstripped BOM would make
+    // the first `v` line vanish and then trip the face index bound).
+    let dir = scratch("convert_bom");
+    let path = write(&dir, "bom.obj", &format!("\u{feff}{TRI_OBJ}"));
+    let out = run(&["convert", path.to_str().unwrap()]);
+    let code = out.status.code().unwrap_or(3);
+    assert!(code <= 2, "stderr: {}", stderr(&out));
+    assert!(
+        stdout(&out).starts_with("wrfm 1\nvertices 3   edges 3\n"),
+        "got: {}",
+        stdout(&out)
+    );
+    fs::remove_dir_all(&dir).ok();
 }
 
 // ---------------------------------------------------------------------------
