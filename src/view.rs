@@ -1,5 +1,5 @@
-use ratatui_wireframe::model::Model;
 use rayon::prelude::*;
+use wrfm_raster::Model;
 use wrfm_raster::geometry::{IDENTITY, auto_dist, mat_mul, rot_x, rot_y, rot_z};
 use wrfm_raster::projection::{Camera, CameraF32, focal};
 

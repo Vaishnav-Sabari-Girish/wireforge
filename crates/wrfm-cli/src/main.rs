@@ -1641,7 +1641,7 @@ fn cmd_convert(file: &str) -> i32 {
     };
     // Like transform/edit: the model goes to stdout whole, the health tier
     // of the PRODUCED model travels on the exit code.
-    let rw = ratatui_wireframe::model::Model {
+    let rw = wrfm_raster::Model {
         vertices: model.vertices,
         edges: model.edges,
     };

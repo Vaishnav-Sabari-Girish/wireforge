@@ -1,6 +1,6 @@
-use ratatui_wireframe::model::Model;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use wrfm_raster::Model;
 use wrfm_raster::geometry::{auto_dist, bounds, world_rot};
 use wrfm_raster::projection::{Camera, focal};
 use wrfm_raster::raster::{Bounds, dots_to_lines, rasterize_line};

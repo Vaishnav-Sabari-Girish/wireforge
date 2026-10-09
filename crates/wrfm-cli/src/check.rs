@@ -1,7 +1,7 @@
 use crate::proximity::{Grid, POINT_TOL};
-use ratatui_wireframe::model::Model;
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use wrfm_raster::Model;
 
 /// Tarjan bridge-finding: every edge whose removal disconnects its connected
 /// component (an "open edge" — no cycle covers it). Runs the DFS over EACH

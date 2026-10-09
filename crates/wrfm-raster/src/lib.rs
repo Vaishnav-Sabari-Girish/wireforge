@@ -9,6 +9,7 @@
 //!
 //! # Modules
 //!
+//! * [`model`] — the vertex/edge input every raster entry point takes
 //! * [`geometry`] — 3D rotations, bounding box, model extent, auto-fit distance
 //! * [`projection`] — [`projection::Camera`] (world rotation, distance, roll,
 //!   pan) and vertex projection to canvas coordinates
@@ -51,5 +52,8 @@
 //! ```
 
 pub mod geometry;
+pub mod model;
 pub mod projection;
 pub mod raster;
+
+pub use model::Model;

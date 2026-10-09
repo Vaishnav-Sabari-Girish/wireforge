@@ -1,5 +1,5 @@
-use ratatui_wireframe::model::Model;
 use serde_json::{Value, json};
+use wrfm_raster::Model;
 use wrfm_raster::geometry::world_rot;
 use wrfm_raster::projection::{Camera, Projected};
 

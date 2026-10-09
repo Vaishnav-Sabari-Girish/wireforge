@@ -1,4 +1,4 @@
-use ratatui_wireframe::model::Model;
+use wrfm_raster::Model;
 use wrfm_raster::geometry::{mat_mul, rot_axis, rot_x, rot_y, rot_z};
 
 /// The pivot point the whole transform happens about.

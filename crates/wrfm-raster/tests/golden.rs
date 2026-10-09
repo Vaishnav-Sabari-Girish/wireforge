@@ -17,7 +17,7 @@ use ratatui::style::Color;
 use ratatui::symbols;
 use ratatui::widgets::Widget;
 use ratatui::widgets::canvas::{Canvas, Line};
-use ratatui_wireframe::model::Model;
+use wrfm_raster::Model;
 use wrfm_raster::geometry::{auto_dist, world_rot};
 use wrfm_raster::projection::{Camera, focal};
 use wrfm_raster::raster::{Bounds, dots_to_lines, rasterize_line};

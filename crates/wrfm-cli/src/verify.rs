@@ -7,8 +7,8 @@
 
 use crate::check::{bridges, degrees, redundant_vertices};
 use crate::geometry::analyze;
-use ratatui_wireframe::model::Model;
 use serde_json::{Value, json};
+use wrfm_raster::Model;
 
 /// Declared intent for one `wrfm verify` run.
 pub struct VerifyOptions<'a> {

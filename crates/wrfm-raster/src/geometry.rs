@@ -1,7 +1,7 @@
 //! Model-space geometry: rotations, bounding box, extent and the auto-fit
 //! camera distance — the camera-independent half of the shared math.
 
-use ratatui_wireframe::model::Model;
+use crate::Model;
 
 /// Vertical field of view in degrees — the wireforge fork's projection.
 pub const FOV_DEG: f64 = 60.0;

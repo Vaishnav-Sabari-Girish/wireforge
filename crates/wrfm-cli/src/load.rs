@@ -1,6 +1,6 @@
-use ratatui_wireframe::model::Model;
 use std::io::Read;
 use wrfm::WrfmModel;
+use wrfm_raster::Model;
 
 /// A loaded model plus the parser's metadata (display name, format version, groups, source, byte count).
 pub struct Loaded {

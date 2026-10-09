@@ -4,9 +4,8 @@ A zero-dependency parser and serializer for the `.wrfm` 3D wireframe
 format.
 
 This crate provides a `WrfmModel` struct to load, manipulate, and save
-models of vertices and edges. `wireforge` uses it, and the format itself is
-consumed natively by
-[`ratatui-wireframe`](https://crates.io/crates/ratatui-wireframe).
+models of vertices and edges. It is the parser behind `wireforge` (the TUI
+viewer) and `wrfm-cli` (the stream tool).
 
 ## Format versions
 

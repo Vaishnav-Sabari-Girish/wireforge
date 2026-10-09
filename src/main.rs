@@ -15,7 +15,6 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Padding, Paragraph, Widget},
 };
 
-use ratatui_wireframe::model::Model;
 use std::{
     collections::HashMap,
     error::Error,
@@ -26,6 +25,7 @@ use std::{
     time::{Duration, Instant},
 };
 use wrfm::WrfmModel;
+use wrfm_raster::Model;
 
 mod render;
 mod timer;
@@ -1156,7 +1156,7 @@ mod tests {
         // Garbage is "unrecognized" (never an Ok empty model); a file
         // starting with `wrfm 2` is a parse (load) error instead.
         let p = temp_wrfm("garbage", "this is not a wireframe\nno markers here\n");
-        let err = load_model(&p).err().expect("garbage must fail to load");
+        let err = load_model(&p).expect_err("garbage must fail to load");
         assert!(
             err.contains("unrecognized"),
             "error should say 'unrecognized': {err}"
@@ -1165,9 +1165,7 @@ mod tests {
         // Magic present, garbage after it: routed to the wrfm parser, which
         // must fail on the missing counts header — never "unrecognized".
         let p2 = temp_wrfm("magic-garbage", "wrfm 2\nthis is garbage after the magic\n");
-        let err2 = load_model(&p2)
-            .err()
-            .expect("magic+garbage must fail to load");
+        let err2 = load_model(&p2).expect_err("magic+garbage must fail to load");
         assert!(
             !err2.contains("unrecognized"),
             "a wrfm magic line must route to the wrfm parser: {err2}"
@@ -1181,7 +1179,7 @@ mod tests {
         let p = temp_file("cube.obj", "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n");
         let err = probe_format(&p).unwrap_err();
         assert!(err.contains("wrfm convert"), "hint: {err}");
-        let err = load_model(&p).err().expect("obj file must not load");
+        let err = load_model(&p).expect_err("obj file must not load");
         assert!(err.contains("wrfm convert"), "error: {err}");
     }
 
@@ -1204,7 +1202,7 @@ mod tests {
             probe_format(&v_e).is_err(),
             "v/e without magic must not probe as wrfm"
         );
-        let err = load_model(&v_e).err().expect("v/e without magic must fail");
+        let err = load_model(&v_e).expect_err("v/e without magic must fail");
         assert!(err.contains("unrecognized"), "error: {err}");
 
         // Edge-only or marker-less content is likewise never wrfm.
@@ -1239,7 +1237,7 @@ mod tests {
         // — never an Ok empty model.
         let p = temp_wrfm("empty", "");
         assert!(probe_format(&p).is_err());
-        let err = load_model(&p).err().expect("empty file must fail to load");
+        let err = load_model(&p).expect_err("empty file must fail to load");
         assert!(
             err.contains("unrecognized"),
             "error should say 'unrecognized': {err}"
@@ -1275,7 +1273,7 @@ mod tests {
             "bad-num",
             "wrfm 2\nvertices 1   edges 1\n\nv 1.0 2.0 abc\ne 0 0\n",
         );
-        let err = load_model(&p).err().expect("bad-num must fail to load");
+        let err = load_model(&p).expect_err("bad-num must fail to load");
         assert!(err.contains("line"), "error should mention the line: {err}");
         assert!(
             err.contains("v 1.0 2.0 abc"),
@@ -1361,8 +1359,7 @@ mod tests {
     #[test]
     fn load_model_from_text_garbage_fails() {
         let err = load_model_from_text("stream", "garbage here\nno markers\n")
-            .err()
-            .expect("garbage stream must fail");
+            .expect_err("garbage stream must fail");
         assert!(err.contains("unrecognized"), "error: {err}");
     }
 
@@ -1380,9 +1377,7 @@ mod tests {
     #[test]
     fn load_model_from_text_obj_errors_with_a_convert_hint() {
         let text = "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n";
-        let err = load_model_from_text("cube", text)
-            .err()
-            .expect("obj stream must not load");
+        let err = load_model_from_text("cube", text).expect_err("obj stream must not load");
         assert!(err.contains("wrfm convert"), "error: {err}");
     } // ---------- event loop (input / holds) ----------
 

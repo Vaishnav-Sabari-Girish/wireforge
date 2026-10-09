@@ -59,12 +59,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "autocfg"
-version = "1.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
-
-[[package]]
 name = "bitflags"
 version = "2.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -153,12 +147,6 @@ checksum = "633458d4ef8c78b72454de2d54fd6ab2e60f9e02be22f3c6104cdc8a4e0fceb9"
 dependencies = [
  "unicode-segmentation",
 ]
-
-[[package]]
-name = "critical-section"
-version = "1.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "790eea4361631c5e7d22598ecd5723ff611904e3344ce8720784c93e3d83d40b"
 
 [[package]]
 name = "crossbeam-deque"
@@ -399,12 +387,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
-name = "libm"
-version = "0.2.16"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
-
-[[package]]
 name = "line-clipping"
 version = "0.3.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -465,16 +447,6 @@ dependencies = [
  "log",
  "wasi",
  "windows-sys",
-]
-
-[[package]]
-name = "num-traits"
-version = "0.2.19"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
-dependencies = [
- "autocfg",
- "libm",
 ]
 
 [[package]]
@@ -543,7 +515,6 @@ checksum = "42d3603f354bba8c595fa47860e60142d7372b7210c27044c6a7d0e1a4336b44"
 dependencies = [
  "bitflags",
  "compact_str",
- "critical-section",
  "hashbrown 0.17.1",
  "indoc",
  "itertools",
@@ -572,18 +543,6 @@ dependencies = [
  "strum",
  "unicode-segmentation",
  "unicode-width",
-]
-
-[[package]]
-name = "ratatui-wireframe"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a66e516c7104facdeac049297b972c9290028cbcaf892dd798d190f1c5498913"
-dependencies = [
- "num-traits",
- "ratatui",
- "spin",
- "wrfm 0.4.0",
 ]
 
 [[package]]
@@ -741,12 +700,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 
 [[package]]
-name = "spin"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1527984ca054dfca79333baec451042863f485fbee01b7bf6d911de915cac865"
-
-[[package]]
 name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -896,17 +849,10 @@ dependencies = [
  "crossterm",
  "libc",
  "ratatui",
- "ratatui-wireframe",
  "rayon",
- "wrfm 0.5.0",
+ "wrfm",
  "wrfm-raster",
 ]
-
-[[package]]
-name = "wrfm"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8d67316c98c974f25c91ef05c9110edad3543f034572a688de7d67c2c746bdf"
 
 [[package]]
 name = "wrfm"
@@ -917,9 +863,8 @@ name = "wrfm-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
- "ratatui-wireframe",
  "serde_json",
- "wrfm 0.5.0",
+ "wrfm",
  "wrfm-raster",
 ]
 
@@ -928,7 +873,6 @@ name = "wrfm-raster"
 version = "0.1.0"
 dependencies = [
  "ratatui",
- "ratatui-wireframe",
 ]
 
 [[package]]

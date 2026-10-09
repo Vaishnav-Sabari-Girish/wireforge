@@ -1,6 +1,6 @@
 use crate::proximity::Grid;
-use ratatui_wireframe::model::Model;
 use std::collections::HashSet;
+use wrfm_raster::Model;
 
 /// True when `i` is doomed for removal; out-of-range indices count as doomed so an invalid edge endpoint is never kept or indexed.
 fn doomed(mark: &[bool], i: usize) -> bool {

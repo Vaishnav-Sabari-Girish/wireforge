@@ -19,15 +19,8 @@ repository = "https://github.com/lenitain/wireforge"
 [workspace.dependencies]
 clap = { version = "4.6.1", features = ["derive"] }
 ratatui = { version = "0.30.1", default-features = false }
-ratatui-wireframe = "0.7.0"
 wrfm = { version = "0.5.0", path = "crates/wrfm" }
-wrfm-raster = { version = "0.1.0", path = "crates/wrfm-raster" }
-
-# ratatui-wireframe hard-depends on crates.io's wrfm 0.4.0, which would put a
-# second wrfm in the graph. Redirect it to the local path copy so exactly one
-# wrfm exists (and `Model::from_wrfm` types line up with ours).
-[patch.crates-io]
-wrfm = { path = "crates/wrfm" }
+wrfm-raster = { path = "crates/wrfm-raster" }
 
 [package]
 name = "wireforge"
@@ -46,7 +39,6 @@ categories = ["command-line-utilities"]
 clap.workspace = true
 crossterm = "0.29.0"
 ratatui.workspace = true
-ratatui-wireframe.workspace = true
 rayon = "1.10"
 wrfm.workspace = true
 wrfm-raster.workspace = true

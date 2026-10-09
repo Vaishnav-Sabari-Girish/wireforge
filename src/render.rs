@@ -1,6 +1,6 @@
 use ratatui::style::Color;
-use ratatui_wireframe::model::Model;
 use std::io::Write;
+use wrfm_raster::Model;
 
 use crate::view::{self, ViewState};
 use wrfm_raster::raster::{Bounds, rasterize_line};
@@ -556,7 +556,7 @@ mod tests {
     use ratatui::text::Span;
     use ratatui::widgets::Widget;
     use ratatui::widgets::canvas::{Canvas, Line};
-    use ratatui_wireframe::model::Model;
+    use wrfm_raster::Model;
 
     fn cube() -> Model {
         Model {

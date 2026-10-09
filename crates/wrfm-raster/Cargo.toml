@@ -12,10 +12,8 @@ keywords = ["wrfm", "3d", "wireframe", "braille", "rendering"]
 categories = ["command-line-utilities", "graphics"]
 
 [dependencies]
-# The shared model type (`ratatui_wireframe::model::Model`) and the braille
-# pattern table the rasterized cells are encoded with.
+# The braille pattern table the rasterized cells are encoded with.
 ratatui.workspace = true
-ratatui-wireframe.workspace = true
 
 [lints.rust]
 unsafe_code = "forbid"
