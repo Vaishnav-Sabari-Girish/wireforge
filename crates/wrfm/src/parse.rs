@@ -9,9 +9,10 @@ impl WrfmModel {
     ///
     /// The input must be v2 (v1 files are rejected): a `wrfm 2` magic line, a
     /// `vertices <N> edges <M>` counts header, then `v` / `e` / `group`
-    /// lines. Lenient: blank lines, `#` comments and unknown
-    /// lines are skipped. Returns a structured [`ParseError`] on malformed
-    /// input.
+    /// lines. Lenient: blank lines and `#` comments are skipped anywhere after
+    /// the magic line, and unknown directives are skipped once the counts
+    /// header has been seen (before it, the header itself is required).
+    /// Returns a structured [`ParseError`] on malformed input.
     ///
     /// ```
     /// use wrfm::WrfmModel;

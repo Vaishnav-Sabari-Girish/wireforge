@@ -1,7 +1,7 @@
 # Wireforge SPEC
 
-How to install the toolchain, drive the viewer, and read and write the
-`.wrfm` format. For the vision behind it, see [README.md](README.md).
+How to install Wireforge, use the viewer, and read and write the `.wrfm`
+format. See [README.md](README.md) for the rest of the project.
 
 ## Installation
 
@@ -47,9 +47,12 @@ The file is read once, when the viewer starts; run `wireforge` again after
 editing it.
 
 Run `wireforge` with no file at all and it opens the viewer with an empty
-model: the XYZ axes are drawn at the origin — the empty space itself — so
-rotating, panning and zooming still work, and Row 0 reads `Wireforge: no file`.
-It is safe to launch from a menu or a launcher and pass a model later:
+model: the XYZ axes are drawn at the origin, so rotating, panning and zooming
+still work, and Row 0 reads `Wireforge: no file`.
+A menu entry or launcher gets the same empty canvas if it runs the viewer in a
+terminal and gives it nothing on stdin. If stdin is piped or redirected, a
+bare `wireforge` reads the stream as a model instead
+([Stream input](#stream-input)):
 
 ```bash
 wireforge
@@ -59,8 +62,9 @@ wireforge
 
 `wireforge -` reads a model from stdin (or a FIFO such as `<( cat model.wrfm )`)
 once, at start-up. Keyboard input still works via the controlling terminal.
-This is also what a bare `wireforge` does when its stdin is a **pipe**; the
-empty canvas above is for a terminal, where there is no stream to read.
+A bare `wireforge` does the same whenever stdin is not a terminal, so a pipe
+or a redirect is read as a model. The empty canvas appears only on a terminal,
+where there is no stream to read.
 
 ```bash
 cat model.wrfm | wireforge -
@@ -74,7 +78,7 @@ OBJ files are converted first with `wrfm convert` (part of
 wrfm convert mouse.obj | wireforge -
 ```
 
-A transform built with `wrfm-cli` can be viewed directly:
+The result of a `wrfm-cli` transform can be viewed directly:
 
 ```bash
 wrfm edit model.wrfm --extract-group cabinet | wrfm transform - --scale 2 | wireforge -
@@ -88,28 +92,29 @@ wrfm edit model.wrfm --extract-group cabinet | wrfm transform - --scale 2 | wire
 | `↑` / `↓`                       | Rotate Pitch (X-axis)                                                          |
 | `←` / `→`                       | Rotate Yaw (Y-axis)                                                            |
 | `h` / `j` / `k` / `l`           | Rotate Yaw / Pitch (same as `←` / `→` / `↑` / `↓`)                             |
-| `r` / `e`                       | Rotate Roll (Z-axis)                                                           |
+| `r` / `e`                       | Rotate Roll (view axis)                                                        |
 | `Ctrl` + `←` / `→` / `↑` / `↓`  | Rotate Yaw / Pitch around the model's own axes (local frame)                   |
-| `Ctrl` + `h` / `j` / `k` / `l`  | Rotate Yaw / Pitch around the model's own axes (same as `←` / `→` / `↑` / `↓`) |
+| `Ctrl` + `h` / `j` / `k` / `l`  | Rotate Yaw / Pitch around the model's own axes (same as `Ctrl` + arrows)       |
 | `Ctrl` + `r` / `e`              | Rotate Roll around the model's own (local) Z-axis                              |
 | `Shift` + `←` / `→` / `↑` / `↓` | Move the model                                                                 |
 | `Shift` + `h` / `j` / `k` / `l` | Move the model                                                                 |
 | `=` / `-`                       | Move nearer / farther                                                          |
-| `f`                             | Center the file origin                                                         |
+| `f`                             | Center the world origin (0,0,0) on screen                                      |
 | `Shift` + `f`                   | Fit the model to the view                                                      |
-| `0`                             | Reset rotation and distance                                                    |
+| `0`                             | Reset rotation, pan and distance                                               |
 | `?`                             | Toggle the key help overlay                                                    |
 | `Tab` / `Shift` + `Tab`         | Toggle the XYZ axes                                                            |
 | `q` / `Esc` / `Ctrl` + `C`      | Quit the application                                                           |
 
 ## The `.wrfm` Format
 
-The `.wrfm` format (v2) is a dead-simple, human-readable text format for
-defining 3D vertices and the edges that connect them.
+The `.wrfm` format (v2) is a plain text format for 3D vertices and the edges
+that connect them.
 
 - The first line is the magic and version: `wrfm 2`.
-- The second line is a counts header: `vertices <N>   edges <M>` (the
-  declared counts must match the lines that follow).
+- The counts header comes next, after any blank lines and `#` comments:
+  `vertices <N>   edges <M>` (the declared counts must match the lines that
+  follow).
 - `v <x> <y> <z>` defines a vertex in 3D space.
 - `e <index1> <index2>` defines an edge connecting two vertices (0-indexed
   based on the order they appear).
@@ -140,11 +145,11 @@ The authoritative prose specification lives with the library in
 [crates/wrfm/README.md](crates/wrfm/README.md). It covers BOM and whitespace
 rules, the `f64` round-trip guarantee, and the parser's error behaviour.
 
-**Version history.** v2 is the current format. v1 — the format of `wrfm`
-0.4.0 — had no magic line, no counts header and no groups, left edge indices
-unchecked and reported errors as plain strings. v1 files are not read:
-without the magic line they fail as `MissingMagic`, and a file stamped with
-another version fails as `UnsupportedVersion`. To migrate one, prepend
-`wrfm 2` and a `vertices <N>   edges <M>` header with the file's actual
-counts. The [crate README](crates/wrfm/README.md#format-versions) tabulates
-every difference.
+**Version history.** v2 is the current format. v1 was the format of `wrfm`
+0.4.0: no magic line, no counts header, no groups, edge indices unchecked and
+errors reported as plain strings. v1 files are not read: without the magic
+line they fail as `MissingMagic`, and a file stamped with another version
+fails as `UnsupportedVersion`. To migrate one, prepend `wrfm 2` and a
+`vertices <N>   edges <M>` header with the file's actual counts. The
+[crate README](crates/wrfm/README.md#format-versions) tabulates every
+difference.

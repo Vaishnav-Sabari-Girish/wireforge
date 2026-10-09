@@ -1,38 +1,48 @@
 # wrfm-cli
 
-A read-only, streaming command-line tool for `.wrfm` 3D wireframe models.
-It validates, inspects, queries, views, renders, transforms, edits and diffs
-models, all over plain stdio, with no files written and no TUI needed.
+A read-only, streaming command line tool for `.wrfm` 3D wireframe models,
+and the companion to the [`wireforge`](../../) viewer. It validates, inspects,
+queries, views, renders, transforms, edits and diffs models over plain stdio,
+and writes no files.
 
-It consumes the [`wrfm`](../wrfm) parser library (the single authority for
-syntax and edge-index range) and computes geometry with the same engine as
-the [`wireforge`](../../) TUI, so scripts, editors and agents all get the
-same numbers.
+It uses the [`wrfm`](../wrfm) parser library for syntax and edge-index checks,
+and computes geometry with the same engine as the [`wireforge`](../../) viewer
+([`wrfm-raster`](../wrfm-raster)), so scripts and other tools get the same
+numbers.
 
 ## Features
 
-* **Verify intent, not just health.** `wrfm check` reports L2 health (`ok` / `warn` / `broken`) plus informational
-  quality diagnostics; `wrfm verify` asserts DECLARED intent (size / center / closed / axis / symmetry / groups /
-  redundant vertices) with per-expectation deltas and fix commands.
-* **Facts before pixels.** `wrfm info` / `wrfm geometry` / `wrfm query` compute structured numbers; `wrfm view` gives
-  exact per-view occlusion facts, so you can reason precisely without rendering. `wrfm group` prints per-part facts as
+* **Check health, verify intent.** `wrfm check` reports health (`ok` / `warn` / `broken`): duplicate or
+  near-duplicate vertices, zero-length / duplicate / dangling edges, isolated and redundant vertices. `wrfm verify`
+  asserts declared intent (size / center / closed / axis / symmetry / groups / redundant vertices) with
+  per-expectation deltas and fix commands.
+* **Numbers without rendering.** `wrfm info` / `wrfm geometry` / `wrfm query` compute structured numbers, and
+  `wrfm view` reports exact per-view occlusion facts without rendering anything. `wrfm group` prints per-part facts as
   JSON (`jq -r '.groups[] | "\(.name):\(.verdict)"'` for a one-line verdict list).
 * **Character rendering.** `wrfm render` draws braille / ascii / grid to the terminal (six standard views,
-  `--fit content` auto-framing, region zoom), using the same projection as the wireforge TUI.
+  `--fit content` auto-framing, region zoom), using the same projection as the `wireforge` viewer.
 * **Safe edits over streams.** `wrfm transform` (rigid: rotate / scale / shear / mirror / translate / pivot / align /
   normalize) and `wrfm edit` (topology: delete / extract / clean / dedupe / weld / merge) print the result to stdout,
   ready to chain with pipes and verify with `wrfm check`.
 * **OBJ into the pipeline.** `wrfm convert` reads a Wavefront OBJ (a deliberate subset: `v` vertices, `f` face
   rings, `l` chains, with shared edges deduplicated) and prints canonical `.wrfm`. The input format is detected from
-  the content, so stdin and files behave the same. Surface data (`vt`/`vn`/materials) is dropped and `o`/`g`
-  groups are never invented.
+  the content, so stdin and files behave the same. Surface data (`vt`/`vn`/materials) is dropped, and `o`/`g`
+  groups are ignored.
 * **Compare.** `wrfm diff` shows exactly what changed between two models (density-grid or structured JSON).
 
 ## Getting started
 
-The repo ships sample models in `wrfm_files/`. Every subcommand takes a
-path, or `-` for stdin, and prints its result to stdout. Nothing is ever
-written to disk, so you keep a result with shell redirection.
+The CLI is a separate package from the viewer, and the command it installs is
+`wrfm`:
+
+```bash
+cargo install wrfm-cli    # installs the `wrfm` command
+```
+
+The repo ships sample models in `wrfm_files/`. Every model-input subcommand
+takes a path, or `-` for stdin, and prints its result to stdout; `wrfm format`
+takes nothing and prints the spec itself. Nothing is ever written to disk, so
+you keep a result with shell redirection.
 
 ```bash
 # health check: ok / warn / broken
@@ -50,8 +60,8 @@ wrfm render wrfm_files/cube.wrfm --views top
 
 ## Inspect a model
 
-`wrfm info` / `wrfm geometry` / `wrfm query` print structured facts, as JSON
-for scripting or plain text for reading:
+`wrfm info` and `wrfm geometry` print JSON; `wrfm query` prints plain text
+unless you pass `--format json`:
 
 ```bash
 wrfm info wrfm_files/cube.wrfm
@@ -65,9 +75,13 @@ wrfm info wrfm_files/cube.wrfm
   "edges": 12,
   "groups": [],
   "bytes": 227,
+  "source": "wrfm_files/cube.wrfm",
   "bounds": { "center": [0.0, 0.0, 0.0], "max": [1.0, 1.0, 1.0], "min": [-1.0, -1.0, -1.0], "size": [2.0, 2.0, 2.0] }
 }
 ```
+
+(The real output is pretty-printed, one value per line; the bounds are shown
+collapsed here.)
 
 ```bash
 wrfm query wrfm_files/cube.wrfm profile
@@ -81,14 +95,15 @@ profile (axis span vs edge-cover extent):
 ```
 
 Queries: `profile | cross_section | vertices | distance | connectivity`.
-For bounds, centroid, PCA axes, topology, edge stats, symmetry and
-alignment add `wrfm geometry wrfm_files/cube.wrfm`.
+For bounds, centroid, PCA axes, topology, edge stats, symmetry and alignment,
+run `wrfm geometry`.
 
 ## Verify intent
 
-Assert what a model *should* be, such as its size, center, closedness,
-axis, symmetry, groups, or an accepted redundant-vertex count, and get
-pass/fail with deltas and a fix command:
+Assert what a model *should* be: its size, center, closedness, axis, symmetry,
+groups, or an accepted redundant-vertex count. Each expectation is reported as
+pass or fail, with deltas and a fix command. The report is JSON; the comments
+below are its `verdict` field, abridged:
 
 ```bash
 wrfm verify wrfm_files/tetrahedron.wrfm --expect-size 2,2,2 --expect-closed
@@ -96,18 +111,23 @@ wrfm verify wrfm_files/tetrahedron.wrfm --expect-size 2,2,2 --expect-closed
 
 wrfm verify wrfm_files/tetrahedron.wrfm --expect-size 1,1,1
 # verdict: fail   (exit code 2)
-# suggestion: wrfm transform - --scale-x 0.5 && wrfm transform - --scale-y 0.5 && wrfm transform - --scale-z 0.5
+# suggestion: a per-axis "wrfm transform - --scale-x 0.5 && ..." hint string
 ```
 
-`check` warns about *redundant* vertices, meaning degree-2 midpoints that
-sit dead straight on the chord between their neighbours (degenerate data
-like collapsed control rows; ordinary corners and closed loops are healthy).
+The `suggestion` field is a hint, not a ready-made pipeline: the three
+`wrfm transform -` stages cannot share one stdin. Against the real file, use
+one command such as `wrfm transform model.wrfm --scale 0.5`, which halves all
+three axes.
+
+`check` warns about *redundant* vertices: degree-2 midpoints that lie exactly
+on the chord between their neighbours (degenerate data such as collapsed
+control rows). Ordinary corners and closed loops are not reported.
 `--expect-redundant N` declares the exact count you accept, so the gate
 still catches a newly introduced one:
 
 ```bash
 wrfm verify model.wrfm --expect-redundant 12
-# verdict: pass   (exit code 0) — 12 degenerate midpoints are accepted
+# verdict: pass   (exit code 0), 12 degenerate midpoints accepted
 wrfm verify model.wrfm --expect-redundant 0
 # verdict: fail   (exit code 2)
 # suggestion: re-declare with the actual count: --expect-redundant 12
@@ -128,7 +148,7 @@ wrfm edit model.wrfm --extract-group cabinet > cabinet.wrfm
 # exact `--dedupe` cannot see. `--weld TOL` merges vertices strictly
 # closer than TOL world units and performs the same edge cleanup
 # (duplicate / zero-length edges dropped); the merged vertex keeps the
-# FIRST group section that touched it. One edit op per call.
+# first group section that touched it. One edit op per call.
 wrfm edit model.wrfm --weld 1e-6 > welded.wrfm
 ```
 
@@ -146,22 +166,28 @@ wrfm diff wrfm_files/cube.wrfm cube-2x.wrfm --format json
 # moved vertices with per-vertex displacement and distance, added/removed edges
 ```
 
-## Frame the shot, then rasterize
+## Framing and rasterizing
 
 `--fit content` crops every view to the projected model so it fills the
-canvas, computed per view so it works across `--views`. An explicit
-`--region x0,y0,x1,y1` (normalized 0–1) always takes precedence over
-`--fit`, and `--fit` only crops, it never moves the camera. Use
-`--auto-dist` or `--dist` for that:
+canvas, computed per view so it works across `--views`:
 
 ```bash
 wrfm render model.wrfm --views front --fit content
 # # wrfm render  format=braille  fit=content  canvas=60x24 chars ...
 ```
 
-There is no built-in PNG encoder. `render` emits text, and the terminal
-image is one pipe away. Braille text piped through ImageMagick defaults to
-**16-bit** PNG, which some viewers reject, so pin the depth:
+An explicit `--region x0,y0,x1,y1` (normalized 0–1) always takes precedence
+over `--fit`, and `--fit` only crops, it never moves the camera. To move the
+camera, turn auto-distance off and set a distance. `--dist N` alone does
+nothing while `--auto-dist` is on, and it is on by default:
+
+```bash
+wrfm render model.wrfm --views front --auto-dist false --dist 12
+```
+
+There is no built-in PNG encoder: `render` emits text, and an image tool turns
+it into a PNG. Braille text piped through ImageMagick defaults to **16-bit**
+PNG, which some viewers reject, so pin the depth:
 
 ```bash
 wrfm render model.wrfm --views front --width 96 --height 32 --fit content \
@@ -194,9 +220,8 @@ wrfm format                            # print the .wrfm v2 spec itself
 ## Composing commands with pipes
 
 Every command is read-only and streaming. It reads a model from a file or
-from `-` (stdin) and prints the result to stdout, so atomic operations
-chain into complex transforms with pipes. Each stage can be verified with
-`wrfm check`:
+from `-` (stdin) and prints the result to stdout, so operations chain with
+pipes. Each stage can be checked with `wrfm check`:
 
 ```bash
 # Extract the "cabinet" group, scale it 2x, rotate it, then clean up
@@ -239,9 +264,10 @@ wrfm diff a-g.wrfm b-g.wrfm
 wrfm view m.wrfm | jq '.visible_edges[:10]'
 ```
 
-`render --detail` presets are plain options (documentation only):
+There are no `--detail` presets any more. Pick a row and pass those options
+directly:
 
-| preset | equivalent |
+| preset | options |
 | --- | --- |
 | `overview` | `--format grid --width 40 --height 16` |
 | `standard` | `--format grid --width 60 --height 24 --grid-w 32 --grid-h 16` |

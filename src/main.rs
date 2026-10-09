@@ -56,7 +56,7 @@ const LEGACY_HOLD_TIMEOUT: Duration = Duration::from_secs(1);
     name = "wireforge",
     author,
     version,
-    about = "TUI editor and viewer for .wrfm 3D models"
+    about = "TUI viewer for .wrfm 3D wireframe models"
 )]
 struct Args {
     /// `.wrfm` file to open, or `-` to read from stdin (the default when stdin is

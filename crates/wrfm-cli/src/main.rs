@@ -75,9 +75,10 @@ STREAMS (three-channel contract — read this before piping):
   stdout = pure result (model text / JSON / render) — the data.
   stderr = diagnostics and errors; the health verdict travels on the exit
            code — run `wrfm check` for the report.
-  exit   = 0 ok · 1 warn (a warning-level health issue; `check` only)
-           · 2 broken (repair required: check broken, verify fail, or
-           --strict upgrading a warn) · 3 no result (unreadable file,
+  exit   = 0 ok · 1 warn (a warning-level health issue; every data command
+           still prints its result and exits 1 — only `check` prints the
+           report) · 2 broken (repair required: check broken, verify fail,
+           or --strict upgrading a warn) · 3 no result (unreadable file,
            corrupt model, or usage error).
   To pipe JSON/data do NOT merge stderr: use `wrfm info a.wrfm 2>/dev/null`
   (never `2>&1`) so diagnostics cannot corrupt the data stream.
@@ -102,11 +103,12 @@ REPAIR MAP (finding -> command)
   redundant (collinear degree-2) -> no repair action; declare: wrfm verify --expect-redundant N
 
 OUTPUT ENCODING
-  `--format text|json` on the data commands: json is the machine-readable
-  form, text is its projection. `render --format` instead selects the
+  `--format text|json` exists on `check`, `query` and `diff`: json is the
+  machine-readable form, text is its projection. `info`, `geometry`, `group`
+  and `view` always print JSON. `render --format` instead selects the
   render style (braille|ascii|grid|both), never a data encoding.
 
-Authoritative spec: FORMAT.md (wrfm crate docs).
+Authoritative spec: the `wrfm` crate docs (crates/wrfm/README.md; docs.rs/wrfm).
 "#;
 
 #[derive(Parser, Debug)]
@@ -114,7 +116,7 @@ Authoritative spec: FORMAT.md (wrfm crate docs).
     name = "wrfm",
     version,
     about = "Read-only streaming CLI for .wrfm 3D wireframe models",
-    after_help = "Every model-input command accepts '-' for stdin. Nothing writes a file: use shell redirection.\nExit codes: 0 ok (clean result / verify pass) · 1 warn (a warning-level health issue; `check` only) · 2 broken (repair required: check broken, an unmet verify declaration, or --strict upgrading a warn) · 3 no result (unreadable file, corrupt model, or usage error).\nPoint identity: vertices strictly closer than 1e-6 world units are the SAME point — `check` reports them as near-duplicate vertices and `wrfm edit --weld 1e-6` merges them (absolute threshold; pass an explicit --weld TOL when the model's units are far from 1).\n--format text|json selects the OUTPUT ENCODING of the data commands: json is the machine-readable form, text is its projection. `render --format` names the render style instead (braille|ascii|grid|both).\nRepair map (finding -> command): duplicate vertices -> --dedupe · near-duplicate vertices -> --weld 1e-6 · duplicate edges -> --dedupe · zero-length or dangling edges -> --clean · isolated vertices -> --clean · redundant (collinear degree-2) vertices have no repair action — accept them with `wrfm verify --expect-redundant N`.\nstderr carries diagnostics and errors only — the health verdict travels on the exit code (run `wrfm check` for the report).\nCompose atomic operations with pipes, e.g.:\n  wrfm edit m.wrfm --extract-group body | wrfm transform - --scale 2 --rotate-y 45\n  wrfm transform m.wrfm --mirror x | wrfm edit - --clean\nFormat spec: wrfm format (self-contained; no source needed)."
+    after_help = "Every model-input command accepts '-' for stdin. Nothing writes a file: use shell redirection.\nExit codes: 0 ok (clean result / verify pass) · 1 warn (a warning-level health issue in the model; every data command still prints its result and exits 1, only `check` prints the report) · 2 broken (repair required: check broken, an unmet verify declaration, or --strict upgrading a warn) · 3 no result (unreadable file, corrupt model, or usage error).\nPoint identity: vertices strictly closer than 1e-6 world units are the SAME point — `check` reports them as near-duplicate vertices and `wrfm edit --weld 1e-6` merges them (absolute threshold; pass an explicit --weld TOL when the model's units are far from 1).\n--format text|json exists on `check` / `query` / `diff` and selects their OUTPUT ENCODING: json is the machine-readable form, text is its projection (`info` / `geometry` / `group` / `view` always print JSON). `render --format` names the render style instead (braille|ascii|grid|both).\nRepair map (finding -> command): duplicate vertices -> --dedupe · near-duplicate vertices -> --weld 1e-6 · duplicate edges -> --dedupe · zero-length or dangling edges -> --clean · isolated vertices -> --clean · redundant (collinear degree-2) vertices have no repair action — accept them with `wrfm verify --expect-redundant N`.\nstderr carries diagnostics and errors only — the health verdict travels on the exit code (run `wrfm check` for the report).\nCompose atomic operations with pipes, e.g.:\n  wrfm edit m.wrfm --extract-group body | wrfm transform - --scale 2 --rotate-y 45\n  wrfm transform m.wrfm --mirror x | wrfm edit - --clean\nFormat spec: wrfm format (self-contained; no source needed)."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -270,7 +272,7 @@ enum Command {
         #[arg(long)]
         region: Option<String>,
         /// Auto-frame: 'content' crops every frame to the projected content bbox so the model fills the canvas (computed per view; combines with --views/--width/--height).
-        /// Priority: an explicit --region WINS and --fit content is ignored; --auto-dist/--dist still choose the camera distance (fit only crops what the camera sees).
+        /// An explicit --region takes precedence and --fit content is ignored; --auto-dist/--dist still choose the camera distance (fit only crops what the camera sees).
         #[arg(long, value_name = "MODE")]
         fit: Option<String>,
         /// Auto camera distance from the model extent (default true).
@@ -285,16 +287,16 @@ enum Command {
         /// Aim-point Y offset (world units).
         #[arg(long, default_value_t = 0.0)]
         pan_y: f64,
-        /// World-frame pitch in degrees (the fork's HUD pitch). Used ONLY for a single explicit-angle frame: --views ''.
+        /// World-frame pitch in degrees. Used only for a single explicit-angle frame: --views ''.
         #[arg(long, default_value_t = 0.0)]
         pitch: f64,
-        /// World-frame yaw in degrees (turntable, the fork's HUD yaw; positive = the object's nose turns to its own left). Used ONLY for a single explicit-angle frame: --views ''.
+        /// World-frame yaw in degrees (positive turns the object's nose to its own left). Used only for a single explicit-angle frame: --views ''.
         #[arg(long, default_value_t = 0.0)]
         yaw: f64,
-        /// Roll in degrees around the view axis. Used ONLY for a single explicit-angle frame: --views ''.
+        /// Roll in degrees around the view axis. Used only for a single explicit-angle frame: --views ''.
         #[arg(long, default_value_t = 0.0)]
         roll: f64,
-        /// Render ONLY this group (its vertices + the edges touching it).
+        /// Render only this group (its vertices + the edges touching it).
         #[arg(long)]
         group: Option<String>,
     },
@@ -326,7 +328,7 @@ enum Command {
         /// Pivot point the whole transform happens about: origin | center | bbox | 'x,y,z' (default origin).
         #[arg(long, default_value = "origin")]
         pivot: String,
-        /// Pivot about the bbox centre AND move it to the origin after the transform (overrides --pivot; --translate still applies).
+        /// Pivot about the bbox centre and move it to the origin after the transform (overrides --pivot; --translate still applies).
         #[arg(long)]
         to_origin: bool,
         /// Rotate the model's longest PCA principal axis onto x | y | z.
@@ -376,7 +378,7 @@ enum Command {
         /// Merge duplicate vertices (exact position) and drop duplicate / zero-length edges.
         #[arg(long)]
         dedupe: bool,
-        /// Merge vertices within TOL (world units) — catches near-duplicates exact --dedupe misses (real data differs by ~1e-15). Same cleanup as --dedupe (duplicate / zero-length edges dropped); the merged vertex keeps the FIRST group section that touched it.
+        /// Merge vertices within TOL (world units); catches near-duplicates exact --dedupe misses (real data differs by ~1e-15). Same cleanup as --dedupe (duplicate / zero-length edges dropped); the merged vertex keeps the first group section that touched it.
         #[arg(long, value_name = "TOL")]
         weld: Option<f64>,
         /// Merge another model (path or '-') into this one.

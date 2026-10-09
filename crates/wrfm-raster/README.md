@@ -2,13 +2,14 @@
 
 3D camera projection and braille rasterization.
 
-The raster stage is a port of ratatui's `Canvas` algorithm — same
-Cohen–Sutherland clipping, `Painter::get_point` scaling, Bresenham stepping,
-and braille pattern table. `tests/golden.rs` renders with both and asserts
-byte-for-byte equality across centered, region-zoom and arbitrary windows.
+The raster stage ports ratatui's `Canvas` algorithm: same Cohen–Sutherland
+clipping, `Painter::get_point` scaling, Bresenham stepping and braille pattern
+table. `tests/golden.rs` renders with both and asserts byte-for-byte equality
+across centered, region-zoom and arbitrary windows.
 
 ## Modules
 
+- `model` — the `Model` vertex/edge input every entry point takes
 - `geometry` — rotations, bounds, model extent, auto-fit distance
 - `projection` — `Camera`, `focal`, vertex → canvas projection
 - `raster` — `Bounds`, `rasterize_line` (clip + Bresenham), braille encoding

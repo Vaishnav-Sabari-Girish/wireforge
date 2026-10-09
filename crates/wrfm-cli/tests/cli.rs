@@ -1,5 +1,5 @@
 //! Integration tests for the `wrfm` CLI binary — the contract in
-//! `docs/PLAN.md` (PLAN-cli-stream §3) is an exit-code + three-channel
+//! `crates/wrfm-cli/README.md` (Exit codes) is an exit-code + three-channel
 //! contract, so these tests assert EXIT CODES and stream purity, not just
 //! output text.
 //!
@@ -12,7 +12,7 @@
 //! stderr carries diagnostics and errors only — never a health note, never
 //! mixed into stdout (the verdict travels on the exit code).
 //!
-//! Fixtures are FORMAT.md v2: a `wrfm 2` magic line and a
+//! Fixtures are `.wrfm` v2 (crates/wrfm/README.md): a `wrfm 2` magic line and a
 //! `vertices <V>   edges <M>` counts header.
 
 use serde_json::Value;

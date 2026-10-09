@@ -2,7 +2,7 @@
 name = "wrfm-cli"
 version = "0.1.0"
 edition.workspace = true
-description = "Command-line tool for .wrfm 3D wireframe models over streams"
+description = "Streaming command-line tool for .wrfm 3D wireframe models"
 readme = "README.md"
 license.workspace = true
 authors.workspace = true
@@ -20,8 +20,8 @@ wrfm-raster.workspace = true
 [lints.rust]
 unsafe_code = "forbid"
 
-# The tool is invoked as `wrfm <subcommand>` (docs/PLAN.md), so the installed
-# binary is named `wrfm`, not `wrfm-cli`.
+# The tool is invoked as `wrfm <subcommand>`, so the installed binary is named
+# `wrfm` while the crates.io package stays `wrfm-cli`.
 [[bin]]
 name = "wrfm"
 path = "src/main.rs"

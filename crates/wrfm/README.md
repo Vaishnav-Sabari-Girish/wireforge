@@ -4,8 +4,8 @@ A zero-dependency parser and serializer for the `.wrfm` 3D wireframe
 format.
 
 This crate provides a `WrfmModel` struct to load, manipulate, and save
-models of vertices and edges. It is the parser behind `wireforge` (the TUI
-viewer) and `wrfm-cli` (the stream tool).
+models of vertices and edges. It is the parser used by `wireforge`, the TUI
+viewer, and by the `wrfm` command line tool.
 
 ## Format versions
 
@@ -18,14 +18,14 @@ The format has two versions. **v2 is current**; v1 is the format of `wrfm`
 | Counts header | — | `vertices <N>   edges <M>`, required and enforced |
 | Groups | — (`group` lines are skipped) | `group <name>` sections |
 | Edge indices | unvalidated (out-of-range indices parse silently) | checked against the vertex count |
-| Unknown lines | skipped anywhere | blanks and comments only before the counts header; skipped after it |
+| Unknown lines | skipped anywhere | blanks and comments anywhere; unknown directives only after the counts header |
 | Parse failures | a plain `String` | structured `ParseError` with line and column |
 | Writing | `# ComChan wireframe format` comment, `{:.6}` coordinates | canonical v2, shortest round-trip `f64` |
 
-The version bump is not cosmetic. v1 could not tell a valid model from a
-truncated or mangled one: it declared no counts and checked no indices, so a
-half-written file quietly parsed into a different, broken model. v2 makes
-the file self-describing and fails loudly instead.
+The version bump matters. v1 could not tell a valid model from a truncated or
+mangled one: it declared no counts and checked no indices, so a half-written
+file parsed into a different, broken model. v2 makes the file self-describing
+and reports such files as errors.
 
 Only v2 is read. A v1 file is recognizable by the absence of a marker: it
 opens with `#` comments (0.4.0 writes `# ComChan wireframe format`) or
@@ -42,10 +42,10 @@ vertices <N>   edges <M>
 
 ## The `.wrfm` Format
 
-The `.wrfm` file type is a plain text format for defining 3D wireframes. A
-v2 file is UTF-8 text with one element per line:
+`.wrfm` is a plain text format for 3D wireframes. A v2 file is UTF-8 text with
+one element per line:
 
-* `wrfm <version>` — magic line, required as the FIRST line of the file (a
+* `wrfm <version>` — magic line, required as the first line of the file (a
   UTF-8 BOM is tolerated before it; nothing else may precede it). Version `2`
   is the current format; other versions are rejected.
 * `vertices <N>   edges <M>` — counts header, required before any content. A
@@ -55,10 +55,12 @@ v2 file is UTF-8 text with one element per line:
 * `group <name>` — opens a named section; the following `v` lines belong to
   it until the next `group`. Groups are optional and organize the global
   vertex list.
-* Lines starting with `#` are safely ignored as comments (except before the
-  magic line).
+* Lines starting with `#` are ignored as comments (except before the magic
+  line).
 
-### Example File (`cube.wrfm`)
+### Example File (`quad.wrfm`)
+
+A single square face, in a group of its own:
 
 ```text
 wrfm 2
@@ -83,11 +85,23 @@ shortest round-trip representation, so `1.0 / 3.0` round-trips as
 
 Add `wrfm` to your `Cargo.toml`.
 
+### `no_std`
+
+The `std` feature is on by default. Turn it off to parse models without the
+standard library (the crate then needs only `alloc`):
+
+```toml
+wrfm = { version = "0.5", default-features = false }
+```
+
+`from_str` and the model types work either way; `from_file`, `save_to_file`,
+`LoadError` and the `Display` impl that serializes a model are `std`-only.
+
 ### Loading a Model
 
-You can parse a model directly from a file path. The parser skips empty
-lines and comments. `from_file` returns a `LoadError`, which is either an
-I/O error or a structured `ParseError`:
+You can parse a model directly from a file path. The parser skips blank lines
+and `#` comments. `from_file` returns a `LoadError`, which is either an I/O
+error or a structured `ParseError`:
 
 ```rust
 use wrfm::{LoadError, WrfmModel};
@@ -125,16 +139,22 @@ fn main() {
             match err {
                 ParseError::InvalidVertex { detail, .. } => eprintln!("bad vertex: {detail:?}"),
                 ParseError::InvalidEdge { detail, .. } => eprintln!("bad edge: {detail:?}"),
+                // Magic, counts header, group and count errors carry no finer
+                // detail to unwrap; `Display` already reported them above.
+                other => eprintln!("{other}"),
             }
         }
     }
 }
 ```
 
-Parsing skips unknown lines silently. Note that out-of-range edge indices are
-never tolerated (validated against the final vertex count, so forward
-references to later-defined vertices are fine). The v2 magic, counts header
-and declared counts are always enforced.
+Parsing skips unknown lines, but only after the counts header. Blank lines and
+`#` comments are skipped anywhere after the magic line. Unknown directives are
+skipped once the header has been seen; before that, the first line that is not
+`vertices <N>   edges <M>` is an error. Out-of-range edge indices are never
+tolerated (validated against the final vertex count, so forward references to
+later-defined vertices are fine). The v2 magic, counts header and declared
+counts are always enforced.
 
 ### Creating and Saving a Model
 

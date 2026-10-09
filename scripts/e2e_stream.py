@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """End-to-end stream-input tests for the wireforge TUI (requires a PTY).
 
-Drives the REAL TUI binary and verifies the PLAN-cli-stream §6 stream-input
-contract:
+Drives the REAL TUI binary and verifies the stream-input contract documented
+in SPEC.md (Stream input):
 
   1. `stdin_opens_wrfm`        — pipe a v2 wrfm model into `wireforge -`
      (stdin is a pipe with EOF): it renders, and Row 0 shows the model name
