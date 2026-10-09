@@ -1,23 +1,18 @@
-//! Shared camera projection and braille rasterization for the wireforge
-//! family — `wireforge` (the TUI viewer) and `wrfm-cli` (the stream tool)
-//! both render the same `.wrfm` models, so they share the math and the
-//! rasterizer here instead of keeping two drifting copies.
+//! 3D camera projection and braille rasterization shared by `wireforge` (TUI
+//! viewer) and `wrfm-cli` (stream tool).
 //!
-//! # Layers
+//! The raster stage is a port of ratatui's `Canvas` algorithm — same
+//! Cohen–Sutherland clipping, `Painter::get_point` scaling, Bresenham
+//! stepping, and braille pattern table. `tests/golden.rs` renders with both
+//! and asserts byte-for-byte equality across centered, region-zoom and
+//! arbitrary windows.
+//!
+//! # Modules
 //!
 //! * [`geometry`] — 3D rotations, bounding box, model extent, auto-fit distance
 //! * [`projection`] — [`projection::Camera`] (world rotation, distance, roll,
 //!   pan) and vertex projection to canvas coordinates
 //! * [`raster`] — line clipping, Bresenham dot stepping, braille encoding
-//!
-//! # Byte-identical to ratatui
-//!
-//! The rasterizer is a port of the algorithm behind ratatui's
-//! `Canvas` widget (Cohen–Sutherland clipping, the same scale-and-round
-//! mapping, the same Bresenham stepping), and the cells are encoded with
-//! ratatui's own braille pattern table. `tests/golden.rs` renders with both
-//! and asserts the output is byte-for-byte identical, which is what keeps the
-//! TUI's frames and the CLI's text output in lockstep.
 //!
 //! ```
 //! use wrfm_raster::geometry::world_rot;
