@@ -22,6 +22,16 @@ ratatui = { version = "0.30.1", default-features = false }
 wrfm = { version = "0.5.0", path = "crates/wrfm" }
 wrfm-raster = { version = "0.1.0", path = "crates/wrfm-raster" }
 
+# Workspace-wide release profile (root Cargo.toml is the only place profiles
+# take effect). fat LTO + one codegen unit maximize optimization for these
+# small CLI/TUI binaries; abort + stripped symbols keep them small. Debugging
+# and profiling use the debug profile instead.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
 [package]
 name = "wireforge"
 version = "0.7.0"
