@@ -22,6 +22,8 @@
 
 ### :bug: Bug fixes
 
+- **(workspace)** Pin the wrfm-raster version for publishing
+
 - **(hooks)** Check every crate in the workspace
 
 - **(rotation)** Read plain keys in the viewer's frame
@@ -40,6 +42,8 @@
 
 
 ### :recycle: Refactoring
+
+- Own the model type and drop ratatui-wireframe
 
 - **(wrfm)** Split lib.rs into model, parse, error and tests modules
 
