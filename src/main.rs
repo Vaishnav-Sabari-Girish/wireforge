@@ -80,14 +80,15 @@ enum Hud {
 /// One continuous degree of freedom: rotation (yaw / pitch / roll) and translation (pan / dolly).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Motion {
-    // Rotation (world-frame: fixed world axes).
+    // Rotation (world-frame: fixed world axes; h/l/r/e read left/right as
+    // the viewer sees them — the model faces out of the screen).
     YawLeft,
     YawRight,
     PitchUp,
     PitchDown,
     RollPlus,
     RollMinus,
-    // Rotation (local-frame: the model's own axes).
+    // Rotation (local-frame: the model's own axes and its own left/right).
     LocalYawLeft,
     LocalYawRight,
     LocalPitchUp,
@@ -236,17 +237,24 @@ fn apply_motion_step(view: &mut ViewState, m: Motion, rot: f64, mv: f64) {
         // World-frame rotation: yaw/pitch pre-multiply the model->world
         // matrix with a fixed world-axis rotation, so the axes are anchored
         // to the world and never follow the model (no gimbal collapse).
-        Motion::YawLeft => view.add_yaw(rot),
-        Motion::YawRight => view.add_yaw(-rot),
+        // The SENSE of the plain keys is the viewer's: the model faces out
+        // of the screen while the sight line points into it, so plain h
+        // sweeps the nose the way the viewer reads "left" (screen-left =
+        // the model's own right) — the mirror of Ctrl+h, which yaws the
+        // model to its own left. Pitch has no mirror (the model's up is
+        // the viewer's up), so k/j read the same in both frames.
+        Motion::YawLeft => view.add_yaw(-rot),
+        Motion::YawRight => view.add_yaw(rot),
         Motion::PitchUp => view.add_pitch(-rot),
         Motion::PitchDown => view.add_pitch(rot),
-        // Screen-space roll: `r` rotates the image counter-clockwise. The
-        // frame picks the axis (here the view axis), never the sense: at the
-        // default view — where the model faces the camera — that reads as the
-        // model's starboard side dipping, the same body-bank direction as
-        // Ctrl+r. `e` is the mirror.
-        Motion::RollPlus => view.roll += rot,
-        Motion::RollMinus => view.roll -= rot,
+        // View-frame roll: `r` rolls about the sight line (into the
+        // screen) in the viewer's sense — the viewer's right side (screen
+        // right) dips, i.e. the image turns clockwise; `e` is the mirror.
+        // That axis is anti-parallel to the model's front (+Z out of the
+        // screen), so plain r and Ctrl+r read as mirror images at the
+        // default view: Ctrl+r keeps the body reading (starboard dips).
+        Motion::RollPlus => view.roll -= rot,
+        Motion::RollMinus => view.roll += rot,
         // Local-frame rotation: the same step post-multiplied, so the axis
         // rides with the model. Local roll lives in the rotation matrix (see
         // ViewState::add_roll_local), never in the screen-space `roll`.
@@ -531,7 +539,7 @@ fn hud_layout(
 const HELP: &[&str] = &[
     "=== wireforge keys ===",
     "",
-    "No Shift:",
+    "No Shift (world axes; left/right as you see them):",
     "  yaw left  <- / h       yaw right  -> / l",
     "  pitch up  ^ / k        pitch down v / j",
     "  roll      r / e        farther    -",
@@ -541,7 +549,7 @@ const HELP: &[&str] = &[
     "  left      <- / h       right      -> / l",
     "  up        ^ / k        down       v / j",
     "",
-    "Ctrl (around the model's own axes):",
+    "Ctrl (the model's own axes / its own left-right):",
     "  yaw left  Ctrl+h       yaw right  Ctrl+l",
     "  pitch up  Ctrl+k       pitch down Ctrl+j",
     "  roll      Ctrl+r / e",
@@ -1287,8 +1295,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             if app.auto_spin {
                 // Space auto-spin: rotate the model around its own (local) Y
                 // axis (view::ViewState::spin_local) — a globe turning in
-                // place, however it is pitched/rolled.
-                app.view.spin_local(SPIN_RATE * dt);
+                // place, however it is pitched/rolled. The sign keeps the
+                // spin agreeing with plain ← (the viewer's left).
+                app.view.spin_local(-SPIN_RATE * dt);
                 app.view.normalize();
             }
             render_frame(&mut app, &mut engine, &mut stdout)?;
@@ -2256,6 +2265,41 @@ mod tests {
         release.kind = KeyEventKind::Release;
         app.handle_input(Event::Key(release));
         assert!(app.held.is_empty(), "unshifted key-up must stop the hold");
+    }
+
+    #[test]
+    fn plain_keys_are_the_viewers_frame_ctrl_the_models() {
+        // The model faces out of the screen (+Z) while the sight line points
+        // into it: plain h/r must read as the viewer's left/right, Ctrl as
+        // the model's own — mirror images at the default view. Pitch has no
+        // mirror: the model's up is the viewer's up, so k/j agree.
+        let mut v = ViewState::default();
+        apply_motion_step(&mut v, Motion::YawLeft, 0.3, 0.0);
+        // The nose is the third column of the model->world matrix.
+        assert!(v.rot[0][2] < 0.0, "plain h must sweep the nose screen-left");
+
+        let mut v = ViewState::default();
+        apply_motion_step(&mut v, Motion::LocalYawLeft, 0.3, 0.0);
+        assert!(
+            v.rot[0][2] > 0.0,
+            "Ctrl+h must yaw to the model's own left (screen-right at default)"
+        );
+
+        let mut v = ViewState::default();
+        apply_motion_step(&mut v, Motion::RollPlus, 0.3, 0.0);
+        assert!(
+            v.roll < 0.0,
+            "plain r rolls about the sight line: the viewer's right dips (image CW)"
+        );
+
+        let mut v = ViewState::default();
+        apply_motion_step(&mut v, Motion::LocalRollPlus, 0.3, 0.0);
+        // Starboard is the model's local -X; a right bank dips it (y < 0).
+        assert!(-v.rot[1][0] < 0.0, "Ctrl+r must dip the model's starboard");
+
+        let mut v = ViewState::default();
+        apply_motion_step(&mut v, Motion::PitchUp, 0.3, 0.0);
+        assert!(v.rot[1][2] > 0.0, "k must tip the nose up in both frames");
     }
 
     #[test]

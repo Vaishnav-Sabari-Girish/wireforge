@@ -20,8 +20,9 @@ crate.
   move (Shift + arrows or hjkl, plain `=` / `-`) the model with your
   keyboard, toggle auto-spin with `Space`, center with `f` or fit with
   `Shift + f`, and read the current camera from the HUD line. Plain
-  rotation keys turn the world axes; `Ctrl` + arrows / `hjkl` / `e` / `r`
-  turns the model's own axes instead (local frame). XYZ axes can be
+  rotation keys turn the world axes and read left/right as you see them
+  (the model faces you); `Ctrl` + arrows / `hjkl` / `e` / `r` turns the
+  model's own axes and its own left/right instead (local frame). XYZ axes can be
   toggled with `Tab`.
 - **Stream input:** `wireforge -` reads a model from stdin (or a FIFO such
   as `<( cat model.wrfm )`) as a one-shot preview with no hot-reload.

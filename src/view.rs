@@ -132,14 +132,17 @@ impl ViewState {
         self.pitch += d;
     }
 
-    /// Roll the model around its own (local) Z axis, the local counterpart of
-    /// the screen-space `roll`: positive `d` banks the model to its own right
-    /// (right-hand turn about the nose axis, so its starboard side dips) —
-    /// the same sense as `Motion::RollPlus`, applied about the model's own
-    /// axis instead of the view axis. Unlike yaw/pitch it does NOT touch the
-    /// `roll` field: `roll` is the authoritative camera-frame angle applied by
-    /// `project_point`, so ticking it here as well would rotate the image
-    /// twice; the HUD therefore reports world-frame roll only.
+    /// Roll the model around its own (local) Z axis: positive `d` banks the
+    /// model to its own right (right-hand turn about the nose axis, so its
+    /// starboard side dips). Plain `Motion::RollPlus` is the *viewer's* frame
+    /// instead — it rolls about the sight line, which points into the screen
+    /// while the nose points out of it, so at the default view plain `r` and
+    /// `Ctrl+r` read as mirror images (plain `r` dips the viewer's right,
+    /// `Ctrl+r` dips the model's starboard). Unlike yaw/pitch it does NOT
+    /// touch the `roll` field: `roll` is the authoritative camera-frame
+    /// angle applied by `project_point`, so ticking it here as well would
+    /// rotate the image twice; the HUD therefore reports world-frame roll
+    /// only.
     pub fn add_roll_local(&mut self, d: f64) {
         self.rot = mat_mul(self.rot, rot_z(d));
     }
