@@ -75,7 +75,7 @@ fn main() -> Result<(), LoadError> {
 
 ### Handling Parse Errors
 
-`from_str` and `parse_with` return a classified, positioned `ParseError`.
+`from_str` returns a classified, positioned `ParseError`.
 Render it with `Display` for a rustc-style report (line/column header, source
 line, caret, expected-vs-found), or inspect the structured fields:
 
@@ -93,20 +93,16 @@ fn main() {
             match err {
                 ParseError::InvalidVertex { detail, .. } => eprintln!("bad vertex: {detail:?}"),
                 ParseError::InvalidEdge { detail, .. } => eprintln!("bad edge: {detail:?}"),
-                ParseError::UnknownDirective { token, .. } => {
-                    eprintln!("unknown directive `{token}`");
-                }
             }
         }
     }
 }
 ```
 
-Parsing is lenient by default, and unknown lines are skipped silently. Use
-`WrfmModel::parse_with(name, input, true)` to reject unknown directives, and
-note that out-of-range edge indices are never tolerated (validated against the
-final vertex count, so forward references to later-defined vertices are fine).
-The v1 magic, counts header and declared counts are enforced in both modes.
+Parsing skips unknown lines silently. Note that out-of-range edge indices are
+never tolerated (validated against the final vertex count, so forward
+references to later-defined vertices are fine). The v1 magic, counts header
+and declared counts are always enforced.
 
 ### Creating and Saving a Model
 

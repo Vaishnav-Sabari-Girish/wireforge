@@ -14,7 +14,6 @@ use std::io::Write;
 #[cfg(feature = "std")]
 use std::path::Path;
 
-/// A parsed `.wrfm` model: a name, vertices, 0-based edges, format version and optional groups.
 /// A parsed `.wrfm` model (v1): a display `name`, a list of
 /// `vertices`, 0-based `edges`, the format `version` and optional `groups`.
 ///
@@ -92,7 +91,7 @@ impl WrfmModel {
     ///
     /// The input must be v1: a `wrfm 1` magic line, a
     /// `vertices <N> edges <M>` counts header, then `v` / `e` / `group`
-    /// lines. Lenient by default: blank lines, `#` comments and unknown
+    /// lines. Lenient: blank lines, `#` comments and unknown
     /// lines are skipped. Returns a structured [`ParseError`] on malformed
     /// input.
     ///
@@ -110,32 +109,6 @@ impl WrfmModel {
     /// assert_eq!(model.edges, vec![(0, 1)]);
     /// ```
     pub fn from_str(name: &str, input: &str) -> Result<Self, ParseError> {
-        Self::parse_with(name, input, false)
-    }
-
-    /// Parses a model with `strict` controlling whether unknown lines are
-    /// rejected (`UnknownDirective`) or silently skipped.
-    ///
-    /// The v1 magic, header and declared counts are REQUIRED in both modes —
-    /// they are structural, not a policy. Out-of-range edge
-    /// indices are never tolerated, regardless of `strict`.
-    ///
-    /// ```
-    /// use wrfm::WrfmModel;
-    ///
-    /// // Lenient: unknown lines are skipped.
-    /// let lenient =
-    ///     WrfmModel::from_str("m", "wrfm 1\nvertices 1   edges 0\n\ngarbage\nv 0 0 0\n")
-    /// .unwrap();
-    /// assert_eq!(lenient.vertices.len(), 1);
-    ///
-    /// // Strict: unknown lines are an error.
-    /// assert!(
-    ///     WrfmModel::parse_with("m", "wrfm 1\nvertices 1   edges 0\n\ngarbage\nv 0 0 0\n", true)
-    /// .is_err()
-    /// );
-    /// ```
-    pub fn parse_with(name: &str, input: &str, strict: bool) -> Result<Self, ParseError> {
         let input = input.strip_prefix('\u{feff}').unwrap_or(input);
         let mut model = WrfmModel {
             name: name.to_string(),
@@ -405,17 +378,8 @@ impl WrfmModel {
                         }
                     }
                 }
-                other => {
-                    if strict {
-                        return Err(ParseError::UnknownDirective {
-                            line,
-                            column: 1,
-                            line_text: raw_line.to_string(),
-                            token: other.to_string(),
-                        });
-                    }
-                    // Lenient: unknown lines are skipped silently.
-                }
+                // Unknown lines are skipped silently.
+                _ => {}
             }
         }
 
@@ -590,7 +554,7 @@ impl WrfmModel {
 }
 
 /// Serialize the canonical v1 text as a `String` — the
-/// streaming, file-less form of [`save_to_file`], used by CLI pipelines
+/// streaming, file-less form of [`WrfmModel::save_to_file`], used by CLI pipelines
 /// (`wrfm transform a --scale 2 > big.wrfm`). Same canonical output:
 /// `wrfm <version>`, counts header, optional `group` sections, edges,
 /// and shortest-round-trip coordinates.
@@ -616,7 +580,6 @@ impl fmt::Display for WrfmModel {
 }
 
 /// A named section of the global vertex list (`vertex_start..vertex_end` is half-open).
-/// A named section of the global vertex list .
 ///
 /// `vertex_start..vertex_end` is a half-open range over the model's global
 /// `vertices`; edges are never tracked per group.
@@ -712,14 +675,6 @@ pub enum ParseError {
         line_text: String,
         detail: EdgeError,
     },
-    /// An unrecognized directive (only reported in strict mode).
-    UnknownDirective {
-        line: usize,
-        column: usize,
-        line_text: String,
-        /// The directive word (first whitespace-separated token).
-        token: String,
-    },
     /// Line 1 is not `wrfm <version>` — the file is not a wrfm file
     ///.
     MissingMagic {
@@ -784,7 +739,6 @@ pub enum ParseError {
 
 impl ParseError {
     /// 1-based line number of the error.
-    /// 1-based line number of the error.
     ///
     /// ```
     /// use wrfm::WrfmModel;
@@ -800,7 +754,6 @@ impl ParseError {
         match self {
             ParseError::InvalidVertex { line, .. }
             | ParseError::InvalidEdge { line, .. }
-            | ParseError::UnknownDirective { line, .. }
             | ParseError::MissingMagic { line, .. }
             | ParseError::MalformedMagic { line, .. }
             | ParseError::UnsupportedVersion { line, .. }
@@ -811,7 +764,6 @@ impl ParseError {
         }
     }
 
-    /// 1-based column of the error.
     /// 1-based column of the error.
     ///
     /// ```
@@ -828,7 +780,6 @@ impl ParseError {
         match self {
             ParseError::InvalidVertex { column, .. }
             | ParseError::InvalidEdge { column, .. }
-            | ParseError::UnknownDirective { column, .. }
             | ParseError::MissingMagic { column, .. }
             | ParseError::MalformedMagic { column, .. }
             | ParseError::UnsupportedVersion { column, .. }
@@ -843,7 +794,6 @@ impl ParseError {
         match self {
             ParseError::InvalidVertex { line_text, .. }
             | ParseError::InvalidEdge { line_text, .. }
-            | ParseError::UnknownDirective { line_text, .. }
             | ParseError::MissingMagic { line_text, .. }
             | ParseError::MalformedMagic { line_text, .. }
             | ParseError::UnsupportedVersion { line_text, .. }
@@ -883,9 +833,6 @@ impl ParseError {
                     "vertex index {index} is out of range (model has {vertex_count} vertices)"
                 ),
             },
-            ParseError::UnknownDirective { token, .. } => {
-                format!("unknown directive `{token}` (only `v`, `e` and `group` are valid)")
-            }
             ParseError::MissingMagic { .. } => {
                 "expected `wrfm <version>` as the first line of the file".to_string()
             }
@@ -929,7 +876,6 @@ impl ParseError {
                 EdgeError::NegativeIndex { index, .. } => index.to_string().chars().count(),
                 EdgeError::OutOfRange { index, .. } => index.to_string().chars().count(),
             },
-            ParseError::UnknownDirective { token, .. } => token.chars().count().max(1),
             ParseError::MissingMagic { .. } => 1,
             ParseError::MalformedMagic { token, .. } => token.chars().count().max(1),
             ParseError::UnsupportedVersion { token, .. } => token.chars().count().max(1),
@@ -941,7 +887,6 @@ impl ParseError {
     }
 }
 
-/// Renders a rustc-style error report with the source line, a caret and a detail message.
 /// Renders a rustc-style error report: `error: <kind> at line L, column C`,
 /// the offending source line with a caret, and a detail message
 /// .
@@ -967,7 +912,6 @@ impl fmt::Display for ParseError {
         let kind = match self {
             ParseError::InvalidVertex { .. } => "invalid vertex",
             ParseError::InvalidEdge { .. } => "invalid edge",
-            ParseError::UnknownDirective { .. } => "unknown directive",
             ParseError::MissingMagic { .. } => "missing wrfm magic",
             ParseError::MalformedMagic { .. } => "malformed wrfm magic",
             ParseError::UnsupportedVersion { .. } => "unsupported wrfm version",
@@ -1002,7 +946,6 @@ impl fmt::Display for ParseError {
 }
 
 /// Classified vertex-line error.
-/// Classified vertex-line error.
 ///
 /// ```
 /// use wrfm::{ParseError, VertexError, WrfmModel};
@@ -1032,7 +975,6 @@ pub enum VertexError {
     },
 }
 
-/// Classified edge-line error.
 /// Classified edge-line error.
 ///
 /// ```
@@ -1079,7 +1021,6 @@ pub enum EdgeError {
     },
 }
 
-/// Error returned by `from_file`: an I/O failure or a structured parse error.
 /// Error returned by [`WrfmModel::from_file`]: either an I/O failure or a
 /// structured parse error. Only available with the `std` feature.
 ///
@@ -1096,7 +1037,6 @@ pub enum LoadError {
     Parse(ParseError),
 }
 
-/// Displays the I/O error or the wrapped parse report.
 /// Displays a load failure: the underlying I/O error, or the wrapped
 /// [`ParseError`] report.
 ///
@@ -1120,9 +1060,8 @@ impl fmt::Display for LoadError {
     }
 }
 
-/// The cause chain: `Io` wraps the I/O error, `Parse` wraps the `ParseError`.
 /// The cause chain: `Io` exposes the wrapped I/O error, `Parse` exposes
-/// the underlying [`ParseError`] .
+/// the underlying [`ParseError`].
 ///
 /// ```
 /// use std::error::Error;
@@ -1738,36 +1677,10 @@ e 3 7
     }
 
     #[test]
-    fn unknown_line_skipped_default() {
+    fn unknown_line_skipped() {
         let model = WrfmModel::from_str("m", &v1(1, 0, "garbage x\nv 0 0 0\n"))
             .expect("unknown line skipped");
         assert_eq!(model.vertices.len(), 1);
-    }
-
-    #[test]
-    fn unknown_line_strict_reports() {
-        let err = WrfmModel::parse_with("m", &v1(1, 0, "garbage x\nv 0 0 0\n"), true)
-            .expect_err("strict mode rejects unknown lines");
-        match err {
-            ParseError::UnknownDirective {
-                line,
-                column,
-                token,
-                ..
-            } => {
-                assert_eq!((line, column), (4, 1));
-                assert_eq!(token, "garbage");
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_with_false_equals_from_str() {
-        let input = v1(2, 1, "v 0 0 0\nv 1 1 1\ne 0 1\n");
-        let a = WrfmModel::from_str("m", &input);
-        let b = WrfmModel::parse_with("m", &input, false);
-        assert_eq!(a, b);
     }
 
     #[test]
