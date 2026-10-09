@@ -12,7 +12,7 @@
 //! stderr carries diagnostics and errors only — never a health note, never
 //! mixed into stdout (the verdict travels on the exit code).
 //!
-//! Fixtures are FORMAT.md v1: a `wrfm 1` magic line and a
+//! Fixtures are FORMAT.md v2: a `wrfm 2` magic line and a
 //! `vertices <V>   edges <M>` counts header.
 
 use serde_json::Value;
@@ -25,9 +25,9 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_wrfm")
 }
 
-/// A valid v1 cube: magic + header + 8 vertices + 12 edges.
+/// A valid v2 cube: magic + header + 8 vertices + 12 edges.
 const CUBE: &str = "\
-wrfm 1
+wrfm 2
 vertices 8   edges 12
 
 v 0 0 0
@@ -52,12 +52,12 @@ e 2 6
 e 3 7
 ";
 
-/// A valid v1 file with two groups: `body` (global vertices 0..3, a
+/// A valid v2 file with two groups: `body` (global vertices 0..3, a
 /// triangle) and `head` (3..6, a triangle) — 6 vertices, 6 edges. Every
 /// vertex is a triangle corner: two healthy closed loops, so the whole
 /// model is an `ok` verdict and these commands exit 0.
 const TWO_GROUPS: &str = "\
-wrfm 1
+wrfm 2
 vertices 6   edges 6
 
 group body
@@ -78,7 +78,7 @@ e 5 3
 
 /// A model with a WARN-level issue: one duplicate vertex (twin of vertex 7).
 const DUP_VERTEX: &str = "\
-wrfm 1
+wrfm 2
 vertices 9   edges 13
 
 v 0 0 0
@@ -107,7 +107,7 @@ e 8 0
 
 /// A model with a BROKEN issue: a zero-length edge (8,8).
 const BROKEN: &str = "\
-wrfm 1
+wrfm 2
 vertices 8   edges 13
 
 v 0 0 0
@@ -133,9 +133,9 @@ e 3 7
 e 0 0
 ";
 
-/// A valid v1 cube spanning [0,2]^3 (max span 2) — for normalize tests.
+/// A valid v2 cube spanning [0,2]^3 (max span 2) — for normalize tests.
 const CUBE2: &str = "\
-wrfm 1
+wrfm 2
 vertices 8   edges 12
 
 v 0 0 0
@@ -163,7 +163,7 @@ e 3 7
 /// CUBE translated by +5 in x: no shared vertices with [`CUBE`], so a
 /// merge of the two is duplicate-free (fully healthy).
 const CUBE_SHIFTED: &str = "\
-wrfm 1
+wrfm 2
 vertices 8   edges 12
 
 v 5 0 0
@@ -188,10 +188,10 @@ e 2 6
 e 3 7
 ";
 
-/// A valid v1 box spanning x in [1,3], y/z in [0,1] (bbox centre
+/// A valid v2 box spanning x in [1,3], y/z in [0,1] (bbox centre
 /// (2,0.5,0.5)) — the PLAN §5.2 "cube at x 1..3".
 const CUBE_X13: &str = "\
-wrfm 1
+wrfm 2
 vertices 8   edges 12
 
 v 1 0 0
@@ -216,11 +216,11 @@ e 2 6
 e 3 7
 ";
 
-/// A valid v1 cube spanning [-1,1]^3 — mirror-symmetric about every
+/// A valid v2 cube spanning [-1,1]^3 — mirror-symmetric about every
 /// origin plane (unlike the [0,1]^3 `CUBE`, whose symmetry plane does not
 /// pass through the origin). bbox SIZE is [2,2,2].
 const CUBE_CENTERED: &str = "\
-wrfm 1
+wrfm 2
 vertices 8   edges 12
 
 v -1 -1 -1
@@ -245,10 +245,10 @@ e 2 6
 e 3 7
 ";
 
-/// A valid v1 1x1x4 box stretched along +z (z-span 4, x/y-span 1) — the
+/// A valid v2 1x1x4 box stretched along +z (z-span 4, x/y-span 1) — the
 /// PLAN §5.2 "long-z model" (PCA longest axis exactly +z).
 const LONG_Z: &str = "\
-wrfm 1
+wrfm 2
 vertices 8   edges 12
 
 v 0 0 0
@@ -277,7 +277,7 @@ e 3 7
 /// degenerate junk: an isolated vertex (3), a dangling chain (4-5) and a
 /// zero-length edge (7,7). `--clean` must strip all of it.
 const CLEAN_ME: &str = "\
-wrfm 1
+wrfm 2
 vertices 8   edges 8
 
 v 1 1 1
@@ -301,7 +301,7 @@ e 7 7
 /// A model with a duplicate vertex (2 == 1), a duplicate edge (1,2) twice,
 /// and a zero-length edge (0,0). `--dedupe` must reduce it to a single edge.
 const DUP_MODEL: &str = "\
-wrfm 1
+wrfm 2
 vertices 3   edges 4
 
 v 0 0 0
@@ -315,7 +315,7 @@ e 1 2
 
 /// A chain 0-1-2 plus an isolated vertex 3 (connectivity fixture).
 const CHAIN: &str = "\
-wrfm 1
+wrfm 2
 vertices 4   edges 2
 
 v 0 0 0
@@ -331,7 +331,7 @@ e 1 2
 /// Every vertex is degree 2 — under the old rule all five warned, now only
 /// the straight-through midpoint does.
 const REDUNDANT_MIDPOINT: &str = "\
-wrfm 1
+wrfm 2
 vertices 5   edges 5
 
 v 0 0 0
@@ -349,7 +349,7 @@ e 4 0
 /// Two groups (body 0..3, head 3..6) with one cross edge (1,4): the
 /// `adjacent_groups` fixture.
 const BODY_HEAD: &str = "\
-wrfm 1
+wrfm 2
 vertices 6   edges 7
 
 group body
@@ -490,7 +490,7 @@ fn check_parse_error_exit_three() {
     let path = write(
         &dir,
         "bad.wrfm",
-        "wrfm 1\nvertices 1   edges 0\n\nv 1.0 2.0 abc\n",
+        "wrfm 2\nvertices 1   edges 0\n\nv 1.0 2.0 abc\n",
     );
     let out = run(&["check", path.to_str().unwrap()]);
     assert_eq!(out.status.code(), Some(3), "stderr: {}", stderr(&out));
@@ -507,7 +507,7 @@ fn check_out_of_range_exit_three() {
     let path = write(
         &dir,
         "oor.wrfm",
-        "wrfm 1\nvertices 2   edges 1\n\nv 0 0 0\nv 1 1 1\ne 0 5\n",
+        "wrfm 2\nvertices 2   edges 1\n\nv 0 0 0\nv 1 1 1\ne 0 5\n",
     );
     let out = run(&["check", path.to_str().unwrap()]);
     assert_eq!(out.status.code(), Some(3), "stderr: {}", stderr(&out));
@@ -669,7 +669,7 @@ fn info_ok_json() {
     let j = stdout_json(&out);
     assert_eq!(j["name"], "cube");
     assert_eq!(j["source"], path.to_str().unwrap());
-    assert_eq!(j["version"], 1);
+    assert_eq!(j["version"], 2);
     assert_eq!(j["vertices"], 8);
     assert_eq!(j["edges"], 12);
     assert_eq!(j["groups"].as_array().unwrap().len(), 0);
@@ -685,7 +685,7 @@ fn info_reports_groups_in_json() {
     let out = run(&["info", path.to_str().unwrap()]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
     let j = stdout_json(&out);
-    assert_eq!(j["version"], 1);
+    assert_eq!(j["version"], 2);
     assert_eq!(j["vertices"], 6);
     assert_eq!(j["edges"], 6);
     let g = j["groups"].as_array().unwrap();
@@ -746,7 +746,7 @@ fn info_parse_error_exit_three() {
     let path = write(
         &dir,
         "bad.wrfm",
-        "wrfm 1\nvertices 1   edges 0\n\nv 1.0 2.0 abc\n",
+        "wrfm 2\nvertices 1   edges 0\n\nv 1.0 2.0 abc\n",
     );
     let out = run(&["info", path.to_str().unwrap()]);
     assert_eq!(out.status.code(), Some(3));
@@ -1253,7 +1253,7 @@ fn view_json_is_never_truncated() {
     // them is visible from the front, so the edge lists carry >100 entries —
     // `view` prints them ALL: JSON output is never truncated.
     let dir = scratch("view_json_is_never_truncated");
-    let mut m = String::from("wrfm 1\nvertices 300   edges 150\n\n");
+    let mut m = String::from("wrfm 2\nvertices 300   edges 150\n\n");
     for i in 0..150 {
         m.push_str(&format!("v {i} 0 0\nv {i} 1 0\n"));
     }
@@ -1338,7 +1338,7 @@ fn transform_scale_prints_model_text() {
     let out = run(&["transform", path.to_str().unwrap(), "--scale", "2"]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
     let so = stdout(&out);
-    assert!(so.starts_with("wrfm 1\n"), "canonical magic:\n{so}");
+    assert!(so.starts_with("wrfm 2\n"), "canonical magic:\n{so}");
     // The result is a valid model: round-trip through the parser.
     let back = wrfm::WrfmModel::from_str("scaled", &so).expect("output parses");
     assert_eq!(back.vertices.len(), 8);
@@ -1357,7 +1357,7 @@ fn transform_stdin() {
     let out = run_stdin(&["transform", "-", "--scale", "2"], CUBE);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
     let so = stdout(&out);
-    assert!(so.starts_with("wrfm 1\n"), "stdout:\n{so}");
+    assert!(so.starts_with("wrfm 2\n"), "stdout:\n{so}");
     fs::remove_dir_all(std::env::temp_dir().join("x")).ok();
 }
 
@@ -1369,7 +1369,7 @@ fn transform_broken_exit_two_result_emitted() {
     assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
     // Mechanism A: the result is STILL emitted even when broken.
     assert!(
-        stdout(&out).starts_with("wrfm 1\n"),
+        stdout(&out).starts_with("wrfm 2\n"),
         "stdout:\n{}",
         stdout(&out)
     );
@@ -2055,7 +2055,7 @@ fn format_teaches_magic_and_header() {
     let out = run(&["format"]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
     let so = stdout(&out);
-    assert!(so.contains("wrfm 1"), "stdout:\n{so}");
+    assert!(so.contains("wrfm 2"), "stdout:\n{so}");
     assert!(so.contains("vertices <N>   edges <M>"), "stdout:\n{so}");
 }
 
@@ -2313,7 +2313,7 @@ fn verify_symmetric_off_center_cube_passes() {
 /// `--weld 1e-9` merges it, and its three edges collapse onto the
 /// tetra's existing edges (dropped by the shared cleanup).
 const NEAR_DUP_TETRA: &str = "\
-wrfm 1
+wrfm 2
 vertices 5   edges 9
 
 v 0 0 0
@@ -2597,7 +2597,7 @@ fn help_documents_the_new_flags() {
 
 /// Two vertices ~1e-15 apart (not bit-identical) plus two clean chains.
 const NEAR_TWIN: &str = "\
-wrfm 1
+wrfm 2
 vertices 4   edges 2
 
 v 1.0 1.0 1.0
@@ -2670,7 +2670,7 @@ fn check_finds_near_duplicates_across_a_cell_boundary() {
     // same pair a zero-length edge.
     let dir = scratch("check_finds_near_duplicates_across_a_cell_boundary");
     let straddle = "\
-wrfm 1
+wrfm 2
 vertices 2   edges 1
 
 v 4.99e-05 0 0
@@ -2699,7 +2699,7 @@ e 0 1
 fn point_tolerance_boundary_is_strict() {
     let dir = scratch("point_tolerance_boundary_is_strict");
     let exact = "\
-wrfm 1
+wrfm 2
 vertices 2   edges 1
 
 v 0 0 0
@@ -2808,7 +2808,7 @@ fn diff_reports_group_membership_changes() {
     let a = write(&dir, "a.wrfm", TWO_GROUPS);
     // Same vertices, same edges — vertex 2 moved from `body` to `head`.
     let regrouped = "\
-wrfm 1
+wrfm 2
 vertices 6   edges 6
 
 group body
@@ -2887,7 +2887,7 @@ fn convert_obj_to_wrfm_writes_canonical_wrfm_to_stdout() {
     assert!(code <= 2, "conversion produced no result: {}", stderr(&out));
     let s = stdout(&out);
     assert!(
-        s.starts_with("wrfm 1\nvertices 3   edges 3\n"),
+        s.starts_with("wrfm 2\nvertices 3   edges 3\n"),
         "canonical wrfm on stdout, got: {s}"
     );
     let back = wrfm::WrfmModel::from_str("roundtrip", &s).expect("output parses");
@@ -2926,7 +2926,7 @@ fn convert_reads_an_obj_stream_from_stdin() {
         stderr(&out)
     );
     assert!(
-        stdout(&out).starts_with("wrfm 1\nvertices 3   edges 3\n"),
+        stdout(&out).starts_with("wrfm 2\nvertices 3   edges 3\n"),
         "got: {}",
         stdout(&out)
     );
@@ -2943,7 +2943,7 @@ fn convert_strips_a_leading_bom() {
     let code = out.status.code().unwrap_or(3);
     assert!(code <= 2, "stderr: {}", stderr(&out));
     assert!(
-        stdout(&out).starts_with("wrfm 1\nvertices 3   edges 3\n"),
+        stdout(&out).starts_with("wrfm 2\nvertices 3   edges 3\n"),
         "got: {}",
         stdout(&out)
     );

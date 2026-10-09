@@ -583,7 +583,7 @@ dependencies = [
  "num-traits",
  "ratatui",
  "spin",
- "wrfm",
+ "wrfm 0.4.0",
 ]
 
 [[package]]
@@ -898,13 +898,19 @@ dependencies = [
  "ratatui",
  "ratatui-wireframe",
  "rayon",
- "wrfm",
+ "wrfm 0.5.0",
  "wrfm-raster",
 ]
 
 [[package]]
 name = "wrfm"
 version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d8d67316c98c974f25c91ef05c9110edad3543f034572a688de7d67c2c746bdf"
+
+[[package]]
+name = "wrfm"
+version = "0.5.0"
 
 [[package]]
 name = "wrfm-cli"
@@ -913,7 +919,7 @@ dependencies = [
  "clap",
  "ratatui-wireframe",
  "serde_json",
- "wrfm",
+ "wrfm 0.5.0",
  "wrfm-raster",
 ]
 

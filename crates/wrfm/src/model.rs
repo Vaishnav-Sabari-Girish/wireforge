@@ -12,7 +12,7 @@ use std::io::Write;
 #[cfg(feature = "std")]
 use std::path::Path;
 
-/// A parsed `.wrfm` model (v1): a display `name`, a list of
+/// A parsed `.wrfm` model (v2): a display `name`, a list of
 /// `vertices`, 0-based `edges`, the format `version` and optional `groups`.
 ///
 /// ```
@@ -22,7 +22,7 @@ use std::path::Path;
 /// model.vertices.push((0.0, 1.0, 0.0));
 /// model.edges.push((0, 1));
 /// assert_eq!(model.name, "triangle");
-/// assert_eq!(model.version, 1);
+/// assert_eq!(model.version, 2);
 /// assert_eq!(model.vertices.len(), 1);
 /// assert_eq!(model.edges, vec![(0, 1)]);
 /// assert!(model.groups.is_empty());
@@ -32,20 +32,20 @@ pub struct WrfmModel {
     pub name: String,
     pub vertices: Vec<(f64, f64, f64)>,
     pub edges: Vec<(usize, usize)>,
-    /// Format version parsed from the magic line (`1` for v1).
+    /// Format version parsed from the magic line (`2` for v2).
     pub version: u32,
     /// Named sections over the global vertex list (empty when the file has no `group` lines).
     pub groups: Vec<Group>,
 }
 
 impl Default for WrfmModel {
-    /// `version` defaults to 1 (never 0), `groups` to empty.
+    /// `version` defaults to 2 (never 0), `groups` to empty.
     ///
     /// ```
     /// use wrfm::WrfmModel;
     ///
     /// let m = WrfmModel::default();
-    /// assert_eq!(m.version, 1); // never 0
+    /// assert_eq!(m.version, 2); // never 0
     /// assert_eq!(m.name, "");
     /// assert!(m.vertices.is_empty());
     /// assert!(m.edges.is_empty());
@@ -56,21 +56,21 @@ impl Default for WrfmModel {
             name: String::new(),
             vertices: Vec::new(),
             edges: Vec::new(),
-            version: 1,
+            version: 2,
             groups: Vec::new(),
         }
     }
 }
 
 impl WrfmModel {
-    /// Create an empty v1 model with the given display `name`.
+    /// Create an empty v2 model with the given display `name`.
     ///
     /// ```
     /// use wrfm::WrfmModel;
     ///
     /// let m = WrfmModel::new("cube");
     /// assert_eq!(m.name, "cube");
-    /// assert_eq!(m.version, 1);
+    /// assert_eq!(m.version, 2);
     /// assert!(m.vertices.is_empty());
     /// assert!(m.edges.is_empty());
     /// assert!(m.groups.is_empty());
@@ -80,7 +80,7 @@ impl WrfmModel {
             name: name.into(),
             vertices: Vec::new(),
             edges: Vec::new(),
-            version: 1,
+            version: 2,
             groups: Vec::new(),
         }
     }
@@ -94,7 +94,7 @@ impl WrfmModel {
     /// # let dir = std::env::temp_dir().join(format!("wrfm-doc-{}", std::process::id()));
     /// # std::fs::create_dir_all(&dir).unwrap();
     /// # let path = dir.join("model.wrfm");
-    /// # std::fs::write(&path, "wrfm 1\nvertices 2   edges 1\n\nv 0 0 0\nv 1 1 1\n\ne 0 1\n").unwrap();
+    /// # std::fs::write(&path, "wrfm 2\nvertices 2   edges 1\n\nv 0 0 0\nv 1 1 1\n\ne 0 1\n").unwrap();
     ///
     /// let model = WrfmModel::from_file(&path).unwrap();
     /// assert_eq!(model.name, "model"); // the file stem
@@ -112,8 +112,8 @@ impl WrfmModel {
         Self::from_str(name, &content).map_err(LoadError::Parse)
     }
 
-    /// Save the model to a `.wrfm` file in canonical v1.
-    /// `wrfm 1`, a counts header, optional `group` sections and then all
+    /// Save the model to a `.wrfm` file in canonical v2.
+    /// `wrfm 2`, a counts header, optional `group` sections and then all
     /// edges. Coordinates use the shortest round-trip representation.
     ///
     /// ```
@@ -144,7 +144,7 @@ impl WrfmModel {
         self.write_to(&mut file)
     }
 
-    /// Serialize the canonical v1 text into `w`.
+    /// Serialize the canonical v2 text into `w`.
     #[cfg(feature = "std")]
     fn write_to<W: Write>(&self, w: &mut W) -> std::io::Result<()> {
         writeln!(w, "wrfm {}", self.version)?;
@@ -193,7 +193,7 @@ impl WrfmModel {
     }
 }
 
-/// Serialize the canonical v1 text as a `String` — the
+/// Serialize the canonical v2 text as a `String` — the
 /// streaming, file-less form of [`WrfmModel::save_to_file`], used by CLI pipelines
 /// (`wrfm transform a --scale 2 > big.wrfm`). Same canonical output:
 /// `wrfm <version>`, counts header, optional `group` sections, edges,
@@ -206,7 +206,7 @@ impl WrfmModel {
 /// model.vertices.push((0.0, 0.0, 0.0));
 /// model.edges.push((0, 0));
 /// let text = model.to_string();
-/// assert!(text.starts_with("wrfm 1\nvertices 1   edges 1\n"));
+/// assert!(text.starts_with("wrfm 2\nvertices 1   edges 1\n"));
 /// ```
 #[cfg(feature = "std")]
 impl fmt::Display for WrfmModel {
@@ -215,7 +215,7 @@ impl fmt::Display for WrfmModel {
         let mut buf: Vec<u8> = Vec::new();
         self.write_to(&mut buf)
             .expect("wrfm serialization into a Vec<u8> cannot fail");
-        f.write_str(&String::from_utf8(buf).expect("canonical v1 text is always valid UTF-8"))
+        f.write_str(&String::from_utf8(buf).expect("canonical v2 text is always valid UTF-8"))
     }
 }
 
@@ -229,7 +229,7 @@ impl fmt::Display for WrfmModel {
 ///
 /// let model = WrfmModel::from_str(
 ///     "m",
-///     "wrfm 1\nvertices 3   edges 0\n\ngroup body\n  v 0 0 0\n  v 1 0 0\n  v 1 1 0\n",
+///     "wrfm 2\nvertices 3   edges 0\n\ngroup body\n  v 0 0 0\n  v 1 0 0\n  v 1 1 0\n",
 /// )
 /// .unwrap();
 /// assert_eq!(

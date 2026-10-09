@@ -322,7 +322,7 @@ fn probe_bytes(buf: &[u8]) -> Result<(), String> {
     // magic line does not hide it.
     let head = head.strip_prefix('\u{feff}').unwrap_or(&head);
 
-    // Magic first: the first line of a v1 wrfm file is `wrfm <version>`.
+    // Magic first: the first line of a v2 wrfm file is `wrfm <version>`.
     // The magic is a short line, so it always fits within PROBE_BYTES.
     let first_line = head.lines().next().unwrap_or("");
     if first_line.split_whitespace().next() == Some("wrfm") {
@@ -1119,11 +1119,11 @@ mod tests {
 
     #[test]
     fn load_model_accepts_valid_wrfm() {
-        // A valid v1 file: `wrfm 1` magic, `vertices <N> edges <M>` counts
+        // A valid v2 file: `wrfm 2` magic, `vertices <N> edges <M>` counts
         // header, then `v` / `e` lines.
         let p = temp_wrfm(
             "valid",
-            "wrfm 1\nvertices 2   edges 1\n\nv 0 0 0\nv 1 1 1\ne 0 1\n",
+            "wrfm 2\nvertices 2   edges 1\n\nv 0 0 0\nv 1 1 1\ne 0 1\n",
         );
         let (mode, name) = load_model(&p).expect("valid wrfm must load");
         let m = mode;
@@ -1138,11 +1138,11 @@ mod tests {
 
     #[test]
     fn open_detection_txt_with_wrfm_content_opens() {
-        // A `.txt` holding v1 wrfm content must open as wrfm — the extension
+        // A `.txt` holding v2 wrfm content must open as wrfm — the extension
         // is only a hint, the content is authoritative.
         let p = temp_file(
             "model.txt",
-            "wrfm 1\nvertices 2   edges 1\n\nv 0 0 0\nv 1 1 1\ne 0 1\n",
+            "wrfm 2\nvertices 2   edges 1\n\nv 0 0 0\nv 1 1 1\ne 0 1\n",
         );
         let (mode, name) = load_model(&p).expect("wrfm content in a .txt must open");
         let m = mode;
@@ -1154,7 +1154,7 @@ mod tests {
     #[test]
     fn open_detection_wrfm_with_garbage_is_unrecognized() {
         // Garbage is "unrecognized" (never an Ok empty model); a file
-        // starting with `wrfm 1` is a parse (load) error instead.
+        // starting with `wrfm 2` is a parse (load) error instead.
         let p = temp_wrfm("garbage", "this is not a wireframe\nno markers here\n");
         let err = load_model(&p).err().expect("garbage must fail to load");
         assert!(
@@ -1164,7 +1164,7 @@ mod tests {
 
         // Magic present, garbage after it: routed to the wrfm parser, which
         // must fail on the missing counts header — never "unrecognized".
-        let p2 = temp_wrfm("magic-garbage", "wrfm 1\nthis is garbage after the magic\n");
+        let p2 = temp_wrfm("magic-garbage", "wrfm 2\nthis is garbage after the magic\n");
         let err2 = load_model(&p2)
             .err()
             .expect("magic+garbage must fail to load");
@@ -1196,7 +1196,7 @@ mod tests {
 
     #[test]
     fn wrfm_style_without_magic_is_unrecognized() {
-        // The v1 breaking change: a file with wrfm-style
+        // The v2 breaking change: a file with wrfm-style
         // `v`/`e` lines but NO `wrfm <version>` magic is NOT wrfm and NOT
         // obj — it is "unrecognized".
         let v_e = temp_wrfm("v-e", "v 0 0 0\nv 1 1 1\ne 0 1\n");
@@ -1219,12 +1219,12 @@ mod tests {
 
     #[test]
     fn wrfm_magic_beats_obj_markers() {
-        // The magic test comes FIRST: a file starting with `wrfm 1` is
+        // The magic test comes FIRST: a file starting with `wrfm 2` is
         // wrfm even if later lines look obj-ish (`f` is an unknown directive
         // that lenient parsing skips).
         let p = temp_wrfm(
             "magic-obj",
-            "wrfm 1\nvertices 2   edges 1\n\nv 0 0 0\nv 1 0 0\ne 0 1\nf 1 2 3\n",
+            "wrfm 2\nvertices 2   edges 1\n\nv 0 0 0\nv 1 0 0\ne 0 1\nf 1 2 3\n",
         );
         probe_format(&p).expect("magic wins");
         let (mode, _) = load_model(&p).expect("magic must win over obj markers");
@@ -1248,11 +1248,11 @@ mod tests {
 
     #[test]
     fn load_model_rejects_half_written_file() {
-        // Truncated v1 .wrfm still carries magic + `v`/`e` markers: the
+        // Truncated v2 .wrfm still carries magic + `v`/`e` markers: the
         // parser fails and the caller keeps the last good model.
         let p = temp_wrfm(
             "half",
-            "wrfm 1\nvertices 2   edges 1\n\nv 0 0 0\nv 1 1\ne 0 1\n",
+            "wrfm 2\nvertices 2   edges 1\n\nv 0 0 0\nv 1 1\ne 0 1\n",
         );
         assert!(load_model(&p).is_err());
     }
@@ -1262,7 +1262,7 @@ mod tests {
         // An edge line missing its second index must fail to parse.
         let p = temp_wrfm(
             "bad-edge",
-            "wrfm 1\nvertices 2   edges 1\n\nv 0 0 0\nv 1 1 1\ne 0",
+            "wrfm 2\nvertices 2   edges 1\n\nv 0 0 0\nv 1 1 1\ne 0",
         );
         assert!(load_model(&p).is_err());
     }
@@ -1273,7 +1273,7 @@ mod tests {
         // line); magic routes content to the wrfm parser.
         let p = temp_wrfm(
             "bad-num",
-            "wrfm 1\nvertices 1   edges 1\n\nv 1.0 2.0 abc\ne 0 0\n",
+            "wrfm 2\nvertices 1   edges 1\n\nv 1.0 2.0 abc\ne 0 0\n",
         );
         let err = load_model(&p).err().expect("bad-num must fail to load");
         assert!(err.contains("line"), "error should mention the line: {err}");
@@ -1285,7 +1285,7 @@ mod tests {
 
     #[test]
     fn load_model_rejects_deleted_file() {
-        let p = temp_wrfm("gone", "wrfm 1\nvertices 1   edges 1\n\nv 0 0 0\ne 0 0\n");
+        let p = temp_wrfm("gone", "wrfm 2\nvertices 1   edges 1\n\nv 0 0 0\ne 0 0\n");
         fs::remove_file(&p).unwrap();
         assert!(load_model(&p).is_err(), "a deleted file must fail to load");
     }
@@ -1327,10 +1327,10 @@ mod tests {
     fn probe_bytes_wrfm_magic() {
         // The buffer probe (used by stdin/FIFO) is the same content-first
         // authority as the file probe: `wrfm <version>` first line -> wrfm.
-        let buf = b"wrfm 1\nvertices 2   edges 1\n\nv 0 0 0\nv 1 1 1\ne 0 1\n";
+        let buf = b"wrfm 2\nvertices 2   edges 1\n\nv 0 0 0\nv 1 1 1\ne 0 1\n";
         probe_bytes(buf).expect("wrfm magic probes as wrfm");
         // The magic wins even with obj-looking markers later.
-        let buf2 = b"wrfm 1\nf 1 2 3\n";
+        let buf2 = b"wrfm 2\nf 1 2 3\n";
         probe_bytes(buf2).expect("magic wins over obj markers");
     }
 
@@ -1338,7 +1338,7 @@ mod tests {
     fn probe_bytes_garbage_is_unrecognized() {
         // A stream of garbage (no magic, no obj markers) is "unrecognized" —
         // never an empty model; a magic-less `v`/`e` stream is likewise not
-        // wrfm (the v1 breaking change).
+        // wrfm (the v2 breaking change).
         let err = probe_bytes(b"this is not a wireframe\n").unwrap_err();
         assert!(err.contains("unrecognized"), "error: {err}");
         assert!(probe_bytes(b"v 0 0 0\nv 1 1 1\ne 0 1\n").is_err());
@@ -1349,7 +1349,7 @@ mod tests {
     fn load_model_from_text_wrfm_parses() {
         let (mode, name) = load_model_from_text(
             "stream",
-            "wrfm 1\nvertices 2   edges 1\n\nv 0 0 0\nv 1 1 1\ne 0 1\n",
+            "wrfm 2\nvertices 2   edges 1\n\nv 0 0 0\nv 1 1 1\ne 0 1\n",
         )
         .expect("wrfm stream must load");
         let m = mode;

@@ -7,7 +7,7 @@ use crate::model::{Group, WrfmModel};
 impl WrfmModel {
     /// Parses a model directly from a string (useful for include_str!).
     ///
-    /// The input must be v1: a `wrfm 1` magic line, a
+    /// The input must be v2 (v1 files are rejected): a `wrfm 2` magic line, a
     /// `vertices <N> edges <M>` counts header, then `v` / `e` / `group`
     /// lines. Lenient: blank lines, `#` comments and unknown
     /// lines are skipped. Returns a structured [`ParseError`] on malformed
@@ -18,11 +18,11 @@ impl WrfmModel {
     ///
     /// let model = WrfmModel::from_str(
     ///     "cube",
-    ///     "wrfm 1\nvertices 2   edges 1\n\nv 0 0 0\nv 1 1 1\n\ne 0 1\n",
+    ///     "wrfm 2\nvertices 2   edges 1\n\nv 0 0 0\nv 1 1 1\n\ne 0 1\n",
     /// )
     /// .unwrap();
     /// assert_eq!(model.name, "cube");
-    /// assert_eq!(model.version, 1);
+    /// assert_eq!(model.version, 2);
     /// assert_eq!(model.vertices.len(), 2);
     /// assert_eq!(model.edges, vec![(0, 1)]);
     /// ```
@@ -32,7 +32,7 @@ impl WrfmModel {
             name: name.to_string(),
             vertices: Vec::new(),
             edges: Vec::new(),
-            version: 1,
+            version: 2,
             groups: Vec::new(),
         };
         // Source location of each parsed edge, needed to report OutOfRange.
@@ -59,7 +59,7 @@ impl WrfmModel {
         }
         match first_toks.get(1) {
             Some(&(version_tok, version_col)) => match version_tok.parse::<u32>() {
-                Ok(1) => model.version = 1,
+                Ok(2) => model.version = 2,
                 Ok(v) => {
                     return Err(ParseError::UnsupportedVersion {
                         line: 1,

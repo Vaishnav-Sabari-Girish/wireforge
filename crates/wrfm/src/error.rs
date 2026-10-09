@@ -9,7 +9,7 @@ use core::fmt;
 ///
 /// let err = WrfmModel::from_str(
 ///     "m",
-///     "wrfm 1\nvertices 5   edges 0\n\nv 0 0 0\nv 1 1 1\n",
+///     "wrfm 2\nvertices 5   edges 0\n\nv 0 0 0\nv 1 1 1\n",
 /// )
 /// .unwrap_err();
 /// match err {
@@ -36,7 +36,7 @@ pub enum CountKind {
 ///
 /// let err = WrfmModel::from_str(
 ///     "m",
-///     "wrfm 1\nvertices 1   edges 0\n\nv 1.0 2.0 abc\n",
+///     "wrfm 2\nvertices 1   edges 0\n\nv 1.0 2.0 abc\n",
 /// )
 /// .unwrap_err();
 /// match err {
@@ -136,7 +136,7 @@ impl ParseError {
     ///
     /// let err = WrfmModel::from_str(
     ///     "m",
-    ///     "wrfm 1\nvertices 1   edges 0\n\nv 1.0 2.0 abc\n",
+    ///     "wrfm 2\nvertices 1   edges 0\n\nv 1.0 2.0 abc\n",
     /// )
     /// .unwrap_err();
     /// assert_eq!(err.line(), 4);
@@ -162,7 +162,7 @@ impl ParseError {
     ///
     /// let err = WrfmModel::from_str(
     ///     "m",
-    ///     "wrfm 1\nvertices 1   edges 0\n\nv 1.0 2.0 abc\n",
+    ///     "wrfm 2\nvertices 1   edges 0\n\nv 1.0 2.0 abc\n",
     /// )
     /// .unwrap_err();
     /// assert_eq!(err.column(), 11);
@@ -231,7 +231,7 @@ impl ParseError {
                 "expected `wrfm <version>` where `<version>` is a positive integer".to_string()
             }
             ParseError::UnsupportedVersion { version, .. } => {
-                format!("this file is wrfm version {version}; only version 1 is supported")
+                format!("this file is wrfm version {version}; only version 2 is supported")
             }
             ParseError::MissingHeader { .. } => {
                 "expected a `vertices <N>   edges <M>` counts header before the first \
@@ -341,7 +341,7 @@ impl fmt::Display for ParseError {
 /// ```
 /// use wrfm::{ParseError, VertexError, WrfmModel};
 ///
-/// let err = WrfmModel::from_str("m", "wrfm 1\nvertices 1   edges 0\n\nv 1.0 2.0\n")
+/// let err = WrfmModel::from_str("m", "wrfm 2\nvertices 1   edges 0\n\nv 1.0 2.0\n")
 /// .unwrap_err();
 /// assert!(matches!(
 /// err,
@@ -373,7 +373,7 @@ pub enum VertexError {
 ///
 /// let err = WrfmModel::from_str(
 ///     "m",
-///     "wrfm 1\nvertices 2   edges 1\n\nv 0 0 0\nv 1 1 1\ne 0 5\n",
+///     "wrfm 2\nvertices 2   edges 1\n\nv 0 0 0\nv 1 1 1\ne 0 5\n",
 /// )
 /// .unwrap_err();
 /// assert!(matches!(
@@ -435,7 +435,7 @@ pub enum LoadError {
 /// use wrfm::{LoadError, WrfmModel};
 ///
 /// let parse =
-///     LoadError::Parse(WrfmModel::from_str("m", "wrfm 2\n").unwrap_err());
+///     LoadError::Parse(WrfmModel::from_str("m", "wrfm 3\n").unwrap_err());
 /// assert!(format!("{parse}").contains("unsupported wrfm version"));
 ///
 /// let io = LoadError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "nope"));
@@ -459,7 +459,7 @@ impl fmt::Display for LoadError {
 /// use wrfm::{LoadError, WrfmModel};
 ///
 /// let parse =
-///     LoadError::Parse(WrfmModel::from_str("m", "wrfm 2\n").unwrap_err());
+///     LoadError::Parse(WrfmModel::from_str("m", "wrfm 3\n").unwrap_err());
 /// assert!(parse.source().is_some());
 ///
 /// let io = LoadError::Io(std::io::Error::new(std::io::ErrorKind::Other, "boom"));
@@ -481,7 +481,7 @@ impl std::error::Error for LoadError {
 /// use std::error::Error;
 /// use wrfm::WrfmModel;
 ///
-/// let err = WrfmModel::from_str("m", "wrfm 2\n").unwrap_err();
+/// let err = WrfmModel::from_str("m", "wrfm 3\n").unwrap_err();
 /// assert!(err.source().is_none());
 /// ```
 #[cfg(feature = "std")]

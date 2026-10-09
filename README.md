@@ -7,7 +7,7 @@ A text format, a parser, a Unix-style CLI, and a terminal viewer.
 ## Overview
 
 `.wrfm` is a 3D model format containing a set of points and the lines between
-them. The file opens with a magic line (`wrfm 1`) and a counts header, then
+them. The file opens with a magic line (`wrfm 2`) and a counts header, then
 `v <x> <y> <z>` lines for the points and `e <a> <b>` lines for the lines. `#`
 starts a comment; named groups are optional. A tetrahedron fits in twenty
 lines.
@@ -18,7 +18,8 @@ in a code review.
 
 Wireforge is a small set of tools arranged around that format:
 
-- **`.wrfm`** — the format itself.
+- **`.wrfm`** — the format itself (v2; the v1 files of `wrfm` 0.4.0 are not
+  read).
 - **[`wrfm`](crates/wrfm)** — a zero-dependency Rust library that parses and
   serializes it, with `no_std` support and exact `f64` round-trips.
 - **[`wrfm` CLI](crates/wrfm-cli)** — thirteen subcommands that check, verify,

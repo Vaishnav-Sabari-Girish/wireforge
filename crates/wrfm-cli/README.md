@@ -60,7 +60,7 @@ wrfm info wrfm_files/cube.wrfm
 ```json
 {
   "name": "cube",
-  "version": 1,
+  "version": 2,
   "vertices": 8,
   "edges": 12,
   "groups": [],
@@ -188,7 +188,7 @@ wrfm transform model.wrfm --scale 2    # affine transforms, printed to stdout
 wrfm edit model.wrfm --delete-vertices 0,1   # topology edits (--dedupe / --weld TOL)
 wrfm convert model.obj                 # OBJ -> wrfm (input format detected from the content)
 wrfm diff a.wrfm b.wrfm --format json  # structured or density-grid diff
-wrfm format                            # print the .wrfm v1 spec itself
+wrfm format                            # print the .wrfm v2 spec itself
 ```
 
 ## Composing commands with pipes

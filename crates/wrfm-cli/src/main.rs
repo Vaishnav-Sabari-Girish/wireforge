@@ -26,11 +26,11 @@ macro_rules! err {
 use clap::{Parser, Subcommand};
 use serde_json::json;
 
-/// The complete `.wrfm` v1 format spec, as printed by `wrfm format`.
-const FORMAT_SPEC: &str = r#".wrfm format v1 — plain text, one element per line
+/// The complete `.wrfm` v2 format spec, as printed by `wrfm format`.
+const FORMAT_SPEC: &str = r#".wrfm format v2 — plain text, one element per line
 ===================================================
 
-MAGIC  (line 1, required)   wrfm 1
+MAGIC  (line 1, required)   wrfm 2
 COUNTS (required, next)     vertices <N>   edges <M>
    N = total 'v' lines, M = total 'e' lines (whole file);
    a mismatch is a format error (never silently tolerated).
@@ -42,11 +42,20 @@ COORDS   write the shortest decimal that round-trips (0.5, 1.4142135623730951)
 AXIS     Y-UP: +Y is vertical (height); X and Z form the ground plane.
          A model built with Z as height appears lying on its side.
 
+VERSIONS v2 (this spec)  magic + enforced counts header + groups + checked
+                         edge indices; shortest round-trip f64 coordinates.
+         v1 (wrfm 0.4.0) no magic, no counts header, no groups, unchecked
+                         indices; v1 files are REJECTED. Migrate by
+                         prepending the magic line and a counts header with
+                         the file's ACTUAL v/e totals:
+                           wrfm 2
+                           vertices <N>   edges <M>
+
 GROUP EXAMPLE — groups are SECTIONS of the ONE global vertex list. The v
 lines under a group RE-LIST the global vertices that belong to it (in
 file order); indexing NEVER restarts in a group.
 
-  wrfm 1
+  wrfm 2
   vertices 5   edges 4
 
   group body
@@ -384,7 +393,7 @@ enum Command {
         #[arg(long, default_value = "text")]
         format: String,
     },
-    /// Print the complete .wrfm v1 format spec (magic, header, groups, precision, streams) to stdout. Learn the format from the CLI itself — no separate manual to keep in sync.
+    /// Print the complete .wrfm v2 format spec (magic, header, groups, precision, streams) to stdout. Learn the format from the CLI itself — no separate manual to keep in sync.
     Format,
     /// Convert an OBJ model to .wrfm (the only supported direction: obj -> wrfm).
     ///
@@ -1618,7 +1627,7 @@ fn cmd_diff(a: &str, b: &str, format: &str) -> i32 {
     0
 }
 
-/// `wrfm format` — print the complete `.wrfm` v1 spec to stdout. Pure informational command: no model input, no L2 check, exit 0 always.
+/// `wrfm format` — print the complete `.wrfm` v2 spec to stdout. Pure informational command: no model input, no L2 check, exit 0 always.
 fn cmd_format() -> i32 {
     out!("{FORMAT_SPEC}");
     output::flush();

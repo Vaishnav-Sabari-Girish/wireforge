@@ -93,10 +93,10 @@ wrfm edit model.wrfm --extract-group cabinet | wrfm transform - --scale 2 | wire
 
 ## The `.wrfm` Format
 
-The `.wrfm` format (v1) is a dead-simple, human-readable text format for
+The `.wrfm` format (v2) is a dead-simple, human-readable text format for
 defining 3D vertices and the edges that connect them.
 
-- The first line is the magic and version: `wrfm 1`.
+- The first line is the magic and version: `wrfm 2`.
 - The second line is a counts header: `vertices <N>   edges <M>` (the
   declared counts must match the lines that follow).
 - `v <x> <y> <z>` defines a vertex in 3D space.
@@ -108,7 +108,7 @@ defining 3D vertices and the edges that connect them.
 **Example: `tetrahedron.wrfm`**
 
 ```text
-wrfm 1
+wrfm 2
 vertices 4   edges 6
 
 # Name: Regular Tetrahedron
@@ -128,3 +128,12 @@ e 3 1
 The authoritative prose specification lives with the library in
 [crates/wrfm/README.md](crates/wrfm/README.md). It covers BOM and whitespace
 rules, the `f64` round-trip guarantee, and the parser's error behaviour.
+
+**Version history.** v2 is the current format. v1 — the format of `wrfm`
+0.4.0 — had no magic line, no counts header and no groups, left edge indices
+unchecked and reported errors as plain strings. v1 files are not read:
+without the magic line they fail as `MissingMagic`, and a file stamped with
+another version fails as `UnsupportedVersion`. To migrate one, prepend
+`wrfm 2` and a `vertices <N>   edges <M>` header with the file's actual
+counts. The [crate README](crates/wrfm/README.md#format-versions) tabulates
+every difference.

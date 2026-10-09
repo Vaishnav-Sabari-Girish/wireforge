@@ -15,7 +15,7 @@ use std::io::Read;
 use wrfm::WrfmModel;
 
 /// Convert the model read from `source` (`<path>`, or `-` for stdin) to
-/// `.wrfm` — v1's only direction (obj -> wrfm).
+/// `.wrfm` — v2's only direction (obj -> wrfm).
 pub fn convert(source: &str) -> Result<WrfmModel, String> {
     let text = read_source(source)?;
     // Strip a UTF-8 BOM: a BOM before the first record must not hide it
@@ -60,7 +60,7 @@ fn read_source(source: &str) -> Result<String, String> {
     std::fs::read_to_string(source).map_err(|e| format!("cannot read '{source}': {e}"))
 }
 
-/// Parse the supported OBJ subset into a v1 model: `v` appends a vertex,
+/// Parse the supported OBJ subset into a v2 model: `v` appends a vertex,
 /// `f` appends the ring of edges around each face, `l` appends its chain
 /// (both into one deduplicating set); every other record is skipped rather
 /// than guessed at — groups are never invented. Vertex references resolve
@@ -305,7 +305,7 @@ f 1 2 3
     #[test]
     fn detection_rejects_wrfm_and_garbage() {
         // An already-converted model is not OBJ input.
-        let err = detect_obj("wrfm 1\nvertices 0   edges 0\n").expect_err("wrfm is not OBJ");
+        let err = detect_obj("wrfm 2\nvertices 0   edges 0\n").expect_err("wrfm is not OBJ");
         assert!(err.contains("already .wrfm"), "{err}");
         // No OBJ geometry at all: never a silent empty model.
         let err = detect_obj("# just a comment\nmtllib scene.mtl\n").expect_err("no geometry");
@@ -329,8 +329,8 @@ f 1 2 3
     fn output_reparses_as_canonical_wrfm() {
         let text = obj_to_wrfm(TRI).expect("parses").to_string();
         assert!(
-            text.starts_with("wrfm 1\nvertices 3   edges 3\n"),
-            "canonical v1 header, got: {text}"
+            text.starts_with("wrfm 2\nvertices 3   edges 3\n"),
+            "canonical v2 header, got: {text}"
         );
         let back = WrfmModel::from_str("roundtrip", &text).expect("own output parses");
         assert_eq!(back.vertices.len(), 3);

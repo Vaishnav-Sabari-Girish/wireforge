@@ -4,7 +4,7 @@
 Drives the REAL TUI binary and verifies the PLAN-cli-stream §6 stream-input
 contract:
 
-  1. `stdin_opens_wrfm`        — pipe a v1 wrfm model into `wireforge -`
+  1. `stdin_opens_wrfm`        — pipe a v2 wrfm model into `wireforge -`
      (stdin is a pipe with EOF): it renders, and Row 0 shows the model name
      "stdin" (ratatui skips spaces in the captured stream, so the needle is
      space-free).

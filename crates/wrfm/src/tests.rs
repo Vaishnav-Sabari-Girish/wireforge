@@ -4,7 +4,7 @@ use alloc::string::{String, ToString};
 use super::*;
 
 const CUBE: &str = "\
-wrfm 1
+wrfm 2
 vertices 8 edges 12
 
 v -1.000000 -1.000000 -1.000000
@@ -30,26 +30,26 @@ e 2 6
 e 3 7
 ";
 
-/// Wrap `body` in a v1 magic line + counts header so tests stay focused.
-fn v1(vertices: usize, edges: usize, body: &str) -> String {
-    format!("wrfm 1\nvertices {vertices}   edges {edges}\n\n{body}")
+/// Wrap `body` in a v2 magic line + counts header so tests stay focused.
+fn v2(vertices: usize, edges: usize, body: &str) -> String {
+    format!("wrfm 2\nvertices {vertices}   edges {edges}\n\n{body}")
 }
 
 #[test]
 fn parses_valid_model() {
     let model = WrfmModel::from_str("cube", CUBE).expect("cube parses");
     assert_eq!(model.name, "cube");
-    assert_eq!(model.version, 1);
+    assert_eq!(model.version, 2);
     assert_eq!(model.vertices.len(), 8);
     assert_eq!(model.edges.len(), 12);
     assert!(model.groups.is_empty());
 }
 
 #[test]
-fn empty_v1_model_ok() {
-    let model = WrfmModel::from_str("m", "wrfm 1\nvertices 0   edges 0\n")
-        .expect("the empty v1 model parses");
-    assert_eq!(model.version, 1);
+fn empty_v2_model_ok() {
+    let model = WrfmModel::from_str("m", "wrfm 2\nvertices 0   edges 0\n")
+        .expect("the empty v2 model parses");
+    assert_eq!(model.version, 2);
     assert_eq!(model.vertices.len(), 0);
     assert_eq!(model.edges.len(), 0);
     assert!(model.groups.is_empty());
@@ -76,7 +76,7 @@ fn comment_first_is_missing_magic() {
 fn comment_after_magic_is_ok() {
     let model = WrfmModel::from_str(
         "m",
-        "wrfm 1\nvertices 2   edges 1\n\n# hi\nv 0 0 0\nv 1 1 1\n\ne 0 1\n",
+        "wrfm 2\nvertices 2   edges 1\n\n# hi\nv 0 0 0\nv 1 1 1\n\ne 0 1\n",
     )
     .expect("comments after the header are fine");
     assert_eq!(model.vertices.len(), 2);
@@ -87,10 +87,10 @@ fn comment_after_magic_is_ok() {
 fn bom_before_magic_ok() {
     let model = WrfmModel::from_str(
         "m",
-        "\u{feff}wrfm 1\nvertices 2   edges 1\n\nv 0 0 0\nv 1 1 1\ne 0 1\n",
+        "\u{feff}wrfm 2\nvertices 2   edges 1\n\nv 0 0 0\nv 1 1 1\ne 0 1\n",
     )
     .expect("BOM before the magic is stripped");
-    assert_eq!(model.version, 1);
+    assert_eq!(model.version, 2);
     assert_eq!(model.vertices.len(), 2);
     assert_eq!(model.edges.len(), 1);
 }
@@ -99,7 +99,7 @@ fn bom_before_magic_ok() {
 fn crlf_lines_parse() {
     let model = WrfmModel::from_str(
         "m",
-        "wrfm 1\r\nvertices 2   edges 1\r\n\r\nv 0 0 0\r\nv 1 1 1\r\n\ne 0 1\r\n",
+        "wrfm 2\r\nvertices 2   edges 1\r\n\r\nv 0 0 0\r\nv 1 1 1\r\n\ne 0 1\r\n",
     )
     .expect("CRLF lines parse");
     assert_eq!(model.vertices.len(), 2);
@@ -117,7 +117,7 @@ fn magic_required_line_one() {
 fn magic_after_comment_rejected() {
     let err = WrfmModel::from_str(
         "m",
-        "# hi\nwrfm 1\nvertices 2   edges 1\n\nv 0 0 0\nv 1 1 1\ne 0 1\n",
+        "# hi\nwrfm 2\nvertices 2   edges 1\n\nv 0 0 0\nv 1 1 1\ne 0 1\n",
     )
     .expect_err("the magic must be the very first line");
     assert!(matches!(err, ParseError::MissingMagic { .. }));
@@ -125,10 +125,10 @@ fn magic_after_comment_rejected() {
 
 #[test]
 fn unsupported_version() {
-    let err = WrfmModel::from_str("m", "wrfm 2\nvertices 0   edges 0\n")
-        .expect_err("version 2 is not supported");
+    let err = WrfmModel::from_str("m", "wrfm 3\nvertices 0   edges 0\n")
+        .expect_err("version 3 is not supported");
     match err {
-        ParseError::UnsupportedVersion { version, .. } => assert_eq!(version, 2),
+        ParseError::UnsupportedVersion { version, .. } => assert_eq!(version, 3),
         other => panic!("unexpected error: {other:?}"),
     }
 }
@@ -146,7 +146,7 @@ fn malformed_magic() {
 
 #[test]
 fn header_required() {
-    let err = WrfmModel::from_str("m", "wrfm 1\nv 0 0 0\n")
+    let err = WrfmModel::from_str("m", "wrfm 2\nv 0 0 0\n")
         .expect_err("a vertex before the header is an error");
     assert!(matches!(err, ParseError::MissingHeader { line: 2, .. }));
 }
@@ -154,17 +154,17 @@ fn header_required() {
 #[test]
 fn malformed_header() {
     // Incomplete: `vertices 4` only.
-    let err = WrfmModel::from_str("m", "wrfm 1\nvertices 4\n")
+    let err = WrfmModel::from_str("m", "wrfm 2\nvertices 4\n")
         .expect_err("an incomplete header is malformed");
     assert!(matches!(err, ParseError::MalformedHeader { .. }));
 
     // Non-integer edge count.
-    let err = WrfmModel::from_str("m", "wrfm 1\nvertices 4 edges x\n")
+    let err = WrfmModel::from_str("m", "wrfm 2\nvertices 4 edges x\n")
         .expect_err("a non-integer edge count is malformed");
     assert!(matches!(err, ParseError::MalformedHeader { .. }));
 
     // Typo (`edge` instead of `edges`).
-    let err = WrfmModel::from_str("m", "wrfm 1\nvertices 4 edge 4\n")
+    let err = WrfmModel::from_str("m", "wrfm 2\nvertices 4 edge 4\n")
         .expect_err("a header typo is malformed");
     assert!(matches!(err, ParseError::MalformedHeader { .. }));
 }
@@ -173,7 +173,7 @@ fn malformed_header() {
 fn header_with_trailing_comment_ok() {
     let model = WrfmModel::from_str(
         "m",
-        "wrfm 1\nvertices 2   edges 1 # authored by hand\n\nv 0 0 0\nv 1 1 1\ne 0 1\n",
+        "wrfm 2\nvertices 2   edges 1 # authored by hand\n\nv 0 0 0\nv 1 1 1\ne 0 1\n",
     )
     .expect("a trailing header comment is ignored");
     assert_eq!(model.vertices.len(), 2);
@@ -182,7 +182,7 @@ fn header_with_trailing_comment_ok() {
 
 #[test]
 fn count_mismatch_vertices() {
-    let err = WrfmModel::from_str("m", &v1(5, 0, "v 0 0 0\nv 1 1 1\nv 2 2 2\nv 3 3 3\n"))
+    let err = WrfmModel::from_str("m", &v2(5, 0, "v 0 0 0\nv 1 1 1\nv 2 2 2\nv 3 3 3\n"))
         .expect_err("fewer vertices than declared");
     match err {
         ParseError::CountMismatch {
@@ -202,7 +202,7 @@ fn count_mismatch_vertices() {
 
 #[test]
 fn count_mismatch_edges() {
-    let err = WrfmModel::from_str("m", &v1(0, 3, "e 0 1\ne 1 2\ne 2 3\ne 3 4\n"))
+    let err = WrfmModel::from_str("m", &v2(0, 3, "e 0 1\ne 1 2\ne 2 3\ne 3 4\n"))
         .expect_err("more edges than declared");
     match err {
         ParseError::CountMismatch {
@@ -222,7 +222,7 @@ fn count_mismatch_edges() {
 fn groups_recorded() {
     let model = WrfmModel::from_str(
             "m",
- &v1(
+ &v2(
  4,
  3,
                 "group body\n  v 0 0 0\n  v 1 0 0\n  v 1 1 0\n  e 0 1\n  e 1 2\ngroup head\n  v 0.5 2 0.25\n  e 2 3\n",
@@ -249,20 +249,20 @@ fn groups_recorded() {
 
 #[test]
 fn group_no_name() {
-    let err = WrfmModel::from_str("m", &v1(0, 0, "group\n"))
+    let err = WrfmModel::from_str("m", &v2(0, 0, "group\n"))
         .expect_err("a group without a name is an error");
     assert!(matches!(err, ParseError::MissingGroupName { .. }));
 }
 
 #[test]
 fn group_optional() {
-    let model = WrfmModel::from_str("m", &v1(1, 0, "v 0 0 0\n")).expect("groups are optional");
+    let model = WrfmModel::from_str("m", &v2(1, 0, "v 0 0 0\n")).expect("groups are optional");
     assert!(model.groups.is_empty());
 }
 
 #[test]
 fn empty_group_not_recorded() {
-    let model = WrfmModel::from_str("m", &v1(1, 0, "group empty\ngroup body\n  v 0 0 0\n"))
+    let model = WrfmModel::from_str("m", &v2(1, 0, "group empty\ngroup body\n  v 0 0 0\n"))
         .expect("an empty group is allowed and not recorded");
     assert_eq!(
         model.groups,
@@ -276,7 +276,7 @@ fn empty_group_not_recorded() {
 
 #[test]
 fn unnamed_vertices_before_first_group() {
-    let model = WrfmModel::from_str("m", &v1(3, 0, "v 9 9 9\ngroup body\n v 0 0 0\n v 1 1 1\n"))
+    let model = WrfmModel::from_str("m", &v2(3, 0, "v 9 9 9\ngroup body\n v 0 0 0\n v 1 1 1\n"))
         .expect("vertices before the first group are unnamed");
     assert_eq!(
         model.groups,
@@ -292,7 +292,7 @@ fn unnamed_vertices_before_first_group() {
 fn forward_ref_across_groups() {
     let model = WrfmModel::from_str(
         "m",
-        &v1(2, 1, "group a\n  v 0 0 0\ngroup b\n  v 1 1 1\n  e 0 1\n"),
+        &v2(2, 1, "group a\n  v 0 0 0\ngroup b\n  v 1 1 1\n  e 0 1\n"),
     )
     .expect("an edge in group B may reference a vertex in group A");
     assert_eq!(model.edges, vec![(0, 1)]);
@@ -301,7 +301,7 @@ fn forward_ref_across_groups() {
 
 #[test]
 fn v_alone_reports_missing_x() {
-    let err = WrfmModel::from_str("m", &v1(1, 0, "v\n")).expect_err("a bare v is an error");
+    let err = WrfmModel::from_str("m", &v2(1, 0, "v\n")).expect_err("a bare v is an error");
     match err {
         ParseError::InvalidVertex {
             detail: VertexError::MissingCoordinate { axis },
@@ -313,7 +313,7 @@ fn v_alone_reports_missing_x() {
 
 #[test]
 fn missing_y_reports_line_column() {
-    let err = WrfmModel::from_str("m", &v1(1, 0, "v 1.0\n")).expect_err("missing y is an error");
+    let err = WrfmModel::from_str("m", &v2(1, 0, "v 1.0\n")).expect_err("missing y is an error");
     match err {
         ParseError::InvalidVertex {
             line,
@@ -332,7 +332,7 @@ fn missing_y_reports_line_column() {
 fn missing_z_reports_line_column() {
     // Blank lines after the header are ignored.
     let err =
-        WrfmModel::from_str("m", &v1(1, 0, "\n\nv 1.0 2.0\n")).expect_err("missing z is an error");
+        WrfmModel::from_str("m", &v2(1, 0, "\n\nv 1.0 2.0\n")).expect_err("missing z is an error");
     match err {
         ParseError::InvalidVertex {
             line,
@@ -350,7 +350,7 @@ fn missing_z_reports_line_column() {
 #[test]
 fn not_a_number_reports_token() {
     let err =
-        WrfmModel::from_str("m", &v1(1, 0, "v 1.0 2.0 abc\n")).expect_err("abc is not a number");
+        WrfmModel::from_str("m", &v2(1, 0, "v 1.0 2.0 abc\n")).expect_err("abc is not a number");
     match err {
         ParseError::InvalidVertex {
             column,
@@ -368,7 +368,7 @@ fn not_a_number_reports_token() {
 #[test]
 fn not_a_number_in_y() {
     let err =
-        WrfmModel::from_str("m", &v1(1, 0, "v 1.0 abc 3.0\n")).expect_err("abc is not a number");
+        WrfmModel::from_str("m", &v2(1, 0, "v 1.0 abc 3.0\n")).expect_err("abc is not a number");
     match err {
         ParseError::InvalidVertex {
             detail: VertexError::NotANumber { token, axis },
@@ -384,14 +384,14 @@ fn not_a_number_in_y() {
 #[test]
 fn extra_values_ignored() {
     let model =
-        WrfmModel::from_str("m", &v1(1, 0, "v 1 2 3 4 5\n")).expect("extra values are ignored");
+        WrfmModel::from_str("m", &v2(1, 0, "v 1 2 3 4 5\n")).expect("extra values are ignored");
     assert_eq!(model.vertices.len(), 1);
     assert_eq!(model.vertices[0], (1.0, 2.0, 3.0));
 }
 
 #[test]
 fn edge_missing_first_index() {
-    let err = WrfmModel::from_str("m", &v1(1, 1, "v 0 0 0\n\ne\n"))
+    let err = WrfmModel::from_str("m", &v2(1, 1, "v 0 0 0\n\ne\n"))
         .expect_err("missing index is an error");
     match err {
         ParseError::InvalidEdge {
@@ -409,7 +409,7 @@ fn edge_missing_first_index() {
 
 #[test]
 fn edge_missing_second_index() {
-    let err = WrfmModel::from_str("m", &v1(2, 1, "v 0 0 0\nv 1 1 1\ne 0\n"))
+    let err = WrfmModel::from_str("m", &v2(2, 1, "v 0 0 0\nv 1 1 1\ne 0\n"))
         .expect_err("missing second index is an error");
     match err {
         ParseError::InvalidEdge {
@@ -422,7 +422,7 @@ fn edge_missing_second_index() {
 
 #[test]
 fn edge_not_an_index() {
-    let err = WrfmModel::from_str("m", &v1(2, 1, "v 0 0 0\nv 1 1 1\ne a b\n"))
+    let err = WrfmModel::from_str("m", &v2(2, 1, "v 0 0 0\nv 1 1 1\ne a b\n"))
         .expect_err("letters are not indices");
     match err {
         ParseError::InvalidEdge {
@@ -438,7 +438,7 @@ fn edge_not_an_index() {
 
 #[test]
 fn edge_negative_index() {
-    let err = WrfmModel::from_str("m", &v1(2, 1, "v 0 0 0\nv 1 1 1\ne 0 -1\n"))
+    let err = WrfmModel::from_str("m", &v2(2, 1, "v 0 0 0\nv 1 1 1\ne 0 -1\n"))
         .expect_err("negative index is an error");
     match err {
         ParseError::InvalidEdge {
@@ -454,7 +454,7 @@ fn edge_negative_index() {
 
 #[test]
 fn edge_out_of_range() {
-    let err = WrfmModel::from_str("m", &v1(2, 1, "v 0 0 0\nv 1 1 1\ne 0 5\n"))
+    let err = WrfmModel::from_str("m", &v2(2, 1, "v 0 0 0\nv 1 1 1\ne 0 5\n"))
         .expect_err("out of range index is an error");
     match err {
         ParseError::InvalidEdge {
@@ -475,7 +475,7 @@ fn edge_out_of_range() {
 
 #[test]
 fn edge_out_of_range_first() {
-    let err = WrfmModel::from_str("m", &v1(2, 1, "v 0 0 0\nv 1 1 1\ne 5 0\n"))
+    let err = WrfmModel::from_str("m", &v2(2, 1, "v 0 0 0\nv 1 1 1\ne 5 0\n"))
         .expect_err("out of range first index is an error");
     match err {
         ParseError::InvalidEdge {
@@ -496,7 +496,7 @@ fn edge_out_of_range_first() {
 
 #[test]
 fn forward_reference_is_ok() {
-    let model = WrfmModel::from_str("m", &v1(2, 1, "v 0 0 0\nv 1 1 1\ne 0 1\n"))
+    let model = WrfmModel::from_str("m", &v2(2, 1, "v 0 0 0\nv 1 1 1\ne 0 1\n"))
         .expect("edges referencing defined vertices parse");
     assert_eq!(model.vertices.len(), 2);
     assert_eq!(model.edges.len(), 1);
@@ -505,14 +505,14 @@ fn forward_reference_is_ok() {
 #[test]
 fn unknown_line_skipped() {
     let model =
-        WrfmModel::from_str("m", &v1(1, 0, "garbage x\nv 0 0 0\n")).expect("unknown line skipped");
+        WrfmModel::from_str("m", &v2(1, 0, "garbage x\nv 0 0 0\n")).expect("unknown line skipped");
     assert_eq!(model.vertices.len(), 1);
 }
 
 #[test]
 fn display_shows_rustc_style() {
     let err =
-        WrfmModel::from_str("m", &v1(1, 0, "v 1.0 2.0 abc\n")).expect_err("abc is not a number");
+        WrfmModel::from_str("m", &v2(1, 0, "v 1.0 2.0 abc\n")).expect_err("abc is not a number");
     let rendered = format!("{err}");
     assert!(
         rendered.contains("error: invalid vertex at line 4, column 11"),
@@ -544,7 +544,7 @@ fn display_shows_rustc_style_for_magic() {
 #[test]
 fn line_and_column_accessors() {
     let err =
-        WrfmModel::from_str("m", &v1(1, 0, "\nv 1.0 2.0 abc\n")).expect_err("abc is not a number");
+        WrfmModel::from_str("m", &v2(1, 0, "\nv 1.0 2.0 abc\n")).expect_err("abc is not a number");
     match &err {
         ParseError::InvalidVertex { line, column, .. } => {
             assert_eq!(err.line(), *line);
@@ -572,7 +572,7 @@ fn roundtrip_exact() {
     let back = WrfmModel::from_file(&path).unwrap();
     assert_eq!(back.vertices, model.vertices); // bit-identical f64s
     assert_eq!(back.groups, model.groups);
-    assert_eq!(back.version, 1);
+    assert_eq!(back.version, 2);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -590,7 +590,7 @@ fn shortest_roundtrip_serialized() {
 }
 
 #[test]
-fn saved_file_is_canonical_v1() {
+fn saved_file_is_canonical_v2() {
     let mut model = WrfmModel::new("cube");
     model.vertices.push((0.0, 0.0, 0.0));
 
@@ -599,7 +599,7 @@ fn saved_file_is_canonical_v1() {
     model.save_to_file(&path).unwrap();
     let content = std::fs::read_to_string(&path).unwrap();
     assert!(
-        content.starts_with("wrfm 1\nvertices 1   edges 0\n"),
+        content.starts_with("wrfm 2\nvertices 1   edges 0\n"),
         "{content}"
     );
     assert!(

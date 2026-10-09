@@ -20,7 +20,7 @@ repository = "https://github.com/lenitain/wireforge"
 clap = { version = "4.6.1", features = ["derive"] }
 ratatui = { version = "0.30.1", default-features = false }
 ratatui-wireframe = "0.7.0"
-wrfm = { version = "0.4.0", path = "crates/wrfm" }
+wrfm = { version = "0.5.0", path = "crates/wrfm" }
 wrfm-raster = { path = "crates/wrfm-raster" }
 
 # ratatui-wireframe hard-depends on crates.io's wrfm 0.4.0, which would put a

@@ -6,7 +6,7 @@ use wrfm::WrfmModel;
 pub struct Loaded {
     pub model: Model,
     pub name: String,
-    /// Format version from the magic line (`1` for v1).
+    /// Format version from the magic line (`2` for v2).
     pub version: u32,
     /// Named sections over the global vertex list.
     pub groups: Vec<wrfm::Group>,
@@ -70,7 +70,7 @@ fn render_load_error(source: &str, e: &wrfm::LoadError) -> String {
     }
 }
 
-/// Serialize a geometry `Model` back to canonical `.wrfm` v1 TEXT (magic + counts header + groups + edges).
+/// Serialize a geometry `Model` back to canonical `.wrfm` v2 TEXT (magic + counts header + groups + edges).
 pub fn serialize_model(m: &Model, name: &str, groups: &[wrfm::Group], version: u32) -> String {
     let mut raw = WrfmModel::new(name);
     raw.vertices = m.vertices.clone();
