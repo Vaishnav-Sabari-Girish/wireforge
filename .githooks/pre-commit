@@ -7,14 +7,9 @@ cd "$(git rev-parse --show-toplevel)"
 echo "Checking for typos..."
 typos
 
-echo "Formatting Rust code (per crate)..."
-# Each crate is an independent Cargo project (no workspace), so we run
-# `cargo fmt` separately in each crate directory.
-for crate in . crates/wrfm crates/wrfm-cli; do
-  if [ -f "$crate/Cargo.toml" ]; then
-    (cd "$crate" && cargo fmt)
-  fi
-done
+echo "Formatting Rust code..."
+# The repo is a cargo workspace; `cargo fmt` at the root covers every member.
+cargo fmt --all
 
 # Get staged Rust files and re-stage them so the formatting is included in the commit
 RUST_FILES=$(git diff --cached --name-only --diff-filter=ACM | grep '\.rs$' || true)
@@ -22,14 +17,8 @@ if [ -n "$RUST_FILES" ]; then
   echo "$RUST_FILES" | tr '\n' '\0' | xargs -0 -r git add
 fi
 
-echo "Running Clippy (per crate)..."
-# Each crate is an independent Cargo project (no workspace), so we run clippy
-# separately in each crate directory.
-for crate in . crates/wrfm crates/wrfm-cli; do
-  if [ -f "$crate/Cargo.toml" ]; then
-    (cd "$crate" && cargo clippy --all-targets --all-features -- -D warnings)
-  fi
-done
+echo "Running Clippy (all workspace members)..."
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 echo "Fixing all markdown files..."
 # 1. Find every .md file, explicitly IGNORING the target/ and .git/ folders.
