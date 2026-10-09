@@ -41,6 +41,11 @@
 - **(input)** Regressions from the kitty keyboard protocol (41ab1c4)
 
 
+### :zap: Performance
+
+- Build binary with radical options
+
+
 ### :recycle: Refactoring
 
 - Own the model type and drop ratatui-wireframe
