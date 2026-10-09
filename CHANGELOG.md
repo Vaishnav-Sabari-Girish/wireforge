@@ -76,4 +76,4 @@
 
 - **(publish)** Add LICENSE and details in Cargo.toml
 
-<!-- ComChan -->
+<!-- wireforge -->

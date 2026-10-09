@@ -24,4 +24,4 @@
 
 - **(streams)** read-only, streaming: every command accepts `-` for stdin
 
-<!-- ComChan -->
+<!-- wireforge -->

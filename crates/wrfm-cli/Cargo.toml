@@ -6,6 +6,8 @@ description = "Command-line tool for .wrfm 3D wireframe models over streams"
 readme = "README.md"
 license = "MIT"
 authors = ["lenitain <xt.zhu@qq.com>"]
+homepage = "https://github.com/lenitain/wireforge"
+repository = "https://github.com/lenitain/wireforge"
 keywords = ["wrfm", "3d", "wireframe", "cli"]
 categories = ["command-line-utilities", "development-tools"]
 

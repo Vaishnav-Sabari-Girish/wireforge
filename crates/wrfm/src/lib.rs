@@ -1864,7 +1864,7 @@ e 3 7
             "{content}"
         );
         assert!(
-            !content.contains("ComChan"),
+            !content.contains("wireforge"),
             "legacy comment dropped: {content}"
         );
         assert!(

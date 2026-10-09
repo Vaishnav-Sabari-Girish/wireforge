@@ -22,7 +22,7 @@ cargo install wireforge
 ### Build from source
 
 ```bash
-git clone https://github.com/Vaishnav-Sabari-Girish/wireforge.git
+git clone https://github.com/lenitain/wireforge.git
 cd wireforge
 cargo build --release
 ```

@@ -2,12 +2,12 @@
 name = "wireforge"
 version = "0.7.0"
 edition = "2024"
-description = "TUI based editor and viewer for .wrfm files for braille-based 3D wireframes"
-readme = "README.md"
-authors = ["Vaishnav Sabari Girish <vaishnav.sabari.girish@gmail.com>"]
 license = "MIT"
-homepage = "https://github.com/Vaishnav-Sabari-Girish/wireforge"
-repository = "https://github.com/Vaishnav-Sabari-Girish/wireforge"
+description = "TUI based viewer for braille-based 3D wireframes"
+readme = "README.md"
+authors = ["lenitain <xt.zhu@qq.com>"]
+homepage = "https://github.com/lenitain/wireforge"
+repository = "https://github.com/lenitain/wireforge"
 keywords = ["cli", "tui", "file"]
 categories = ["command-line-utilities"]
 
