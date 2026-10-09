@@ -1,5 +1,7 @@
 # Wireforge
 
+[![Crates.io](https://img.shields.io/crates/v/wireforge)](https://crates.io/crates/wireforge)
+
 A text format, a parser, a Unix-style CLI, and a terminal viewer.
 
 ![Wireforge viewing a braille-rendered Utah teapot](assets/wireforge.png)
