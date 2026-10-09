@@ -30,4 +30,4 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Lint with clippy
-        run: cargo clippy --all-features -- -D warnings
+        run: cargo clippy --workspace --all-features -- -D warnings

@@ -1,6 +1,7 @@
-use crate::render::world_rot;
 use ratatui_wireframe::model::Model;
 use serde_json::{Value, json};
+use wrfm_raster::geometry::world_rot;
+use wrfm_raster::projection::{Camera, Projected};
 
 /// Camera / projection parameters for a `wrfm_view` call.
 pub struct ViewParams {
@@ -14,41 +15,19 @@ pub struct ViewParams {
     pub pan_y: f64,
 }
 
-/// Projected vertex: screen coords (relative units, +y up) + camera depth.
-struct Proj {
-    px: f64,
-    py: f64,
-    /// Distance from the camera plane along -Z (SMALL = closer).
-    depth: f64,
-}
-
 /// Project every vertex with the fork's world-frame math (rotate, pan, roll, focal divide).
-fn project(m: &Model, p: &ViewParams) -> Vec<Option<Proj>> {
-    let rot = world_rot(p.pitch_deg, p.yaw_deg);
-    let f = 100.0;
-    let (sr, cr) = p.roll_deg.to_radians().sin_cos();
+fn project(m: &Model, p: &ViewParams) -> Vec<Option<Projected>> {
+    let cam = Camera::new(
+        world_rot(p.pitch_deg, p.yaw_deg),
+        p.dist,
+        p.roll_deg.to_radians(),
+        p.pan_x,
+        p.pan_y,
+    );
+    // The analysis path uses a fixed focal scale of 100 (relative units).
     m.vertices
         .iter()
-        .map(|&(x, y, z)| {
-            // v' = R * v + pan (rotate around the file origin, then
-            // translate), so the rotation centre is always the (panned)
-            // origin — the fork's project_point exactly.
-            let rx = rot[0][0] * x + rot[0][1] * y + rot[0][2] * z + p.pan_x;
-            let ry = rot[1][0] * x + rot[1][1] * y + rot[1][2] * z + p.pan_y;
-            let rz = rot[2][0] * x + rot[2][1] * y + rot[2][2] * z;
-            let depth = p.dist - rz;
-            if depth <= 0.1 {
-                return None;
-            }
-            // Roll around the view axis through the (panned) pivot (fork).
-            let (dx, dy) = (rx - p.pan_x, ry - p.pan_y);
-            let (rxr, ryr) = (p.pan_x + dx * cr - dy * sr, p.pan_y + dx * sr + dy * cr);
-            Some(Proj {
-                px: f * rxr / depth,
-                py: f * ryr / depth,
-                depth,
-            })
-        })
+        .map(|&v| cam.project_full(v, 100.0))
         .collect()
 }
 
@@ -70,7 +49,12 @@ struct ScreenGrid {
 
 impl ScreenGrid {
     /// Sample an edge every `step` screen units, calling `f` with the grid cell (and its interpolated depth) each sample lands in.
-    fn for_each_sample(&self, p1: &Proj, p2: &Proj, mut f: impl FnMut(usize, usize, f64)) {
+    fn for_each_sample(
+        &self,
+        p1: &Projected,
+        p2: &Projected,
+        mut f: impl FnMut(usize, usize, f64),
+    ) {
         let (dx, dy) = (p2.px - p1.px, p2.py - p1.py);
         let len = (dx * dx + dy * dy).sqrt();
         let n = ((len / self.step).ceil() as usize).max(1);

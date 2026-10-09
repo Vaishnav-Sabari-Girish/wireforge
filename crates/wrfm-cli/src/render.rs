@@ -1,74 +1,12 @@
-use ratatui::{
-    buffer::Buffer,
-    layout::Rect,
-    prelude::Widget,
-    style::Color,
-    symbols,
-    widgets::canvas::{Canvas, Line},
-};
 use ratatui_wireframe::model::Model;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use wrfm_raster::geometry::{auto_dist, bounds, world_rot};
+use wrfm_raster::projection::{Camera, focal};
+use wrfm_raster::raster::{Bounds, dots_to_lines, rasterize_line};
 
-/// Vertical field of view in degrees — the wireforge fork's projection.
-pub const FOV_DEG: f64 = 60.0;
-/// Auto-fit headroom: the model fills 1/FIT_MARGIN of the screen height.
-pub const FIT_MARGIN: f64 = 2.0;
 /// Camera distance used when `auto_dist=false` — the fork's default distance (no auto camera distance).
 pub const DEFAULT_DIST: f64 = 8.0;
-
-/// A 3x3 row-major rotation matrix (model -> world), matching the fork.
-pub(crate) type Mat3 = [[f64; 3]; 3];
-
-/// Multiply two 3x3 matrices.
-pub(crate) fn mat_mul(a: Mat3, b: Mat3) -> Mat3 {
-    let mut c = [[0.0; 3]; 3];
-    for i in 0..3 {
-        for j in 0..3 {
-            c[i][j] = a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j];
-        }
-    }
-    c
-}
-
-/// Rotation around the world X axis (positive angle tips +Y toward +Z).
-pub(crate) fn rot_x(a: f64) -> Mat3 {
-    let (s, c) = a.sin_cos();
-    [[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]]
-}
-
-/// Rotation around the world Y axis (positive angle turns +Z toward +X).
-pub(crate) fn rot_y(a: f64) -> Mat3 {
-    let (s, c) = a.sin_cos();
-    [[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]]
-}
-
-/// Rotation around the world Z axis (positive angle turns +X toward +Y).
-pub(crate) fn rot_z(a: f64) -> Mat3 {
-    let (s, c) = a.sin_cos();
-    [[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]]
-}
-
-/// Rotation around an ARBITRARY axis by Rodrigues' formula: `v' = v·cosθ + (k×v)·sinθ + k(k·v)(1−cosθ)` with k the normalized axis.
-pub(crate) fn rot_axis(axis: [f64; 3], angle_deg: f64) -> Mat3 {
-    let norm = (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]).sqrt();
-    if norm < f64::EPSILON {
-        return [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-    }
-    let (kx, ky, kz) = (axis[0] / norm, axis[1] / norm, axis[2] / norm);
-    let (s, c) = angle_deg.to_radians().sin_cos();
-    let t = 1.0 - c;
-    [
-        [c + kx * kx * t, kx * ky * t - kz * s, kx * kz * t + ky * s],
-        [ky * kx * t + kz * s, c + ky * ky * t, ky * kz * t - kx * s],
-        [kz * kx * t - ky * s, kz * ky * t + kx * s, c + kz * kz * t],
-    ]
-}
-
-/// World-frame model rotation for absolute (pitch, yaw): the model is first pitched around the world X axis, then yawed around the world vertical axis. The yaw sign follows wireforge's global convention (post-unification): positive yaw turns the object's nose to its own left, so `--yaw 90` shows the object's right side.
-pub(crate) fn world_rot(pitch_deg: f64, yaw_deg: f64) -> Mat3 {
-    mat_mul(rot_y(yaw_deg.to_radians()), rot_x(pitch_deg.to_radians()))
-}
 
 /// Output format for a rendered frame.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -350,70 +288,6 @@ pub(crate) fn submodel_for_group(m: &Model, g: &wrfm::Group) -> Model {
     }
 }
 
-/// Bounding box of the model: `(min, max)` corners.
-pub fn bounds(m: &Model) -> ([f64; 3], [f64; 3]) {
-    let mut min = [f64::INFINITY; 3];
-    let mut max = [f64::NEG_INFINITY; 3];
-    for &(x, y, z) in &m.vertices {
-        min[0] = min[0].min(x);
-        min[1] = min[1].min(y);
-        min[2] = min[2].min(z);
-        max[0] = max[0].max(x);
-        max[1] = max[1].max(y);
-        max[2] = max[2].max(z);
-    }
-    (min, max)
-}
-
-/// The model's comprehensive length (the fork's `model_extent`): the geometric mean of the three bounding-box dimensions, i.e. (dx * dy * dz)^(1/3).
-pub fn model_extent(m: &Model) -> f64 {
-    let (min, max) = bounds(m);
-    let (dx, dy, dz) = (
-        (max[0] - min[0]).max(1e-9),
-        (max[1] - min[1]).max(1e-9),
-        (max[2] - min[2]).max(1e-9),
-    );
-    (dx * dy * dz).cbrt()
-}
-
-/// Auto camera distance (the fork's `fit_to` math): the geometric-mean extent fills 1/FIT_MARGIN of the screen half-height.
-pub fn auto_dist(m: &Model) -> f64 {
-    let r = model_extent(m).max(1e-6);
-    r / (FOV_DEG / 2.0).to_radians().tan() * FIT_MARGIN
-}
-
-/// Project one model-space vertex to canvas pixel coordinates (origin at the view centre, +x right, +y up) using the fork's projection: world-frame rotation and pan, camera distance, roll about the pivot, then the focal-length divide.
-#[allow(clippy::too_many_arguments)] // mirrors the fork's project_point signature
-pub(crate) fn project_vertex(
-    p: (f64, f64, f64),
-    rot: &Mat3,
-    dist: f64,
-    f: f64,
-    pan_x: f64,
-    pan_y: f64,
-    sr: f64,
-    cr: f64,
-) -> Option<(f64, f64)> {
-    // v' = R * v + pan: rotate around the file origin, then translate, so
-    // the rotation centre is always the (panned) origin — the fork's
-    // project_point exactly.
-    let rx = rot[0][0] * p.0 + rot[0][1] * p.1 + rot[0][2] * p.2 + pan_x;
-    let ry = rot[1][0] * p.0 + rot[1][1] * p.1 + rot[1][2] * p.2 + pan_y;
-    let rz = rot[2][0] * p.0 + rot[2][1] * p.1 + rot[2][2] * p.2;
-    // Fixed camera at [0,0,dist] looking down -Z.
-    let z = dist - rz;
-    if z <= 0.1 {
-        return None;
-    }
-    // Roll around the view axis through the (panned) pivot: rotate the
-    // camera-frame (rx, ry) around (pan_x, pan_y) before the divide. At
-    // pan = 0 this reduces to rotating around the screen centre — the
-    // previous (correct-at-pan-0) behaviour.
-    let (dx, dy) = (rx - pan_x, ry - pan_y);
-    let (rxr, ryr) = (pan_x + dx * cr - dy * sr, pan_y + dx * sr + dy * cr);
-    Some((f * rxr / z, f * ryr / z))
-}
-
 /// `--fit content`: the normalized region `(x0, y0, x1, y1)` (0..1 canvas
 /// fractions, y growing downward) that crops this camera's frame to the
 /// projected model content, so the content fills the canvas. Computed with
@@ -432,21 +306,26 @@ pub fn fit_content_region(
 ) -> Option<[f64; 4]> {
     let px_w = opts.width.max(1) as f64 * 2.0;
     let px_h = opts.height.max(1) as f64 * 4.0;
-    let rot = world_rot(pitch_deg, yaw_deg);
     let dist = if opts.auto_dist {
         auto_dist(m)
     } else {
         opts.dist.unwrap_or(DEFAULT_DIST)
     };
-    let f = (px_h / 2.0) / (FOV_DEG / 2.0).to_radians().tan();
-    let (sr, cr) = roll_deg.to_radians().sin_cos();
+    let cam = Camera::new(
+        world_rot(pitch_deg, yaw_deg),
+        dist,
+        roll_deg.to_radians(),
+        opts.pan_x,
+        opts.pan_y,
+    );
+    let f = focal(px_h);
 
     // Projected content bounding box in canvas pixels (origin = centre).
     let (mut minx, mut maxx) = (f64::INFINITY, f64::NEG_INFINITY);
     let (mut miny, mut maxy) = (f64::INFINITY, f64::NEG_INFINITY);
     let mut any = false;
     for &v in &m.vertices {
-        if let Some((x, y)) = project_vertex(v, &rot, dist, f, opts.pan_x, opts.pan_y, sr, cr) {
+        if let Some((x, y)) = cam.project(v, f) {
             minx = minx.min(x);
             maxx = maxx.max(x);
             miny = miny.min(y);
@@ -522,50 +401,39 @@ fn render_braille(m: &Model, g: &GeomParams) -> Vec<String> {
     let x_bounds = [-px_w / 2.0 + x0 * px_w, -px_w / 2.0 + x1 * px_w];
     let y_bounds = [px_h / 2.0 - y1 * px_h, px_h / 2.0 - y0 * px_h];
 
-    // Fork projection parameters: world-frame rotation, camera distance
-    // (auto-fit, or the explicit/default distance), FOV focal length,
-    // projection-time roll and pan offset.
-    let rot = world_rot(g.pitch_deg, g.yaw_deg);
+    // Shared camera: world-frame rotation, camera distance (auto-fit, or
+    // the explicit/default distance), FOV focal length, roll and pan.
     let dist = if g.auto_dist {
         auto_dist(m)
     } else {
         g.dist.unwrap_or(DEFAULT_DIST)
     };
-    let f = (px_h / 2.0) / (FOV_DEG / 2.0).to_radians().tan();
-    let (sr, cr) = g.roll_deg.to_radians().sin_cos();
+    let cam = Camera::new(
+        world_rot(g.pitch_deg, g.yaw_deg),
+        dist,
+        g.roll_deg.to_radians(),
+        g.pan_x,
+        g.pan_y,
+    );
+    let f = focal(px_h);
 
-    let canvas = Canvas::default()
-        .marker(symbols::Marker::Braille)
-        .x_bounds(x_bounds)
-        .y_bounds(y_bounds)
-        .paint(|ctx| {
-            for &(a, b) in &m.edges {
-                if let (Some(p1), Some(p2)) = (
-                    project_vertex(m.vertices[a], &rot, dist, f, g.pan_x, g.pan_y, sr, cr),
-                    project_vertex(m.vertices[b], &rot, dist, f, g.pan_x, g.pan_y, sr, cr),
-                ) {
-                    ctx.draw(&Line {
-                        x1: p1.0,
-                        y1: p1.1,
-                        x2: p2.0,
-                        y2: p2.1,
-                        color: Color::White,
-                    });
-                }
-            }
-        });
+    // Off-screen dot grid: characters x (2, 4) braille dots. A 0 canvas
+    // dimension still allocates one cell (the same `max(1)` area ratatui
+    // derives), while the zero-size WINDOW maps nothing — blank frame.
+    let (cw, ch) = (w.max(1) as usize, h.max(1) as usize);
+    let (dots_w, dots_h) = (cw * 2, ch * 4);
+    let win = Bounds::from_arrays(x_bounds, y_bounds);
 
-    let area = Rect::new(0, 0, w.max(1), h.max(1));
-    let mut buf = Buffer::empty(area);
-    canvas.render(area, &mut buf);
-
-    (0..h.max(1))
-        .map(|y| {
-            (0..w.max(1))
-                .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
-                .collect::<String>()
-        })
-        .collect()
+    let mut dots = vec![0u8; cw * ch];
+    for &(a, b) in &m.edges {
+        if let (Some(p1), Some(p2)) = (cam.project(m.vertices[a], f), cam.project(m.vertices[b], f))
+        {
+            rasterize_line(p1.0, p1.1, p2.0, p2.1, dots_w, dots_h, win, |cell, bit| {
+                dots[cell] |= bit
+            });
+        }
+    }
+    dots_to_lines(&dots, cw, ch)
 }
 
 /// Render `model` and return the frame text for the requested format(s).
@@ -1031,6 +899,7 @@ pub fn diff_to_json(a: &Model, b: &Model, limit: usize) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wrfm_raster::geometry::{FIT_MARGIN, FOV_DEG, model_extent};
 
     fn cube() -> Model {
         let mut verts = Vec::new();
@@ -1277,9 +1146,9 @@ mod tests {
     fn projection_matches_fork_math() {
         // Identity view of the cube front vertex at the fork's default
         // distance: f = (px_h/2)/tan(30deg), z = dist - rz = 8 - 1 = 7.
-        let rot = world_rot(0.0, 0.0);
-        let f = 32.0 / (FOV_DEG / 2.0).to_radians().tan();
-        let p = project_vertex((1.0, 1.0, 1.0), &rot, DEFAULT_DIST, f, 0.0, 0.0, 0.0, 1.0).unwrap();
+        let cam = Camera::new(world_rot(0.0, 0.0), DEFAULT_DIST, 0.0, 0.0, 0.0);
+        let f = focal(64.0);
+        let p = cam.project((1.0, 1.0, 1.0), f).unwrap();
         let expected = f / 7.0;
         assert!(
             (p.0 - expected).abs() < 1e-9 && (p.1 - expected).abs() < 1e-9,
@@ -1288,17 +1157,14 @@ mod tests {
             p.1
         );
         // Points at/behind the camera plane are culled (z <= 0.1).
-        assert!(
-            project_vertex((0.0, 0.0, 8.2), &rot, DEFAULT_DIST, f, 0.0, 0.0, 0.0, 1.0).is_none()
-        );
+        assert!(cam.project((0.0, 0.0, 8.2), f).is_none());
         // World-frame turntable: at pitch 90 the model's own Y axis starts
         // centred and yaw swings it to screen-right (fork's regression
         // test), instead of Euler photo-spinning around the view axis.
         // Positive yaw = the object's nose turns to its own left, which at
         // pitch 90 (its Y pointing at the camera) swings that axis right.
-        let rot = world_rot(90.0, 45.0);
-        let (ox, _) =
-            project_vertex((0.0, 1.0, 0.0), &rot, DEFAULT_DIST, f, 0.0, 0.0, 0.0, 1.0).unwrap();
+        let cam = Camera::new(world_rot(90.0, 45.0), DEFAULT_DIST, 0.0, 0.0, 0.0);
+        let (ox, _) = cam.project((0.0, 1.0, 0.0), f).unwrap();
         assert!(ox > 0.0, "model Y should swing to screen-right, got {ox}");
     }
 

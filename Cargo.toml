@@ -1,23 +1,55 @@
-[package]
-name = "wireforge"
-version = "0.7.0"
+[workspace]
+members = ["crates/*"]
+
+# Shared package metadata, inherited with `<key>.workspace = true`.
+# `readme` is deliberately NOT hoisted: an inherited value would resolve
+# relative to the workspace root, and every package ships its own README.md.
+[workspace.package]
 edition = "2024"
 license = "MIT"
-description = "TUI based viewer for braille-based 3D wireframes"
-readme = "README.md"
 authors = ["lenitain <xt.zhu@qq.com>"]
 homepage = "https://github.com/lenitain/wireforge"
 repository = "https://github.com/lenitain/wireforge"
+
+# Central dependency declarations, inherited with `<dep>.workspace = true`.
+# ratatui: the ONE place it is declared — default-features off. Everything the
+# repo uses (Buffer/Rect/widgets/Canvas/BRAILLE) is core API; the TUI writes
+# ANSI itself, reads events via plain crossterm, and never touches ratatui's
+# terminal backend, calendar widget or underline-color.
+[workspace.dependencies]
+clap = { version = "4.6.1", features = ["derive"] }
+ratatui = { version = "0.30.1", default-features = false }
+ratatui-wireframe = "0.7.0"
+wrfm = { version = "0.4.0", path = "crates/wrfm" }
+wrfm-raster = { path = "crates/wrfm-raster" }
+
+# ratatui-wireframe hard-depends on crates.io's wrfm 0.4.0, which would put a
+# second wrfm in the graph. Redirect it to the local path copy so exactly one
+# wrfm exists (and `Model::from_wrfm` types line up with ours).
+[patch.crates-io]
+wrfm = { path = "crates/wrfm" }
+
+[package]
+name = "wireforge"
+version = "0.7.0"
+edition.workspace = true
+license.workspace = true
+description = "TUI based viewer for braille-based 3D wireframes"
+readme = "README.md"
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
 keywords = ["cli", "tui", "file"]
 categories = ["command-line-utilities"]
 
 [dependencies]
-clap = { version = "4.6.1", features = ["derive"] }
+clap.workspace = true
 crossterm = "0.29.0"
-ratatui = "0.30.1"
-ratatui-wireframe = "0.7.0"
+ratatui.workspace = true
+ratatui-wireframe.workspace = true
 rayon = "1.10"
-wrfm = { version = "0.4.0", path = "crates/wrfm" }
+wrfm.workspace = true
+wrfm-raster.workspace = true
 
 [dev-dependencies]
 libc = "0.2"

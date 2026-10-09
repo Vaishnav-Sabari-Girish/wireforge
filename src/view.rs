@@ -1,50 +1,14 @@
 use ratatui_wireframe::model::Model;
 use rayon::prelude::*;
-
-/// Vertical field of view in degrees.
-pub const FOV_DEG: f64 = 60.0;
+use wrfm_raster::geometry::{IDENTITY, auto_dist, mat_mul, rot_x, rot_y, rot_z};
+use wrfm_raster::projection::{Camera, CameraF32, focal};
 
 /// Above this vertex count, projection and bounds switch to the rayon
 /// parallel path (measured crossover ~72k; typical models stay serial).
 const PARALLEL_THRESHOLD: usize = 100_000;
 
-/// Auto-fit headroom: the model fills 1/FIT_MARGIN of the screen height.
-pub const FIT_MARGIN: f64 = 2.0;
-
 /// A 3x3 row-major rotation matrix (model -> world).
-type Mat3 = [[f64; 3]; 3];
-
-/// Identity rotation.
-const IDENTITY: Mat3 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-
-/// Multiply two 3x3 matrices.
-fn mat_mul(a: Mat3, b: Mat3) -> Mat3 {
-    let mut c = [[0.0; 3]; 3];
-    for i in 0..3 {
-        for j in 0..3 {
-            c[i][j] = a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j];
-        }
-    }
-    c
-}
-
-/// Rotation around the world X axis (positive angle tips +Y toward +Z).
-fn rot_x(a: f64) -> Mat3 {
-    let (s, c) = a.sin_cos();
-    [[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]]
-}
-
-/// Rotation around the world Y axis (positive angle turns +Z toward +X).
-fn rot_y(a: f64) -> Mat3 {
-    let (s, c) = a.sin_cos();
-    [[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]]
-}
-
-/// Rotation around the Z axis (positive angle turns +X toward +Y).
-fn rot_z(a: f64) -> Mat3 {
-    let (s, c) = a.sin_cos();
-    [[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]]
-}
+pub use wrfm_raster::geometry::Mat3;
 
 /// The six camera degrees of freedom (world-frame yaw/pitch, roll around the view axis).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -160,8 +124,7 @@ impl ViewState {
 
     /// Auto-fit: set the distance so the model fills the view.
     pub fn fit_to(&mut self, m: &Model) {
-        let r = model_extent(m).max(1e-6);
-        self.dist = r / (FOV_DEG / 2.0).to_radians().tan() * FIT_MARGIN;
+        self.dist = auto_dist(m);
     }
 
     /// Reset rotation/pan and re-fit the distance.
@@ -183,6 +146,10 @@ impl ViewState {
 }
 
 /// Bounding box of the model: `(min, max)` corners.
+///
+/// The serial path is `wrfm_raster::geometry::bounds`; this wrapper only
+/// adds the rayon reduction above [`PARALLEL_THRESHOLD`] (bit-identical:
+/// per-vertex min/max is order-independent).
 pub fn bounds(m: &Model) -> ([f64; 3], [f64; 3]) {
     if m.vertices.len() >= PARALLEL_THRESHOLD {
         // rayon: per-vertex min/max is an independent reduction (large models).
@@ -205,57 +172,35 @@ pub fn bounds(m: &Model) -> ([f64; 3], [f64; 3]) {
                 )
             })
     } else {
-        let mut min = [f64::INFINITY; 3];
-        let mut max = [f64::NEG_INFINITY; 3];
-        for &(x, y, z) in &m.vertices {
-            min[0] = min[0].min(x);
-            min[1] = min[1].min(y);
-            min[2] = min[2].min(z);
-            max[0] = max[0].max(x);
-            max[1] = max[1].max(y);
-            max[2] = max[2].max(z);
-        }
-        (min, max)
+        wrfm_raster::geometry::bounds(m)
     }
 }
 
 /// The model's geometric-mean length (cbrt of the bounding-box dimensions).
+///
+/// Goes through this module's rayon-capable [`bounds`], so the large-model
+/// path stays parallel; the extent math itself lives in wrfm-raster.
 pub fn model_extent(m: &Model) -> f64 {
-    let (min, max) = bounds(m);
-    let (dx, dy, dz) = (
-        (max[0] - min[0]).max(1e-9),
-        (max[1] - min[1]).max(1e-9),
-        (max[2] - min[2]).max(1e-9),
-    );
-    (dx * dy * dz).cbrt()
+    wrfm_raster::geometry::extent_from_bounds(bounds(m))
+}
+
+/// The shared camera built from this view state. `Camera::new` precomputes
+/// `roll.sin_cos()`, which is bit-identical to computing it per call.
+fn camera(v: &ViewState) -> Camera {
+    Camera::new(v.rot, v.dist, v.roll, v.pan_x, v.pan_y)
 }
 
 /// Project a model-space vertex to canvas coordinates; `None` when behind the camera.
 pub fn project_point(p: (f64, f64, f64), v: &ViewState, px_h: usize) -> Option<(f64, f64)> {
-    let f = (px_h as f64 / 2.0) / (FOV_DEG / 2.0).to_radians().tan();
-
-    // v' = R * v + pan: rotate around the file origin, then translate, so
-    // the rotation centre is always the (panned) origin.
-    let r = v.rot;
-    let rx = r[0][0] * p.0 + r[0][1] * p.1 + r[0][2] * p.2 + v.pan_x;
-    let ry = r[1][0] * p.0 + r[1][1] * p.1 + r[1][2] * p.2 + v.pan_y;
-    let rz = r[2][0] * p.0 + r[2][1] * p.1 + r[2][2] * p.2;
-
-    // Fixed camera at [0,0,dist] looking down -Z.
-    let z = v.dist - rz;
-    if z <= 0.1 {
-        return None;
-    }
-
-    // Roll the camera frame about the panned origin so the pivot stays fixed
-    // (reduces to screen-centre roll at pan = 0).
-    let (sr, cr) = v.roll.sin_cos();
-    let (dx, dy) = (rx - v.pan_x, ry - v.pan_y);
-    let (rxr, ryr) = (v.pan_x + dx * cr - dy * sr, v.pan_y + dx * sr + dy * cr);
-    Some((f * rxr / z, f * ryr / z))
+    camera(v).project(p, focal(px_h as f64))
 }
 
 /// Batch-project all vertices (identical math to `project_point`).
+///
+/// Above [`PARALLEL_THRESHOLD`] the per-vertex work runs on rayon threads
+/// through the shared `project_into`; the serial path is the shared
+/// `project_all`. Both go through the same single-vertex implementation, so
+/// the parallel and serial results stay bit-identical.
 pub fn project_batch(
     verts: &[(f64, f64, f64)],
     v: &ViewState,
@@ -263,12 +208,8 @@ pub fn project_batch(
     out: &mut [[f64; 2]],
     ok: &mut [bool],
 ) {
-    let f = (px_h as f64 / 2.0) / (FOV_DEG / 2.0).to_radians().tan();
-    let (sr, cr) = v.roll.sin_cos();
-    let r = v.rot;
-    let px = v.pan_x;
-    let py = v.pan_y;
-    let dist = v.dist;
+    let f = focal(px_h as f64);
+    let cam = camera(v);
     if verts.len() >= PARALLEL_THRESHOLD {
         // rayon: vertex projections are independent of each other (the render vertex bottleneck).
         // Map each vertex to its result (pure function, no shared mutable state), then write back in order.
@@ -276,41 +217,15 @@ pub fn project_batch(
             .par_iter()
             .zip(out.par_iter_mut())
             .zip(ok.par_iter_mut())
-            .for_each(|((p, o), ok_slot)| {
-                let rx = r[0][0] * p.0 + r[0][1] * p.1 + r[0][2] * p.2 + px;
-                let ry = r[1][0] * p.0 + r[1][1] * p.1 + r[1][2] * p.2 + py;
-                let rz = r[2][0] * p.0 + r[2][1] * p.1 + r[2][2] * p.2;
-                let z = dist - rz;
-                if z <= 0.1 {
-                    *ok_slot = false;
-                    return;
-                }
-                let (dx, dy) = (rx - px, ry - py);
-                let rxr = px + dx * cr - dy * sr;
-                let ryr = py + dx * sr + dy * cr;
-                *o = [f * rxr / z, f * ryr / z];
-                *ok_slot = true;
-            });
+            .for_each(|((p, o), ok_slot)| cam.project_into(*p, f, o, ok_slot));
         return;
     }
-    for (i, p) in verts.iter().enumerate() {
-        let rx = r[0][0] * p.0 + r[0][1] * p.1 + r[0][2] * p.2 + px;
-        let ry = r[1][0] * p.0 + r[1][1] * p.1 + r[1][2] * p.2 + py;
-        let rz = r[2][0] * p.0 + r[2][1] * p.1 + r[2][2] * p.2;
-        let z = dist - rz;
-        if z <= 0.1 {
-            ok[i] = false;
-            continue;
-        }
-        let (dx, dy) = (rx - px, ry - py);
-        let rxr = px + dx * cr - dy * sr;
-        let ryr = py + dx * sr + dy * cr;
-        out[i] = [f * rxr / z, f * ryr / z];
-        ok[i] = true;
-    }
+    cam.project_all(verts, f, out, ok);
 }
 
-/// f32 batch projection for very large models (> 4096 vertices).
+/// f32 batch projection for very large models (> 4096 vertices): same
+/// structure as [`project_batch`] with the camera and focal length cast
+/// down to f32 first (the large-model path).
 pub fn project_batch_f32(
     verts: &[(f64, f64, f64)],
     v: &ViewState,
@@ -318,65 +233,23 @@ pub fn project_batch_f32(
     out: &mut [[f32; 2]],
     ok: &mut [bool],
 ) {
-    let f = ((px_h as f64 / 2.0) / (FOV_DEG / 2.0).to_radians().tan()) as f32;
-    let (sr, cr) = v.roll.sin_cos();
-    let (sr, cr) = (sr as f32, cr as f32);
-    let r = [
-        [v.rot[0][0] as f32, v.rot[0][1] as f32, v.rot[0][2] as f32],
-        [v.rot[1][0] as f32, v.rot[1][1] as f32, v.rot[1][2] as f32],
-        [v.rot[2][0] as f32, v.rot[2][1] as f32, v.rot[2][2] as f32],
-    ];
-    let px = v.pan_x as f32;
-    let py = v.pan_y as f32;
-    let dist = v.dist as f32;
+    let f = CameraF32::focal(px_h as f64);
+    let cam = CameraF32::new(&camera(v));
     if verts.len() >= PARALLEL_THRESHOLD {
         verts
             .par_iter()
             .zip(out.par_iter_mut())
             .zip(ok.par_iter_mut())
-            .for_each(|((p, o), ok_slot)| {
-                let p0 = p.0 as f32;
-                let p1 = p.1 as f32;
-                let p2 = p.2 as f32;
-                let rx = r[0][0] * p0 + r[0][1] * p1 + r[0][2] * p2 + px;
-                let ry = r[1][0] * p0 + r[1][1] * p1 + r[1][2] * p2 + py;
-                let rz = r[2][0] * p0 + r[2][1] * p1 + r[2][2] * p2;
-                let z = dist - rz;
-                if z <= 0.1 {
-                    *ok_slot = false;
-                    return;
-                }
-                let (dx, dy) = (rx - px, ry - py);
-                let rxr = px + dx * cr - dy * sr;
-                let ryr = py + dx * sr + dy * cr;
-                *o = [f * rxr / z, f * ryr / z];
-                *ok_slot = true;
-            });
+            .for_each(|((p, o), ok_slot)| cam.project_into(*p, f, o, ok_slot));
         return;
     }
-    for (i, p) in verts.iter().enumerate() {
-        let p0 = p.0 as f32;
-        let p1 = p.1 as f32;
-        let p2 = p.2 as f32;
-        let rx = r[0][0] * p0 + r[0][1] * p1 + r[0][2] * p2 + px;
-        let ry = r[1][0] * p0 + r[1][1] * p1 + r[1][2] * p2 + py;
-        let rz = r[2][0] * p0 + r[2][1] * p1 + r[2][2] * p2;
-        let z = dist - rz;
-        if z <= 0.1 {
-            ok[i] = false;
-            continue;
-        }
-        let (dx, dy) = (rx - px, ry - py);
-        let rxr = px + dx * cr - dy * sr;
-        let ryr = py + dx * sr + dy * cr;
-        out[i] = [f * rxr / z, f * ryr / z];
-        ok[i] = true;
-    }
+    cam.project_all(verts, f, out, ok);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wrfm_raster::geometry::{FIT_MARGIN, FOV_DEG};
 
     fn cube() -> Model {
         let h = 1.0;

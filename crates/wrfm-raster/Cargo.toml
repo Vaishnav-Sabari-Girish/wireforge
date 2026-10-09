@@ -1,0 +1,21 @@
+[package]
+name = "wrfm-raster"
+version = "0.1.0"
+edition.workspace = true
+description = "Shared camera projection and braille rasterization for wireforge and wrfm-cli"
+readme = "README.md"
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+keywords = ["wrfm", "3d", "wireframe", "braille", "rendering"]
+categories = ["command-line-utilities", "graphics"]
+
+[dependencies]
+# The shared model type (`ratatui_wireframe::model::Model`) and the braille
+# pattern table the rasterized cells are encoded with.
+ratatui.workspace = true
+ratatui-wireframe.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

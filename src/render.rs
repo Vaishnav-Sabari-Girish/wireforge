@@ -3,6 +3,7 @@ use ratatui_wireframe::model::Model;
 use std::io::Write;
 
 use crate::view::{self, ViewState};
+use wrfm_raster::raster::{Bounds, rasterize_line};
 
 /// An empty cell: a space with the default foreground color.
 const SPACE: u64 = (' ' as u64) << 8;
@@ -470,7 +471,8 @@ impl Rasterizer {
     }
 }
 
-/// Cohen-Sutherland clip (same algorithm and region order as ratatui).
+/// Clip and rasterize one line into the shared braille grid (wrfm-raster's
+/// port of ratatui's canvas algorithm), stamping each lit cell's color.
 #[allow(clippy::too_many_arguments)] // primitive geometry helper
 fn paint_line_into(
     x1: f64,
@@ -484,22 +486,20 @@ fn paint_line_into(
     dots: &mut [u8],
     colors: &mut [u8],
 ) {
-    let px_wf = px_w as f64;
-    let px_hf = px_h as f64;
-    let (left, right) = (-px_wf / 2.0, px_wf / 2.0);
-    let (bottom, top) = (-px_hf / 2.0, px_hf / 2.0);
-    let Some((cx1, cy1, cx2, cy2)) = clip_line(x1, y1, x2, y2, left, right, bottom, top) else {
-        return;
-    };
-    let Some((dx1, dy1)) = get_point(cx1, cy1, px_w, px_h) else {
-        return;
-    };
-    let Some((dx2, dy2)) = get_point(cx2, cy2, px_w, px_h) else {
-        return;
-    };
-    bresenham(dx1, dy1, dx2, dy2, |x, y| {
-        paint_dot(x, y, color, cw, px_w, px_h, dots, colors);
-    });
+    debug_assert_eq!(cw * 2, px_w, "dot width must be 2 per character cell");
+    rasterize_line(
+        x1,
+        y1,
+        x2,
+        y2,
+        px_w,
+        px_h,
+        Bounds::centered(px_w, px_h),
+        |cell, bit| {
+            dots[cell] |= bit;
+            colors[cell] = color;
+        },
+    );
 }
 
 /// Rasterize a large edge set in parallel over chunks (> 50k edges).
@@ -544,180 +544,6 @@ fn rasterize_edges_par(
                 (pat, col)
             },
         )
-}
-
-/// Cohen-Sutherland clip against the window `[left, right] x [bottom, top]`.
-#[allow(clippy::too_many_arguments)] // primitive geometry helper
-fn clip_line(
-    x1: f64,
-    y1: f64,
-    x2: f64,
-    y2: f64,
-    left: f64,
-    right: f64,
-    bottom: f64,
-    top: f64,
-) -> Option<(f64, f64, f64, f64)> {
-    let mut p1 = (x1, y1);
-    let mut p2 = (x2, y2);
-    let mut r1 = region_code(p1, left, right, bottom, top);
-    let mut r2 = region_code(p2, left, right, bottom, top);
-    loop {
-        if r1 & r2 != 0 {
-            return None;
-        }
-        if r1 != 0 {
-            p1 = intersect(p1, p2, r1, left, right, bottom, top);
-            r1 = region_code(p1, left, right, bottom, top);
-        } else if r2 != 0 {
-            p2 = intersect(p2, p1, r2, left, right, bottom, top);
-            r2 = region_code(p2, left, right, bottom, top);
-        } else {
-            return Some((p1.0, p1.1, p2.0, p2.1));
-        }
-    }
-}
-
-fn region_code(p: (f64, f64), left: f64, right: f64, bottom: f64, top: f64) -> u8 {
-    let mut r = 0u8;
-    if p.0 < left {
-        r |= 1;
-    } else if p.0 > right {
-        r |= 2;
-    }
-    if p.1 < bottom {
-        r |= 4;
-    } else if p.1 > top {
-        r |= 8;
-    }
-    r
-}
-
-/// Intersect the segment with the window boundary identified by `code`.
-fn intersect(
-    p1: (f64, f64),
-    p2: (f64, f64),
-    region: u8,
-    left: f64,
-    right: f64,
-    bottom: f64,
-    top: f64,
-) -> (f64, f64) {
-    let dx = p2.0 - p1.0;
-    let dy = p2.1 - p1.1;
-    if region & 1 != 0 {
-        let y = p1.1 + (left - p1.0) * dy / dx;
-        return (left, y);
-    }
-    if region & 2 != 0 {
-        let y = p1.1 + (right - p1.0) * dy / dx;
-        return (right, y);
-    }
-    if region & 4 != 0 {
-        let x = p1.0 + (bottom - p1.1) * dx / dy;
-        return (x, bottom);
-    }
-    debug_assert!(region & 8 != 0);
-    let x = p1.0 + (top - p1.1) * dx / dy;
-    (x, top)
-}
-
-/// Canvas -> dot-grid rounding (the same `get_point` math as ratatui).
-fn get_point(x: f64, y: f64, px_w: usize, px_h: usize) -> Option<(usize, usize)> {
-    let px_wf = px_w as f64;
-    let px_hf = px_h as f64;
-    let (left, right) = (-px_wf / 2.0, px_wf / 2.0);
-    let (bottom, top) = (-px_hf / 2.0, px_hf / 2.0);
-    if x < left || x > right || y < bottom || y > top {
-        return None;
-    }
-    let xd = ((x - left) * (px_wf - 1.0) / (right - left)).round() as usize;
-    let yd = ((top - y) * (px_hf - 1.0) / (top - bottom)).round() as usize;
-    Some((xd, yd))
-}
-
-/// Paint one dot into the 2x4 braille grid via the pattern bit.
-#[allow(clippy::too_many_arguments)] // primitive geometry helper
-#[inline]
-fn paint_dot(
-    x: usize,
-    y: usize,
-    color: u8,
-    cw: usize,
-    px_w: usize,
-    px_h: usize,
-    dots: &mut [u8],
-    colors: &mut [u8],
-) {
-    if x >= px_w || y >= px_h {
-        return;
-    }
-    let cell = (y >> 2) * cw + (x >> 1);
-    dots[cell] |= 1 << ((x & 1) + 2 * (y & 3));
-    colors[cell] = color;
-}
-
-/// Bresenham line stepping, byte-identical to ratatui's canvas.
-fn bresenham(x1: usize, y1: usize, x2: usize, y2: usize, mut f: impl FnMut(usize, usize)) {
-    let dx = x2.abs_diff(x1);
-    let dy = y2.abs_diff(y1);
-    if dx == 0 {
-        for y in y1.min(y2)..=y1.max(y2) {
-            f(x1, y);
-        }
-    } else if dy == 0 {
-        for x in x1.min(x2)..=x1.max(x2) {
-            f(x, y1);
-        }
-    } else if dy < dx {
-        if x1 > x2 {
-            line_low(x2, y2, x1, y1, &mut f);
-        } else {
-            line_low(x1, y1, x2, y2, &mut f);
-        }
-    } else if y1 > y2 {
-        line_high(x2, y2, x1, y1, &mut f);
-    } else {
-        line_high(x1, y1, x2, y2, &mut f);
-    }
-}
-
-fn line_low(x1: usize, y1: usize, x2: usize, y2: usize, f: &mut impl FnMut(usize, usize)) {
-    let dx = (x2 - x1) as isize;
-    let dy = (y2 as isize - y1 as isize).abs();
-    let mut d = 2 * dy - dx;
-    let mut y = y1;
-    for x in x1..=x2 {
-        f(x, y);
-        if d > 0 {
-            y = if y1 > y2 {
-                y.saturating_sub(1)
-            } else {
-                y.saturating_add(1)
-            };
-            d -= 2 * dx;
-        }
-        d += 2 * dy;
-    }
-}
-
-fn line_high(x1: usize, y1: usize, x2: usize, y2: usize, f: &mut impl FnMut(usize, usize)) {
-    let dx = (x2 as isize - x1 as isize).abs();
-    let dy = (y2 - y1) as isize;
-    let mut d = 2 * dx - dy;
-    let mut x = x1;
-    for y in y1..=y2 {
-        f(x, y);
-        if d > 0 {
-            x = if x1 > x2 {
-                x.saturating_sub(1)
-            } else {
-                x.saturating_add(1)
-            };
-            d -= 2 * dy;
-        }
-        d += 2 * dx;
-    }
 }
 
 #[cfg(test)]

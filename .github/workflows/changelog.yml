@@ -7,6 +7,7 @@ on:
           - "wireforge-v*"
           - "wrfm-v*"
           - "wrfm-cli-v*"
+          - "wrfm-raster-v*"
   workflow_dispatch:
 
 # We need to give the bot permission to push commits to your repo
@@ -72,6 +73,20 @@ jobs:
           OUTPUT: crates/wrfm-cli/CHANGELOG.md
           GITHUB_REPO: ${{ github.repository }}
 
+      # crates/wrfm-raster — versioned by its own tags: wrfm-raster-v*
+      - name: Generate wrfm-raster changelog
+        uses: orhun/git-cliff-action@main
+        id: git-cliff-wrfm-raster
+        with:
+          config: cliff.toml
+          args: >-
+            --verbose
+            --tag-pattern '^wrfm-raster-v[0-9]'
+            --include-path 'crates/wrfm-raster/**'
+        env:
+          OUTPUT: crates/wrfm-raster/CHANGELOG.md
+          GITHUB_REPO: ${{ github.repository }}
+
       - name: Commit and push changes
         run: |
           # Set up the GitHub Actions bot git identity
@@ -79,7 +94,7 @@ jobs:
           git config user.email 'github-actions[bot]@users.noreply.github.com'
 
           # Add the updated files
-          git add CHANGELOG.md crates/wrfm/CHANGELOG.md crates/wrfm-cli/CHANGELOG.md
+          git add CHANGELOG.md crates/wrfm/CHANGELOG.md crates/wrfm-cli/CHANGELOG.md crates/wrfm-raster/CHANGELOG.md
 
           # Commit the changes (the || exit 0 prevents the workflow from failing if there are no changes)
           git commit -m "chore(changelog): update CHANGELOG.md files [skip ci]" || exit 0

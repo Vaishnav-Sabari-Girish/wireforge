@@ -23,6 +23,9 @@ Wireforge is a small set of tools arranged around that format:
   serializes it, with `no_std` support and exact `f64` round-trips.
 - **[`wrfm` CLI](crates/wrfm-cli)** — thirteen subcommands that check, verify,
   inspect, query, transform, edit, render and diff models over plain stdio.
+- **[`wrfm-raster`](crates/wrfm-raster)** — the shared renderer: camera
+  projection and braille rasterization used by both the CLI and the viewer,
+  byte-identical to ratatui's canvas.
 - **`wireforge`** — the viewer. Open a file and turn it around with the
   keyboard.
 

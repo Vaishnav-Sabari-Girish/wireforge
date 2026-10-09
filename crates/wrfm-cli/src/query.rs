@@ -1,6 +1,6 @@
-use crate::render::bounds;
 use ratatui_wireframe::model::Model;
 use serde_json::{Value, json};
+use wrfm_raster::geometry::bounds;
 
 /// A query that can be run against a model.
 ///

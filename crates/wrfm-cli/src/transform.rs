@@ -1,5 +1,5 @@
-use crate::render::{mat_mul, rot_axis, rot_x, rot_y, rot_z};
 use ratatui_wireframe::model::Model;
+use wrfm_raster::geometry::{mat_mul, rot_axis, rot_x, rot_y, rot_z};
 
 /// The pivot point the whole transform happens about.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -371,7 +371,7 @@ mod tests {
     }
 
     fn bbox(model: &Model) -> ([f64; 3], [f64; 3]) {
-        crate::render::bounds(model)
+        wrfm_raster::geometry::bounds(model)
     }
 
     fn span(model: &Model) -> f64 {

@@ -1,6 +1,6 @@
-use crate::render::bounds;
 use ratatui_wireframe::model::Model;
 use serde_json::{Value, json};
+use wrfm_raster::geometry::bounds;
 
 /// Round to 3 decimals so JSON stays compact and readable.
 fn r3(x: f64) -> f64 {

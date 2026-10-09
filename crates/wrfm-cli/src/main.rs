@@ -1000,7 +1000,7 @@ fn cmd_info(file: &str, group: Option<&str>) -> i32 {
     };
     let c = check::check(&model, false);
     let verdict = verdict_of(&c);
-    let (min, max) = render::bounds(&model);
+    let (min, max) = wrfm_raster::geometry::bounds(&model);
     let center = [
         (min[0] + max[0]) / 2.0,
         (min[1] + max[1]) / 2.0,
@@ -1208,7 +1208,7 @@ fn cmd_view(
         None => loaded.model.clone(),
     };
     let dist = if auto_dist {
-        render::auto_dist(&model)
+        wrfm_raster::geometry::auto_dist(&model)
     } else {
         dist.unwrap_or(render::DEFAULT_DIST)
     };
@@ -1273,7 +1273,7 @@ fn cmd_render(
         }
         None => (loaded.model.clone(), String::new()),
     };
-    let (min, max) = render::bounds(&model);
+    let (min, max) = wrfm_raster::geometry::bounds(&model);
 
     let fmt = match opts.format {
         render::Format::Braille => "braille",
