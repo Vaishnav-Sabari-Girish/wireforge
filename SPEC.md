@@ -43,17 +43,13 @@ wireforge path/to/model.wrfm
 wireforge cube.wrfm
 ```
 
-The viewer hot-reloads the file as you edit it. The file is watched with
-`inotify` on Linux (with a 200 ms mtime+length poll as the fallback), so
-atomic-rename saves and file re-creation are caught too; a half-written or
-deleted file keeps the last good model on screen and recovers automatically.
-The camera is preserved across reloads.
+The file is read once, when the viewer starts; run `wireforge` again after
+editing it.
 
 ### Stream input
 
 `wireforge -` reads a model from stdin (or a FIFO such as `<( cat model.wrfm )`)
-as a one-shot preview with no hot-reload. Keyboard input still works via the
-controlling terminal:
+once, at start-up. Keyboard input still works via the controlling terminal:
 
 ```bash
 cat model.wrfm | wireforge -

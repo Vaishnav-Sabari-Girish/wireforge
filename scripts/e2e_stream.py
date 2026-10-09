@@ -5,15 +5,15 @@ Drives the REAL TUI binary and verifies the PLAN-cli-stream §6 stream-input
 contract:
 
   1. `stdin_opens_wrfm`        — pipe a v1 wrfm model into `wireforge -`
-     (stdin is a pipe with EOF): it renders, and Row 0 advertises the
-     "nohot-reload" one-shot mode (ratatui skips spaces in the captured
-     stream, so the needle is space-free).
+     (stdin is a pipe with EOF): it renders, and Row 0 shows the model name
+     "stdin" (ratatui skips spaces in the captured stream, so the needle is
+     space-free).
   2. `stdin_garbage_is_unrecognized` — `wireforge -` with garbage fails
      fast with "unrecognized file format" and exits 1.
   3. `fifo_path_loads_once`    — `wireforge <real-fifo>` reads the fifo ONCE
-     and renders; Row 0 shows the fifo path with "(no hot-reload)".
-  4. `fifo_no_hotreload`       — after the one-shot load, a second writer to
-     the same fifo does NOT re-render (no poll, no hot-reload event).
+     and renders; Row 0 shows the fifo path.
+  4. `fifo_ignores_later_writes` — after the one-shot load, a second writer to
+     the same fifo does NOT re-render (the model is read only once).
   5. `pipe_stdin_keyboard`     — `cat model | wireforge -` (real pipe stdin)
      in a shell with a controlling terminal: keyboard is read from
      `/dev/tty`, so 'q' quits.
@@ -28,8 +28,8 @@ and runs under a plain `cargo test`.)
 Matching notes (why fragments instead of full strings): ratatui renders
 with diff-based cell updates, so a captured stream only contains the cells
 that CHANGED between frames — spaces and identical characters are skipped.
-So we match "Wireforge:" and "(no hot-reload)" fragments after stripping
-ANSI sequences.
+So we match "Wireforge:", "stdin" and "stream.fifo" fragments after
+stripping ANSI sequences.
 
 Usage:  scripts/e2e_stream.py [path/to/wireforge-binary]
 Defaults to ./target/debug/wireforge (run `cargo build` first).
@@ -224,7 +224,7 @@ def main() -> int:
         # --- 1. stdin_opens_wrfm -------------------------------------------
         tui = StreamTui(binary, "-", cube.encode())
         checks.append(("stdin renders", tui.wait_for("Wireforge:")))
-        checks.append(("stdin row0 advertises no hot-reload", "nohot-reload" in tui.text()))
+        checks.append(("stdin row0 shows the model name", "stdin" in tui.text()))
         tui.clear()
         code = tui.quit()
         checks.append(("stdin quits cleanly", code == 0))
@@ -252,19 +252,18 @@ def main() -> int:
         writer = fifo_writer(cube_path, fifo)
         tui = StreamTui(binary, fifo, None)
         checks.append(("fifo renders", tui.wait_for("Wireforge:")))
-        checks.append(("fifo row0 advertises no hot-reload", "nohot-reload" in tui.text()))
+        checks.append(("fifo row0 shows the fifo path", "stream.fifo" in tui.text()))
         wait_writer(writer, timeout=10)
         tui.clear()
-        # Loads once: after the writer's EOF the screen is stable — no
-        # "hot-reloaded" event ever appears for a one-shot preview.
+        # The fifo is read ONCE, at start-up: after the writer's EOF the
+        # screen is stable and no further write can reach the viewer.
         time.sleep(1.5)
         tui.drain(0.5)
-        checks.append(("fifo has no hot-reload event", "hot-reload" not in tui.text()))
 
-        # --- 4. fifo_no_hotreload ------------------------------------------
+        # --- 4. fifo_ignores_later_writes ----------------------------------
         # A second writer to the same fifo must NOT re-render: wireforge
-        # loaded once and never polls, so this writer blocks forever with no
-        # reader. The screen keeps showing the cube.
+        # loaded once, so this writer blocks forever with no reader. The
+        # screen keeps showing the cube.
         before = tui.text()
         second = fifo_writer(tetra_path, fifo)
         time.sleep(1.5)

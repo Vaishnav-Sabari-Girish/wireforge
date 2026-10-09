@@ -27,11 +27,9 @@ use std::{
 };
 use wrfm::WrfmModel;
 
-mod reload;
 mod render;
 mod timer;
 mod view;
-use reload::{ReloadEvent, ReloadWatch};
 use timer::{TimerId, TimerScheduler};
 use view::ViewState;
 
@@ -43,15 +41,10 @@ const ROT_RATE: f64 = 169.0 / 128.0;
 /// Smooth continuous translation rate: fraction of the model extent moved per second.
 const MOVE_RATE: f64 = 83.0 / 128.0;
 
-/// How long the transient reload status line (row 1) stays on screen
-/// before it is cleared and those rows go back to the model canvas.
-const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 /// Auto-spin yaw rate (radians per second): 169/256 = 0.66015625, a dyadic (exact-in-binary) constant.
 const SPIN_RATE: f64 = 169.0 / 256.0;
 /// How often the idle loop re-checks the terminal size (resize fallback).
 const RESIZE_CHECK_INTERVAL: Duration = Duration::from_millis(500);
-/// How long to let a file write settle before re-parsing after a change.
-const SETTLE_DELAY: Duration = Duration::from_millis(50);
 /// How long the keyboard may stay silent before a hold is dropped, on a
 /// terminal that never reports a key-up. Silence is the only evidence there
 /// is; 1 s outlasts the default OS initial repeat delay (660 ms on X11) and
@@ -404,135 +397,19 @@ fn load_model_from_text(name: &str, text: &str) -> Result<(Model, String), Strin
     Ok((model, wrfm_data.name))
 }
 
-/// Apply a successful reload: swap in the new render and name; the camera pose stays as the user left it.
-fn apply_reload(current: &mut Model, name: &mut String, new_model: Model, new_name: String) {
-    *current = new_model;
-    *name = new_name;
-}
-
-#[cfg_attr(not(test), allow(dead_code))] // exercised by the hot-reload unit tests
-/// Apply one hot-reload poll result to the running viewer.
-fn handle_reload_event(
-    event: ReloadEvent,
-    current: &mut Model,
-    name: &mut String,
-    target_file: &Path,
-) -> Option<ReloadRecord> {
-    match event {
-        ReloadEvent::Changed => {
-            // Let a half-written file settle before re-parsing it, so a
-            // mid-write read is less likely; a failed parse still keeps the
-            // last good model and retries on the next poll.
-            std::thread::sleep(SETTLE_DELAY);
-            Some(match load_model(target_file) {
-                Ok((new_model, new_name)) => {
-                    apply_reload(current, name, new_model, new_name);
-                    ReloadRecord {
-                        outcome: ReloadOutcome::Ok,
-                        detail: "model reloaded".to_string(),
-                    }
-                }
-                Err(e) => ReloadRecord {
-                    outcome: ReloadOutcome::ParseError,
-                    detail: format!("Parse Error: {e}"),
-                },
-            })
-        }
-        ReloadEvent::Missing => Some(ReloadRecord {
-            outcome: ReloadOutcome::FileRemoved,
-            detail: "file removed (deleted or renamed away); keeping last model".to_string(),
-        }),
-        ReloadEvent::Unchanged => None,
-    }
-}
-
-/// The outcome class of a hot-reload action.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReloadOutcome {
-    /// The file changed and re-parsed successfully; the model was replaced.
-    Ok,
-    /// The file changed but failed to parse; the last good model was kept.
-    ParseError,
-    /// The file disappeared (deleted or renamed away); the last model kept.
-    FileRemoved,
-}
-
-/// The most recent hot-reload action: an outcome plus its detail, the input to `status_line`.
-#[derive(Debug, Clone, PartialEq)]
-struct ReloadRecord {
-    outcome: ReloadOutcome,
-    /// The action's detail: the full parse-error report for `ParseError`, a one-line note for the other outcomes.
-    detail: String,
-}
-
-/// The transient row-1 status label for a reload outcome — one of the three fixed labels.
-fn hud_status_for(outcome: ReloadOutcome) -> &'static str {
-    match outcome {
-        ReloadOutcome::Ok => "hot-reloaded",
-        ReloadOutcome::ParseError => "parse error",
-        ReloadOutcome::FileRemoved => "file removed",
-    }
-}
-
-#[cfg_attr(not(test), allow(dead_code))] // exercised by the status-expiry unit tests
-/// True when the armed status-line deadline has passed; `None` (nothing showing) never expires.
-fn status_expired(deadline: Option<Instant>, now: Instant) -> bool {
-    deadline.is_some_and(|d| now >= d)
-}
-
-/// The transient status line under Row 0: the outcome label plus a
-/// COMPACT detail. For a parse error only the report's first line survives
-/// (`<kind> at line L, column C`): the line must stay ONE row tall, so the
-/// rustc-style body (source line + caret) is not shown.
-fn status_line(record: &ReloadRecord) -> String {
-    let label = hud_status_for(record.outcome);
-    match record.outcome {
-        ReloadOutcome::Ok => label.to_string(),
-        ReloadOutcome::FileRemoved => format!("{label}; keeping last model"),
-        ReloadOutcome::ParseError => {
-            // detail = "Parse Error: error: <kind> at line L, column C\n..."
-            let Some(first) = record.detail.lines().next() else {
-                return label.to_string();
-            };
-            let head = first.strip_prefix("Parse Error: ").unwrap_or(first);
-            let head = head.strip_prefix("error: ").unwrap_or(head);
-            if head.is_empty() {
-                label.to_string()
-            } else {
-                format!("{label}: {head}")
-            }
-        }
-    }
-}
-
-/// HUD layout: Row 0 is the fixed model + view line; below it the transient event region.
-fn hud_layout(
-    name: &str,
-    view: &ViewState,
-    status: &str,
-    height: u16,
-    collapsed: bool,
-    one_shot: Option<&str>,
-) -> (String, Vec<String>, u16) {
-    // In one-shot (stdin / FIFO) mode Row 0 advertises that the preview will
-    // NOT auto-refresh, so Row 0 warns up front and the user is never surprised.
-    let label = one_shot.unwrap_or(name);
+/// HUD layout: Row 0 is the fixed model + view line. `label` overrides the
+/// model name (the FIFO path for a stream preview, whose model name is only
+/// the file stem); regular files pass `None` and show their own name.
+fn hud_layout(name: &str, view: &ViewState, collapsed: bool, label: Option<&str>) -> String {
+    let title = label.unwrap_or(name);
     let mut row0 = format!(
         "Wireforge: {} | yaw={:.2} pitch={:.2} roll={:.2} dist={:.2} pan=({:.2},{:.2})",
-        label, view.yaw, view.pitch, view.roll, view.dist, view.pan_x, view.pan_y
+        title, view.yaw, view.pitch, view.roll, view.dist, view.pan_x, view.pan_y
     );
     if collapsed {
         row0.push_str("   [?] keys");
     }
-    let event_lines: Vec<String> = if status.is_empty() {
-        Vec::new()
-    } else {
-        status.lines().map(str::to_string).collect()
-    };
-    // Reserve only as many rows as fit below the fixed row 0; a long Parse
-    // Error must never be squeezed into Row 0.
-    let reserved = event_lines.len().min(height.saturating_sub(1) as usize) as u16;
-    (row0, event_lines, reserved)
+    row0
 }
 
 /// The full help overlay (shown when the HUD is expanded).
@@ -567,12 +444,6 @@ const HELP: &[&str] = &[
 // Game-engine event loop: an input thread + channel, one scheduler owned
 // by the loop, a two-mode main loop, and dirty-flag rendering.
 
-/// Events the main loop blocks on: terminal input, reload events and timer timeouts.
-pub(crate) enum LoopEvent {
-    Input(Event),
-    Reload(ReloadEvent),
-}
-
 /// A key that is currently down. Its `motion` is sampled when the key goes
 /// down, so a modifier change mid-hold can never fork one key into two motions.
 #[derive(Debug, Clone, Copy)]
@@ -587,8 +458,9 @@ struct Hold {
 struct App {
     current: Model,
     name: String,
-    one_shot: Option<String>,
-    target_file: PathBuf,
+    /// Row 0 label override: the FIFO path for a stream preview; `None`
+    /// shows the model name.
+    row0_label: Option<String>,
     view: ViewState,
     /// Keys currently held down, keyed by their identity (the base key from
     /// `canonical_key`), so Release finds the right hold even when the
@@ -601,25 +473,22 @@ struct App {
     auto_spin: bool,
     hud: Hud,
     show_axes: bool,
-    status_msg: String,
     /// True when the screen must be repainted before the loop blocks again.
     dirty: bool,
 }
 
 impl App {
-    fn new(current: Model, name: String, one_shot: Option<String>, target_file: PathBuf) -> Self {
+    fn new(current: Model, name: String, row0_label: Option<String>) -> Self {
         App {
             current,
             name,
-            one_shot,
-            target_file,
+            row0_label,
             view: ViewState::default(),
             held: HashMap::new(),
             release_seen: false,
             auto_spin: false,
             hud: Hud::Collapsed,
             show_axes: true,
-            status_msg: String::new(),
             dirty: true,
         }
     }
@@ -781,18 +650,6 @@ impl App {
             continuous_step(&mut self.view, hold.motion, move_scale, dt);
         }
     }
-
-    /// Handle a timer that fired. Returns true when the screen changed.
-    fn handle_timer(&mut self, id: TimerId, _now: Instant) -> bool {
-        match id {
-            TimerId::StatusExpiry => {
-                self.status_msg.clear();
-                self.dirty = true;
-                true
-            }
-            TimerId::ReloadPoll | TimerId::ReloadParse | TimerId::ResizeCheck => false,
-        }
-    }
 }
 
 /// L2 engine state: the retained-mode screen and the rasterizer.
@@ -819,90 +676,16 @@ impl Engine {
 }
 
 /// The only crossterm event reader in the process (blocks on the tty).
-fn spawn_input_thread(tx: Sender<LoopEvent>) {
+fn spawn_input_thread(tx: Sender<Event>) {
     let _ = thread::Builder::new()
         .name("wireforge-input".into())
         .spawn(move || {
             while let Ok(ev) = event::read() {
-                if tx.send(LoopEvent::Input(ev)).is_err() {
+                if tx.send(ev).is_err() {
                     break;
                 }
             }
         });
-}
-
-/// Parse the target file and apply it on success, keeping the last good model on failure; called from the ReloadParse timer so the event loop never blocks on parsing.
-fn handle_reload_changed(
-    current: &mut Model,
-    name: &mut String,
-    target_file: &Path,
-) -> ReloadRecord {
-    match load_model(target_file) {
-        Ok((new_model, new_name)) => {
-            apply_reload(current, name, new_model, new_name);
-            ReloadRecord {
-                outcome: ReloadOutcome::Ok,
-                detail: "model reloaded".to_string(),
-            }
-        }
-        Err(e) => ReloadRecord {
-            outcome: ReloadOutcome::ParseError,
-            detail: format!("Parse Error: {e}"),
-        },
-    }
-}
-
-/// Show a reload outcome on the row-1 status line (cleared after
-/// STATUS_TIMEOUT): the ONE compact line, never the full report.
-fn show_reload_status(app: &mut App, timers: &mut TimerScheduler, record: ReloadRecord) {
-    let now = Instant::now();
-    app.status_msg = status_line(&record);
-    timers.schedule(TimerId::StatusExpiry, now + STATUS_TIMEOUT);
-    app.dirty = true;
-}
-
-/// Handle a reload event from the inotify thread or the poll watch. A change is deferred by `SETTLE_DELAY` so a half-written file settles; a missing file reports on the status line at once.
-fn handle_reload_event_loop(
-    app: &mut App,
-    timers: &mut TimerScheduler,
-    event: ReloadEvent,
-) -> bool {
-    match event {
-        ReloadEvent::Changed => {
-            // Settle half-written files; the loop schedules ReloadParse
-            // (non-blocking) and keeps the last good model on failure.
-            timers.schedule(TimerId::ReloadParse, Instant::now() + SETTLE_DELAY);
-            false
-        }
-        ReloadEvent::Missing => {
-            show_reload_status(
-                app,
-                timers,
-                ReloadRecord {
-                    outcome: ReloadOutcome::FileRemoved,
-                    detail: "file removed (deleted or renamed away); keeping last model"
-                        .to_string(),
-                },
-            );
-            true
-        }
-        ReloadEvent::Unchanged => false,
-    }
-}
-
-/// The ReloadParse timer fired: parse the file and show the outcome.
-fn apply_reload_parse(app: &mut App, timers: &mut TimerScheduler) {
-    let record = handle_reload_changed(&mut app.current, &mut app.name, &app.target_file);
-    show_reload_status(app, timers, record);
-}
-
-/// The ReloadPoll fallback timer fired: stat the file, handle the event and re-arm the poll timer.
-fn poll_reload(watch: &mut Option<ReloadWatch>, app: &mut App, timers: &mut TimerScheduler) {
-    if let Some(w) = watch.as_mut() {
-        let event = w.poll();
-        handle_reload_event_loop(app, timers, event);
-        timers.schedule(TimerId::ReloadPoll, Instant::now() + reload::POLL_INTERVAL);
-    }
 }
 
 /// Fallback resize detection (timer-driven): resize and mark dirty when the terminal size no longer matches the screen.
@@ -922,21 +705,10 @@ fn check_resize(app: &mut App, engine: &mut Engine, timers: &mut TimerScheduler)
 /// Fire every timer due at `now` through its dedicated handler. Called from
 /// both loop modes — and after each idle event, so a steady event stream can
 /// never postpone a due timer.
-fn fire_due_timers(
-    app: &mut App,
-    engine: &mut Engine,
-    timers: &mut TimerScheduler,
-    watch: &mut Option<ReloadWatch>,
-    now: Instant,
-) {
+fn fire_due_timers(app: &mut App, engine: &mut Engine, timers: &mut TimerScheduler, now: Instant) {
     for id in timers.fire_due(now) {
         match id {
-            TimerId::ReloadParse => apply_reload_parse(app, timers),
-            TimerId::ReloadPoll => poll_reload(watch, app, timers),
             TimerId::ResizeCheck => check_resize(app, engine, timers),
-            other => {
-                app.handle_timer(other, now);
-            }
         }
     }
 }
@@ -965,17 +737,14 @@ fn render_frame(
     }
     let w16 = w as u16;
     let h16 = h as u16;
-    let (row0, event_lines, event_rows) = hud_layout(
+    let row0 = hud_layout(
         &app.name,
         &app.view,
-        &app.status_msg,
-        h16,
         app.hud == Hud::Collapsed,
-        app.one_shot.as_deref(),
+        app.row0_label.as_deref(),
     );
-    // Row 0 is the fixed model+view line; the transient event region
-    // occupies rows 1..1+event_rows; the canvas starts below both.
-    let canvas_top = 1 + event_rows;
+    // Row 0 is the fixed model+view line; the canvas starts right below it.
+    let canvas_top: u16 = 1;
     let overlay = if app.hud == Hud::Expanded {
         Some(HELP.iter().map(|s| s.to_string()).collect::<Vec<_>>())
     } else {
@@ -993,21 +762,14 @@ fn render_frame(
         b.reset();
     }
 
-    // Row 0 + transient event rows (always present above the canvas).
+    // Row 0 (always present above the canvas).
     {
         let hud = engine.hud_buf.as_mut().unwrap();
         Paragraph::new(row0).render(Rect::new(0, 0, w16, 1), hud);
-        for (i, line) in event_lines.iter().enumerate() {
-            let row = 1 + i as u16;
-            if row >= canvas_top {
-                break;
-            }
-            Paragraph::new(line.as_str()).render(Rect::new(0, row, w16, 1), hud);
-        }
     }
 
-    // The overlay (help / reload panel) or the model canvas fills
-    // everything below the HUD rows.
+    // The overlay (help panel) or the model canvas fills everything below
+    // the HUD row.
     let canvas_area = if let Some(lines) = overlay {
         let top = canvas_top;
         let height = h16.saturating_sub(top);
@@ -1124,16 +886,15 @@ fn main() -> Result<(), Box<dyn Error>> {
             .exit(),
     };
 
-    // Regular files probe PROBE_BYTES and keep hot-reload; `-`/FIFO read the
-    // whole stream once as one-shot previews (no hot-reload).
+    // Regular files are probed through PROBE_BYTES and loaded from the path;
+    // `-`/FIFO read the whole stream once, at start-up.
     let is_stdin = target_file == Path::new("-");
     let is_fifo = !is_stdin && is_fifo_path(&target_file);
-    // Row 0 label for one-shot mode ("stdin preview (no hot-reload)" or the
-    // FIFO path); None for regular files (hot-reload stays on).
-    let one_shot: Option<String> = if is_stdin {
-        Some("stdin preview (no hot-reload)".to_string())
-    } else if is_fifo {
-        Some(format!("{} (no hot-reload)", target_file.display()))
+    let is_stream = is_stdin || is_fifo;
+    // Row 0 label override: the FIFO's full path (its model name is only the
+    // file stem). stdin and regular files show their model name.
+    let row0_label: Option<String> = if is_fifo {
+        Some(target_file.display().to_string())
     } else {
         None
     };
@@ -1146,9 +907,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         std::process::exit(1);
     }
 
-    let (current_model, model_name) = if one_shot.is_some() {
+    let (current_model, model_name) = if is_stream {
         // Stream path: read all of stdin (or the FIFO) once, probe the
-        // whole BUFFER (not the path), parse, and never poll.
+        // whole BUFFER (not the path) and parse it.
         let mut buf = String::new();
         if is_stdin {
             io::stdin()
@@ -1169,11 +930,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .unwrap_or("fifo")
                 .to_string()
         };
+        let label = if is_stdin {
+            "-".to_string()
+        } else {
+            target_file.display().to_string()
+        };
         load_model_from_text(&name, &buf).unwrap_or_else(|e| {
-            eprintln!(
-                "Failed to load '{}': {e}",
-                one_shot.as_deref().unwrap_or("-")
-            );
+            eprintln!("Failed to load '{label}': {e}");
             std::process::exit(1);
         })
     } else {
@@ -1183,32 +946,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         })
     };
 
-    // The event queue: one channel, one blocking consumer. The
-    // input thread is the only crossterm reader; the inotify reload thread
-    // (Linux) pushes reload events into the same channel.
-    let (tx, rx) = mpsc::channel::<LoopEvent>();
-
-    // File hot-reload: inotify on Linux (true event-driven),
-    // otherwise the mtime+length poll on a 200 ms timer. One-shot
-    // (stdin/FIFO) previews get NO watch — they load once and never poll.
-    let mut watch: Option<ReloadWatch> = None;
-    if one_shot.is_none() {
-        #[cfg(target_os = "linux")]
-        {
-            if reload::spawn_inotify(&target_file, tx.clone()).is_none() {
-                // inotify unavailable: fall back to the mtime-poll watch.
-                let mut w = ReloadWatch::new(target_file.clone());
-                w.baseline();
-                watch = Some(w);
-            }
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let mut w = ReloadWatch::new(target_file.clone());
-            w.baseline();
-            watch = Some(w);
-        }
-    }
+    // The event queue: one channel, one blocking consumer — the input thread
+    // is the only crossterm reader, and it pushes events here.
+    let (tx, rx) = mpsc::channel::<Event>();
 
     enable_raw_mode()?;
     // From here on every exit path (return value, `?` error or panic) must
@@ -1245,7 +985,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // L2 engine + viewer state.
     let (cols, rows) = crossterm::terminal::size()?;
-    let mut app = App::new(current_model, model_name, one_shot, target_file.clone());
+    let mut app = App::new(current_model, model_name, row0_label);
     app.view.fit_to(&app.current);
     let mut engine = Engine::new(cols as usize, rows as usize);
     let mut timers = TimerScheduler::new();
@@ -1255,9 +995,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     // writes every non-space cell (same first-frame semantics as before).
     render_frame(&mut app, &mut engine, &mut stdout)?;
     app.dirty = false;
-    if watch.is_some() {
-        timers.schedule(TimerId::ReloadPoll, Instant::now() + reload::POLL_INTERVAL);
-    }
     timers.schedule(TimerId::ResizeCheck, Instant::now() + RESIZE_CHECK_INTERVAL);
 
     'main: loop {
@@ -1274,22 +1011,19 @@ fn main() -> Result<(), Box<dyn Error>> {
             // Drain the event backlog (no waiting, no cap).
             while let Ok(ev) = rx.try_recv() {
                 match ev {
-                    LoopEvent::Input(Event::Resize(cols, rows)) => {
+                    Event::Resize(cols, rows) => {
                         engine.resize(cols as usize, rows as usize);
                         app.dirty = true;
                     }
-                    LoopEvent::Input(ev) => {
+                    ev => {
                         if app.handle_input(ev) {
                             break 'main;
                         }
                     }
-                    LoopEvent::Reload(rel) => {
-                        handle_reload_event_loop(&mut app, &mut timers, rel);
-                    }
                 }
             }
-            // Timers can fire mid-animation too (status expiry, reload).
-            fire_due_timers(&mut app, &mut engine, &mut timers, &mut watch, now);
+            // Timers can fire mid-animation too.
+            fire_due_timers(&mut app, &mut engine, &mut timers, now);
             // One frame of smooth motion + held-key expiry.
             app.update_held(now, dt);
             if app.auto_spin {
@@ -1307,7 +1041,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let wait = timers
                 .earliest()
                 .map(|d| d.saturating_duration_since(Instant::now()));
-            let msg: Result<LoopEvent, mpsc::RecvTimeoutError> = match wait {
+            let msg: Result<Event, mpsc::RecvTimeoutError> = match wait {
                 Some(t) => rx.recv_timeout(t),
                 None => match rx.recv() {
                     Ok(e) => Ok(e),
@@ -1317,26 +1051,23 @@ fn main() -> Result<(), Box<dyn Error>> {
             match msg {
                 Ok(ev) => {
                     match ev {
-                        LoopEvent::Input(Event::Resize(cols, rows)) => {
+                        Event::Resize(cols, rows) => {
                             engine.resize(cols as usize, rows as usize);
                             app.dirty = true;
                         }
-                        LoopEvent::Input(ev) => {
+                        ev => {
                             if app.handle_input(ev) {
                                 break 'main;
                             }
                         }
-                        LoopEvent::Reload(rel) => {
-                            handle_reload_event_loop(&mut app, &mut timers, rel);
-                        }
                     }
                     // Due timers also advance while events keep arriving, so a
                     // steady stream cannot starve them until the queue drains.
-                    fire_due_timers(&mut app, &mut engine, &mut timers, &mut watch, now);
+                    fire_due_timers(&mut app, &mut engine, &mut timers, now);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     // The kernel woke us exactly at the earliest deadline.
-                    fire_due_timers(&mut app, &mut engine, &mut timers, &mut watch, now);
+                    fire_due_timers(&mut app, &mut engine, &mut timers, now);
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break 'main,
             }
@@ -1559,237 +1290,16 @@ mod tests {
         assert!(load_model(&p).is_err(), "a deleted file must fail to load");
     }
 
-    // --- Hot-reload invariants (ok / error / missing) ---
+    // --- HUD layout (row 0) ---
 
     #[test]
-    fn reload_preserves_view() {
-        // Two models of very different sizes: after a reload the camera
-        // keeps its distance and rotation by default ...
-        let small = temp_wrfm(
-            "small",
-            "wrfm 1\nvertices 2   edges 1\n\nv 0 0 0\nv 1 0 0\ne 0 1\n",
-        );
-        let big = temp_wrfm(
-            "big",
-            "wrfm 1\nvertices 4   edges 3\n\nv 0 0 0\nv 100 0 0\nv 0 100 0\nv 0 0 100\ne 0 1\ne 0 2\ne 0 3\n",
-        );
-        let (mut current, mut name) = load_model(&small).unwrap();
-        let mut view = ViewState::default();
-        view.fit_to(&current);
-        view.add_yaw(1.0); // user turned the model
-        let dist_before = view.dist;
-
-        let (new_model, new_name) = load_model(&big).unwrap();
-        apply_reload(&mut current, &mut name, new_model, new_name);
-        assert_eq!(view.dist, dist_before, "distance must be preserved");
-        assert!((view.yaw - 1.0).abs() < 1e-9, "rotation must be preserved");
-        assert_eq!(name, big.file_stem().unwrap().to_str().unwrap());
-    }
-
-    #[test]
-    fn reload_failure_keeps_old_render() {
-        // A failed reload must not touch the current render: the swap only
-        // happens inside apply_reload, which the caller invokes on success.
-        let valid = temp_wrfm("valid2", "wrfm 1\nvertices 1   edges 1\n\nv 0 0 0\ne 0 0\n");
-        let (current, _) = load_model(&valid).unwrap();
-        let bad = temp_wrfm("bad", "wrfm 1\nvertices 1   edges 1\n\nv 0 0 0\ne 0 1\n");
-        assert!(load_model(&bad).is_err());
-        assert_eq!(
-            current.vertices.len(),
-            1,
-            "the old model must still be held"
-        );
-    }
-
-    #[test]
-    fn hot_reload_changed_garbage_keeps_model_and_reports_parse_error() {
-        // after a successful reload, write garbage -> the screen KEEPS
-        // the last model + the event shows Parse Error.
-        let p = temp_wrfm(
-            "inv-garbage",
-            "wrfm 1\nvertices 2   edges 1\n\nv 0 0 0\nv 1 0 0\ne 0 1\n",
-        );
-        let (mut current, mut name) = load_model(&p).unwrap();
-        let mut view = ViewState::default();
-        view.fit_to(&current);
-        let vertices_before = current.vertices.len();
-
-        fs::write(&p, "this is garbage\n").unwrap();
-        let record = handle_reload_event(ReloadEvent::Changed, &mut current, &mut name, &p)
-            .expect("Changed must produce a reload record");
-        assert_eq!(
-            record.outcome,
-            ReloadOutcome::ParseError,
-            "garbage must record a parse-error outcome"
-        );
-        assert!(
-            record.detail.contains("Parse Error"),
-            "record: {:?}",
-            record.detail
-        );
-        assert_eq!(
-            current.vertices.len(),
-            vertices_before,
-            "garbage must never replace the on-screen model"
-        );
-    }
-
-    #[test]
-    fn hot_reload_missing_keeps_model_and_reports_file_removed() {
-        // delete the file -> keeps the model + "file removed".
-        let p = temp_wrfm(
-            "inv-deleted",
-            "wrfm 1\nvertices 2   edges 1\n\nv 0 0 0\nv 1 0 0\ne 0 1\n",
-        );
-        let (mut current, mut name) = load_model(&p).unwrap();
-        let mut view = ViewState::default();
-        view.fit_to(&current);
-        let vertices_before = current.vertices.len();
-
-        fs::remove_file(&p).unwrap();
-        let record = handle_reload_event(ReloadEvent::Missing, &mut current, &mut name, &p)
-            .expect("Missing must produce a reload record");
-        assert_eq!(
-            record.outcome,
-            ReloadOutcome::FileRemoved,
-            "deletion must record a file-removed outcome"
-        );
-        assert!(
-            record.detail.contains("file removed"),
-            "record: {:?}",
-            record.detail
-        );
-        assert_eq!(
-            current.vertices.len(),
-            vertices_before,
-            "deletion must never replace the on-screen model"
-        );
-    }
-
-    #[test]
-    fn hot_reload_fixed_file_replaces_with_success() {
-        // fix the file -> replaces + success (the only path that may
-        // swap the model — the invariant).
-        let p = temp_wrfm(
-            "inv-fixed",
-            "wrfm 1\nvertices 2   edges 1\n\nv 0 0 0\nv 1 0 0\ne 0 1\n",
-        );
-        let (mut current, mut name) = load_model(&p).unwrap();
-        let mut view = ViewState::default();
-        view.fit_to(&current);
-
-        // First break it: garbage -> Parse Error, model kept.
-        fs::write(&p, "garbage\n").unwrap();
-        let record =
-            handle_reload_event(ReloadEvent::Changed, &mut current, &mut name, &p).unwrap();
-        assert_eq!(record.outcome, ReloadOutcome::ParseError);
-        let kept = current.vertices.len();
-
-        // Then fix it: replaces + success.
-        fs::write(
- &p,
-            "wrfm 1\nvertices 4   edges 3\n\nv 0 0 0\nv 1 0 0\nv 0 1 0\nv 0 0 1\ne 0 1\ne 0 2\ne 0 3\n",
- )
- .unwrap();
-        let record =
-            handle_reload_event(ReloadEvent::Changed, &mut current, &mut name, &p).unwrap();
-        assert_eq!(record.outcome, ReloadOutcome::Ok);
-        assert_eq!(
-            record.detail, "model reloaded",
-            "record: {:?}",
-            record.detail
-        );
-        assert_eq!(
-            current.vertices.len(),
-            4,
-            "a fixed file must replace the model (was {kept})"
-        );
-    }
-
-    #[test]
-    fn hot_reload_unchanged_produces_no_event() {
-        // Unchanged -> no event line (the previous event stays until
-        // the next one replaces it).
-        let p = temp_wrfm(
-            "inv-unchanged",
-            "wrfm 1\nvertices 1   edges 1\n\nv 0 0 0\ne 0 0\n",
-        );
-        let (mut current, mut name) = load_model(&p).unwrap();
-        let mut view = ViewState::default();
-        view.fit_to(&current);
-        assert_eq!(
-            handle_reload_event(ReloadEvent::Unchanged, &mut current, &mut name, &p,),
-            None,
-            "Unchanged must not emit an event line"
-        );
-    }
-
-    // --- HUD layout (status line / event rows) ---
-
-    #[test]
-    fn status_expired_after_timeout() {
-        // The status line is transient: no deadline -> never expires; a
-        // future deadline -> still shown; a passed deadline -> cleared so
-        // the event region's rows return to the model canvas.
-        let now = Instant::now();
-        assert!(
-            !status_expired(None, now),
-            "no deadline must never be treated as expired"
-        );
-        assert!(
-            !status_expired(Some(now + STATUS_TIMEOUT), now),
-            "a deadline in the future must keep the status on screen"
-        );
-        assert!(
-            status_expired(Some(now), now + STATUS_TIMEOUT),
-            "a passed deadline must clear the status"
-        );
-    }
-
-    #[test]
-    fn hud_status_for_maps_all_four_states() {
-        // Every reload outcome has a HUD line (transient 5 s); the four
-        // states are ok / parse error / file removed (Unchanged shows
-        // nothing — it never produces a record).
-        assert_eq!(hud_status_for(ReloadOutcome::Ok), "hot-reloaded");
-        assert_eq!(hud_status_for(ReloadOutcome::ParseError), "parse error");
-        assert_eq!(hud_status_for(ReloadOutcome::FileRemoved), "file removed");
-    }
-
-    #[test]
-    fn status_line_is_single_and_compact() {
-        // The row-1 status is ONE line: the outcome label plus a compact
-        // detail (the parse error's first line only, never the report body).
-        let ok = ReloadRecord {
-            outcome: ReloadOutcome::Ok,
-            detail: "model reloaded".to_string(),
-        };
-        assert_eq!(status_line(&ok), "hot-reloaded");
-
-        let err = ReloadRecord {
-            outcome: ReloadOutcome::ParseError,
-            detail: "Parse Error: error: invalid vertex at line 4, column 1\n 4 | v 1 1\n   |   ^^"
-                .to_string(),
-        };
-        let line = status_line(&err);
-        assert_eq!(line, "parse error: invalid vertex at line 4, column 1");
-        assert!(!line.contains('\n'), "the report body must be cut: {line}");
-
-        let removed = ReloadRecord {
-            outcome: ReloadOutcome::FileRemoved,
-            detail: "file removed (deleted or renamed away); keeping last model".to_string(),
-        };
-        let line = status_line(&removed);
-        assert!(!line.contains('\n'), "must stay one row: {line}");
-        assert!(line.contains("keeping last model"), "{line}");
-    }
-
-    #[test]
-    fn hud_fixed_row_always_present_and_quiet_has_no_event_region() {
-        // The fixed Row 0 is always present; with no event the event region
-        // is absent and the canvas starts at row 1.
+    fn hud_row0_carries_the_name_view_and_optional_label() {
+        // Row 0 is always the fixed model + view line. A stream preview may
+        // override the title (the FIFO path, whose model name is only the
+        // file stem); otherwise the model name shows, and the collapsed HUD
+        // appends the help hint.
         let view = ViewState::default();
-        let (row0, events, reserved) = hud_layout("cube", &view, "", 24, true, None);
+        let row0 = hud_layout("cube", &view, true, None);
         assert!(
             row0.starts_with("Wireforge: cube | yaw="),
             "fixed row must carry the model name and view: {row0}"
@@ -1798,41 +1308,20 @@ mod tests {
             row0.contains("dist=") && row0.contains("pan=("),
             "row0: {row0}"
         );
-        assert!(events.is_empty(), "no event -> no event lines");
-        assert_eq!(reserved, 0, "quiet -> canvas starts at row 1");
-    }
+        assert!(row0.ends_with("[?] keys"), "collapsed hint: {row0}");
 
-    #[test]
-    fn hud_event_rows_appear_and_reserve_canvas_rows() {
-        // On an event the event region renders below Row 0 (multiline for a
-        // Parse Error) and the canvas loses those rows.
-        let view = ViewState::default();
-        let msg = "Parse Error: error: invalid vertex at line 2, column 1\n   |\n 2 | v 1 1\n   |   ^^\nexpected a number for the z coordinate, got `2`";
-        let (row0, events, reserved) = hud_layout("cube", &view, msg, 24, true, None);
-        assert_eq!(events.len(), 5, "multiline event splits into lines");
-        assert_eq!(reserved, 5, "event region reserves its rows below row 0");
+        let labelled = hud_layout("stream", &view, false, Some("/tmp/stream.fifo"));
         assert!(
-            !row0.contains("Parse Error"),
-            "event text must never be squeezed into Row 0"
+            labelled.starts_with("Wireforge: /tmp/stream.fifo |"),
+            "row0: {labelled}"
         );
-        assert!(events[0].starts_with("Parse Error:"), "{}", events[0]);
+        assert!(
+            !labelled.contains("[?] keys"),
+            "the expanded HUD hides the hint: {labelled}"
+        );
     }
 
-    #[test]
-    fn hud_event_region_clamped_to_available_rows() {
-        // A very long Parse Error must not push the canvas off screen: the
-        // event region is clamped to height - 1.
-        let view = ViewState::default();
-        let msg = (0..40)
-            .map(|i| format!("line {i}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let (_, events, reserved) = hud_layout("cube", &view, &msg, 5, true, None);
-        assert_eq!(reserved, 4, "event region clamps to height - 1");
-        assert_eq!(events.len(), 40, "all lines are kept for rendering");
-    }
-
-    // ---------- stream input (stdin / FIFO one-shot) ----------
+    // ---------- stream input (stdin / FIFO) ----------
 
     #[test]
     fn probe_bytes_wrfm_magic() {
@@ -1895,31 +1384,7 @@ mod tests {
             .err()
             .expect("obj stream must not load");
         assert!(err.contains("wrfm convert"), "error: {err}");
-    }
-
-    #[test]
-    fn hud_one_shot_label_in_row_zero() {
-        // In one-shot mode Row 0 advertises the no-hot-reload preview so the
-        // user is never surprised by a preview that never refreshes.
-        let view = ViewState::default();
-        let (row0, _, _) = hud_layout(
-            "stdin",
-            &view,
-            "",
-            24,
-            true,
-            Some("stdin preview (no hot-reload)"),
-        );
-        assert!(
-            row0.starts_with("Wireforge: stdin preview (no hot-reload) |"),
-            "row0: {row0}"
-        );
-        // A regular file passes None and keeps the model name.
-        let (row0b, _, _) = hud_layout("cube", &view, "", 24, true, None);
-        assert!(row0b.starts_with("Wireforge: cube |"), "row0: {row0b}");
-    }
-
-    // ---------- event loop (input / holds) ----------
+    } // ---------- event loop (input / holds) ----------
 
     #[test]
     fn app_handle_input_toggles() {
@@ -1930,7 +1395,6 @@ mod tests {
             },
             "cube".to_string(),
             None,
-            PathBuf::from("cube.wrfm"),
         );
         app.dirty = false;
 
@@ -1998,7 +1462,6 @@ mod tests {
             },
             "cube".to_string(),
             None,
-            PathBuf::from("cube.wrfm"),
         );
         app.view.fit_to(&app.current);
         let yaw0 = app.view.yaw;
@@ -2038,7 +1501,6 @@ mod tests {
             },
             "cube".to_string(),
             None,
-            PathBuf::from("cube.wrfm"),
         );
         // Press -> held; Release -> removed immediately (Kitty protocol).
         let press = Event::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
@@ -2226,7 +1688,6 @@ mod tests {
             },
             "cube".to_string(),
             None,
-            PathBuf::from("cube.wrfm"),
         );
         // Press `h` (rotate), then press Shift: the Repeat now spells "move",
         // but it is still the same key, so there is exactly one hold — and a
@@ -2313,7 +1774,6 @@ mod tests {
             },
             "cube".to_string(),
             None,
-            PathBuf::from("cube.wrfm"),
         );
         app.handle_input(Event::Key(KeyEvent::new(
             KeyCode::Right,
@@ -2346,7 +1806,6 @@ mod tests {
             },
             "cube".to_string(),
             None,
-            PathBuf::from("cube.wrfm"),
         );
         let mut release = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
         release.kind = KeyEventKind::Release;
@@ -2388,7 +1847,6 @@ mod tests {
             },
             "cube".to_string(),
             None,
-            PathBuf::from("cube.wrfm"),
         );
         for key in ['j', 'l'] {
             app.handle_input(Event::Key(KeyEvent::new(
@@ -2431,7 +1889,6 @@ mod tests {
             },
             "cube".to_string(),
             None,
-            PathBuf::from("cube.wrfm"),
         );
         app.handle_input(Event::Key(KeyEvent::new(
             KeyCode::Right,
@@ -2455,7 +1912,6 @@ mod tests {
             },
             "cube".to_string(),
             None,
-            PathBuf::from("cube.wrfm"),
         );
         app.handle_input(Event::Key(KeyEvent::new(
             KeyCode::Char(' '),
@@ -2486,48 +1942,5 @@ mod tests {
             .expect("repeat must keep the hold")
             .seen;
         assert!(refreshed >= seen, "auto-repeat must refresh the hold");
-    }
-
-    #[test]
-    fn reload_event_loop_schedules_deferred_parse() {
-        let mut timers = TimerScheduler::new();
-        let mut app = App::new(
-            Model {
-                vertices: vec![(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)],
-                edges: vec![(0, 1)],
-            },
-            "cube".to_string(),
-            None,
-            PathBuf::from("cube.wrfm"),
-        );
-        // Changed -> no immediate status, but a deferred parse is scheduled.
-        let changed = handle_reload_event_loop(&mut app, &mut timers, ReloadEvent::Changed);
-        assert!(!changed);
-        let parse_deadline = timers
-            .earliest()
-            .expect("a change must arm the deferred parse");
-        let expected = Instant::now() + SETTLE_DELAY;
-        let diff = if parse_deadline > expected {
-            parse_deadline - expected
-        } else {
-            expected - parse_deadline
-        };
-        assert!(
-            diff <= Duration::from_millis(50),
-            "deferred parse deadline should be ~SETTLE_DELAY from now"
-        );
-        // Missing -> immediate status + StatusExpiry timer.
-        let missing = handle_reload_event_loop(&mut app, &mut timers, ReloadEvent::Missing);
-        assert!(missing);
-        assert!(app.status_msg.contains("removed"));
-        assert!(
-            !app.status_msg.contains('\n'),
-            "the status must stay a single row: {:?}",
-            app.status_msg
-        );
-        // Clear the pending parse so the status-expiry timer is the earliest.
-        timers.cancel(TimerId::ReloadParse);
-        assert!(timers.earliest().is_some(), "status expiry must be armed");
-        assert!(app.dirty);
     }
 }

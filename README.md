@@ -1,7 +1,6 @@
 # Wireforge
 
-A text format, a parser, a Unix-style CLI, and a terminal viewer that updates
-as you edit.
+A text format, a parser, a Unix-style CLI, and a terminal viewer.
 
 ![Wireforge viewing a braille-rendered Utah teapot](assets/wireforge.png)
 
@@ -24,18 +23,16 @@ Wireforge is a small set of tools arranged around that format:
   serializes it, with `no_std` support and exact `f64` round-trips.
 - **[`wrfm` CLI](crates/wrfm-cli)** — thirteen subcommands that check, verify,
   inspect, query, transform, edit, render and diff models over plain stdio.
-- **`wireforge`** — the viewer. Open a file, keep editing it, and watch the
-  wireframe update on every save.
+- **`wireforge`** — the viewer. Open a file and turn it around with the
+  keyboard.
 
 Each part works on its own.
 
 ## Features
 
-- **It reloads itself.** Point the viewer at a file and keep editing it in Vim,
-  Helix, or VS Code in the next pane. Every save shows up on screen
-  immediately, with the camera exactly where you left it. Half-written files
-  and atomic-rename saves are handled too. The viewer keeps the last good
-  model until the new one is readable.
+- **Content, not extensions.** The viewer sniffs what it is given: a model in
+  a `.txt` opens as a model, an OBJ file is pointed at `wrfm convert`, and a
+  broken model fails with the parser's line-and-column report on stderr.
 - **The camera is your keyboard.** Rotate, pan and zoom with `hjkl`, the arrow
   keys, and a few more; `Ctrl` turns the model around its own axes instead of
   the world's; `Shift + f` frames whatever is in the file. A HUD line always

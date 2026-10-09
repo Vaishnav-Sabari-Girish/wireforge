@@ -24,6 +24,3 @@ libc = "0.2"
 
 [features]
 default = []
-
-[target.'cfg(target_os = "linux")'.dependencies]
-inotify = { version = "0.11", default-features = false }
