@@ -20,7 +20,7 @@ repository = "https://github.com/lenitain/wireforge"
 clap = { version = "4.6.1", features = ["derive"] }
 ratatui = { version = "0.30.1", default-features = false }
 wrfm = { version = "0.5.0", path = "crates/wrfm" }
-wrfm-raster = { path = "crates/wrfm-raster" }
+wrfm-raster = { version = "0.1.0", path = "crates/wrfm-raster" }
 
 [package]
 name = "wireforge"
