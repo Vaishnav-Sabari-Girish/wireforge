@@ -1,4 +1,13 @@
 
+## Unreleased
+
+
+
+### :rocket: New features
+
+- **(viewer)** Start with an empty canvas when FILE is omitted
+
+
 ## v0.8.0 - 2026-10-09
 
 
