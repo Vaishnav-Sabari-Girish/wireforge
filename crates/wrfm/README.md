@@ -1,18 +1,17 @@
 # wrfm
 
-A fast, zero-dependency parser and serializer for the `.wrfm` 3D wireframe
+A zero-dependency parser and serializer for the `.wrfm` 3D wireframe
 format.
 
-This crate provides a memory-efficient `WrfmModel` struct to load, manipulate,
-and save 3D models consisting of vertices and edges. It is designed to act as
-the core data backbone for tools like `wireforge` and terminal rendering
-engines like `ratatui-wireframe`.
+This crate provides a `WrfmModel` struct to load, manipulate, and save
+models of vertices and edges. `wireforge` uses it, and the format itself is
+consumed natively by
+[`ratatui-wireframe`](https://crates.io/crates/ratatui-wireframe).
 
 ## The `.wrfm` Format
 
-The `.wrfm` file type is a minimalist, human-readable text format used to
-define 3D wireframes. A v1 file is plain UTF-8 text with one element per
-line:
+The `.wrfm` file type is a plain text format for defining 3D wireframes. A
+v1 file is UTF-8 text with one element per line:
 
 * `wrfm <version>` — magic line, required as the FIRST line of the file (a
   UTF-8 BOM is tolerated before it; nothing else may precede it). Version `1`
@@ -45,8 +44,8 @@ group bottom
 ```
 
 Coordinates are parsed and serialized at full `f64` precision with the
-shortest round-trip representation: `1.0 / 3.0` round-trips as
-`0.3333333333333333`, never quantized.
+shortest round-trip representation, so `1.0 / 3.0` round-trips as
+`0.3333333333333333` and is never quantized.
 
 ## Usage
 
@@ -54,9 +53,9 @@ Add `wrfm` to your `Cargo.toml`.
 
 ### Loading a Model
 
-You can parse a model directly from a file path. The parser gracefully skips
-empty lines and comments. `from_file` returns a `LoadError`, which is either
-an I/O error or a structured `ParseError`:
+You can parse a model directly from a file path. The parser skips empty
+lines and comments. `from_file` returns a `LoadError`, which is either an
+I/O error or a structured `ParseError`:
 
 ```rust
 use wrfm::{LoadError, WrfmModel};
@@ -103,7 +102,7 @@ fn main() {
 }
 ```
 
-Parsing is lenient by default: unknown lines are skipped silently. Use
+Parsing is lenient by default, and unknown lines are skipped silently. Use
 `WrfmModel::parse_with(name, input, true)` to reject unknown directives, and
 note that out-of-range edge indices are never tolerated (validated against the
 final vertex count, so forward references to later-defined vertices are fine).
@@ -112,8 +111,8 @@ The v1 magic, counts header and declared counts are enforced in both modes.
 ### Creating and Saving a Model
 
 You can build a `WrfmModel` programmatically and serialize it back to disk.
-`save_to_file` writes canonical v1: the magic line, a counts header, optional
-`group` sections (in order) and then all edges.
+`save_to_file` writes canonical v1, containing the magic line, a counts
+header, optional `group` sections (in order) and then all edges.
 
 ```rust
 use wrfm::{Group, WrfmModel};

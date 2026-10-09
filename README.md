@@ -1,147 +1,85 @@
 # Wireforge
 
-A TUI-based viewer and live-editor for `.wrfm` files.
+A text format, a parser, a Unix-style CLI, and a terminal viewer that updates
+as you edit.
 
-It allows users to visualize, test, and create braille-based 3D wireframes
-which can be natively consumed by the
-[`ratatui-wireframe`](https://crates.io/crates/ratatui-wireframe) rendering
-crate.
+![Wireforge viewing a braille-rendered Utah teapot](assets/wireforge.png)
+
+## Overview
+
+`.wrfm` is a 3D model format containing a set of points and the lines between
+them. The file opens with a magic line (`wrfm 1`) and a counts header, then
+`v <x> <y> <z>` lines for the points and `e <a> <b>` lines for the lines. `#`
+starts a comment; named groups are optional. A tetrahedron fits in twenty
+lines.
+
+Because it is plain text, the ordinary tools already work on it. Your editor
+edits it, `diff` shows what changed, a pipe carries it, and a whole model fits
+in a code review.
+
+Wireforge is a small set of tools arranged around that format:
+
+- **`.wrfm`** — the format itself.
+- **[`wrfm`](crates/wrfm)** — a zero-dependency Rust library that parses and
+  serializes it, with `no_std` support and exact `f64` round-trips.
+- **[`wrfm` CLI](crates/wrfm-cli)** — thirteen subcommands that check, verify,
+  inspect, query, transform, edit, render and diff models over plain stdio.
+- **`wireforge`** — the viewer. Open a file, keep editing it, and watch the
+  wireframe update on every save.
+
+Each part works on its own.
 
 ## Features
 
-- **Instant Hot-Reloading:** Open a `.wrfm` file in your favorite text editor
-  (Neovim, VSCode, etc.) and run `wireforge` in an adjacent terminal pane.
-  Every time the file changes on disk the 3D model instantly updates on
-  screen. The file is watched by polling its modification time and length,
-  so atomic-rename saves and file re-creation are caught too; a half-written
-  or deleted file keeps the last good model on screen and recovers
-  automatically. The camera is preserved across reloads.
-- **Interactive 6-DOF Viewport:** Freely rotate (yaw / pitch / roll) and
-  move (Shift + arrows or hjkl, plain `=` / `-`) the model with your
-  keyboard, toggle auto-spin with `Space`, center with `f` or fit with
-  `Shift + f`, and read the current camera from the HUD line. Plain
-  rotation keys turn the world axes and read left/right as you see them
-  (the model faces you); `Ctrl` + arrows / `hjkl` / `e` / `r` turns the
-  model's own axes and its own left/right instead (local frame). XYZ axes can be
-  toggled with `Tab`.
-- **Stream input:** `wireforge -` reads a model from stdin (or a FIFO such
-  as `<( cat model.wrfm )`) as a one-shot preview with no hot-reload.
-  Keyboard input still works via the controlling terminal.
-- **Zero-Dependency CPU Rendering:** Uses mathematical projection and braille
-  characters to render 3D shapes in any standard terminal emulator. The
-  render loop is event-driven: it is fully idle (0% CPU) when nothing
-  changes and redraws uncapped while you animate.
+- **It reloads itself.** Point the viewer at a file and keep editing it in Vim,
+  Helix, or VS Code in the next pane. Every save shows up on screen
+  immediately, with the camera exactly where you left it. Half-written files
+  and atomic-rename saves are handled too. The viewer keeps the last good
+  model until the new one is readable.
+- **The camera is your keyboard.** Rotate, pan and zoom with `hjkl`, the arrow
+  keys, and a few more; `Ctrl` turns the model around its own axes instead of
+  the world's; `Shift + f` frames whatever is in the file. A HUD line always
+  tells you where you are, and `?` shows every binding.
+- **Everything is a pipe.** The viewer reads stdin (`wireforge -`), and the CLI
+  never touches the disk, so the whole toolchain composes the way you would
+  expect:
 
-## Installation
+  ```bash
+  wrfm convert mouse.obj | wireforge -
+  wrfm edit model.wrfm --extract-group cabinet | wrfm transform - --scale 2 | wireforge -
+  ```
 
-### AUR
+- **It is light.** Rendering runs on the CPU only, drawing braille cells, with
+  no GPU, no GUI toolkit, and no display server. The event loop sleeps when
+  nothing changes and redraws at full speed while you animate. Projection and
+  rasterization switch to parallel (rayon) paths on large models.
+- **Built for scripts.** Data goes to stdout, diagnostics go to stderr, and the
+  exit code tells you how things are, whether ok, warn, or broken. A CI job can
+  assert on a model the same way it asserts on a test suite.
 
-```bash
-# Without 3D model support
-yay -S wireforge
-# OR
-paru -S wireforge
-```
-
-### crates.io
+## Getting started
 
 ```bash
-# Without 3D
 cargo install wireforge
 ```
 
-### Build from source
+It is also on the [AUR](https://aur.archlinux.org/packages/wireforge), and can
+be built from source with `cargo build --release`. [SPEC.md](SPEC.md) walks
+through installation, the viewer, its key bindings, and the format itself.
 
-```bash
-git clone https://github.com/Vaishnav-Sabari-Girish/wireforge.git
-cd wireforge
-cargo build --release
-```
+## Documentation
 
-## Usage
+[SPEC.md](SPEC.md) — installation, viewer usage, the full key table, and the
+`.wrfm` format.
 
-Point `wireforge` to any `.wrfm` file (the format is detected from the file's
-content, so the extension does not matter):
+[crates/wrfm-cli/README.md](crates/wrfm-cli/README.md) — the complete CLI
+reference, covering every subcommand, recipe, and exit-code contract.
 
-```bash
-wireforge path/to/model.wrfm
+[crates/wrfm/README.md](crates/wrfm/README.md) — using the parser library and
+the authoritative prose specification of the format.
 
-# Example
-wireforge cube.wrfm
-```
+[CHANGELOG.md](CHANGELOG.md) — release history.
 
-OBJ files are converted first with `wrfm convert` (part of
-[`wrfm-cli`](crates/wrfm-cli/README.md)), then piped in like any other model:
+## License
 
-```bash
-wrfm convert mouse.obj | wireforge -
-```
-
-Or pipe a model in for a one-shot preview (no hot-reload):
-
-```bash
-cat model.wrfm | wireforge -
-wireforge <( cat model.wrfm )
-```
-
-You can also build a transform with `wrfm-cli` and view it directly:
-
-```bash
-wrfm edit model.wrfm --extract-group cabinet | wrfm transform - --scale 2 | wireforge -
-```
-
-### TUI Controls
-
-| Key                             | Action                                                                         |
-| :------------------------------ | :----------------------------------------------------------------------------- |
-| `Space`                         | Toggle automatic spinning                                                      |
-| `↑` / `↓`                       | Rotate Pitch (X-axis)                                                          |
-| `←` / `→`                       | Rotate Yaw (Y-axis)                                                            |
-| `h` / `j` / `k` / `l`           | Rotate Yaw / Pitch (same as `←` / `→` / `↑` / `↓`)                             |
-| `r` / `e`                       | Rotate Roll (Z-axis)                                                           |
-| `Ctrl` + `←` / `→` / `↑` / `↓`  | Rotate Yaw / Pitch around the model's own axes (local frame)                   |
-| `Ctrl` + `h` / `j` / `k` / `l`  | Rotate Yaw / Pitch around the model's own axes (same as `←` / `→` / `↑` / `↓`) |
-| `Ctrl` + `r` / `e`              | Rotate Roll around the model's own (local) Z-axis                              |
-| `Shift` + `←` / `→` / `↑` / `↓` | Move the model                                                                 |
-| `Shift` + `h` / `j` / `k` / `l` | Move the model                                                                 |
-| `=` / `-`                       | Move nearer / farther                                                          |
-| `f`                             | Center the file origin                                                         |
-| `Shift` + `f`                   | Fit the model to the view                                                      |
-| `0`                             | Reset rotation and distance                                                    |
-| `?`                             | Toggle the key help overlay                                                    |
-| `Tab` / `Shift` + `Tab`         | Toggle the XYZ axes                                                            |
-| `q` / `Esc` / `Ctrl` + `C`      | Quit the application                                                           |
-
-## The `.wrfm` Format
-
-The `.wrfm` format (v1) is a dead-simple, human-readable text format for
-defining 3D vertices and the edges that connect them.
-
-- The first line is the magic and version: `wrfm 1`.
-- The second line is a counts header: `vertices <N>   edges <M>` (the
-  declared counts must match the lines that follow).
-- `v <x> <y> <z>` defines a vertex in 3D space.
-- `e <index1> <index2>` defines an edge connecting two vertices (0-indexed
-  based on the order they appear).
-- Lines starting with `#` are comments; `group <name>` opens a named
-  section (optional).
-
-**Example: `tetrahedron.wrfm`**
-
-```text
-wrfm 1
-vertices 4   edges 6
-
-# Name: Regular Tetrahedron
-v 1.0 1.0 1.0
-v 1.0 -1.0 -1.0
-v -1.0 1.0 -1.0
-v -1.0 -1.0 1.0
-
-e 0 1
-e 0 2
-e 0 3
-e 1 2
-e 2 3
-e 3 1
-```
+[MIT](LICENSE)

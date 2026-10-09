@@ -2,7 +2,7 @@
 name = "wrfm-cli"
 version = "0.1.0"
 edition = "2024"
-description = "Command-line tool for .wrfm 3D wireframe models: check / info / group / geometry / query / view / render / transform / edit / diff over streams"
+description = "Command-line tool for .wrfm 3D wireframe models over streams"
 readme = "README.md"
 license = "MIT"
 authors = ["lenitain <xt.zhu@qq.com>"]
