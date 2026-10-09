@@ -46,10 +46,21 @@ wireforge cube.wrfm
 The file is read once, when the viewer starts; run `wireforge` again after
 editing it.
 
+Run `wireforge` with no file at all and it opens the viewer with an empty
+model: the XYZ axes are drawn at the origin — the empty space itself — so
+rotating, panning and zooming still work, and Row 0 reads `Wireforge: no file`.
+It is safe to launch from a menu or a launcher and pass a model later:
+
+```bash
+wireforge
+```
+
 ### Stream input
 
 `wireforge -` reads a model from stdin (or a FIFO such as `<( cat model.wrfm )`)
-once, at start-up. Keyboard input still works via the controlling terminal:
+once, at start-up. Keyboard input still works via the controlling terminal.
+This is also what a bare `wireforge` does when its stdin is a **pipe**; the
+empty canvas above is for a terminal, where there is no stream to read.
 
 ```bash
 cat model.wrfm | wireforge -

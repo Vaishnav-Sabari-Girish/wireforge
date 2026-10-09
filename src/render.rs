@@ -372,6 +372,13 @@ impl Rasterizer {
 
         // Axes: 0.618 of the model's geometric-mean extent, transformed with
         // the model, Red/Yellow/LightBlue for X/Y/Z, toggled with Tab.
+        //
+        // An EMPTY model (the blank start-up view) still draws them: there
+        // the extent is the unit scene, so the three axes are the space
+        // itself — the origin cross that shows which way X, Y and Z point
+        // and that every camera key still works. It is also why the model
+        // extent is never zero or NaN (see `extent_from_bounds`): the axes
+        // would otherwise collapse onto the origin as a single dot.
         let mut labels: Vec<(f64, f64, &str, u8)> = Vec::new();
         if show_axes {
             let axis_len = view::model_extent(model) / 0.618;
@@ -829,6 +836,112 @@ mod tests {
         // non-space cell is the only change.
         let changed = s.present(&mut out).unwrap();
         assert_eq!(changed, 1);
+    }
+
+    /// The rows `(top, bottom)` that hold a cell of `color`, or `None` when
+    /// no cell of that color is on screen.
+    fn color_rows(screen: &Screen, color: Fg) -> Option<(usize, usize)> {
+        let (w, h) = screen.size();
+        let mut rows: Vec<usize> = Vec::new();
+        for y in 0..h {
+            if (0..w).any(|x| screen.cell(x, y) as u8 == color as u8) {
+                rows.push(y);
+            }
+        }
+        rows.first().copied().zip(rows.last().copied())
+    }
+
+    #[test]
+    fn empty_model_renders_the_origin_cross() {
+        // The blank start-up view (`wireforge` with no FILE): no geometry, but
+        // the space is still there — the three axes are drawn from the unit
+        // scene (see `extent_from_bounds`), so the viewer shows an origin
+        // cross instead of an empty field, and X/Y/Z stay visible labels.
+        let m = Model::default();
+        let mut v = ViewState::default();
+        v.fit_to(&m);
+        let mut raster = Rasterizer::new();
+        raster.resize(120, 29);
+        let mut screen = Screen::new(120, 30);
+        raster.render(&m, &v, (0, 1, 120, 29), true, &mut screen);
+
+        // All three axes are on screen, in their own colors.
+        for (axis, color) in [("X", Fg::Red), ("Y", Fg::Yellow), ("Z", Fg::LightBlue)] {
+            assert!(
+                color_rows(&screen, color).is_some(),
+                "{axis} axis must be drawn for an empty model"
+            );
+        }
+        // The cross is sized by the unit scene, not collapsed into one dot:
+        // the Y arm is 1.618 world units at the fit distance, which is a
+        // substantial part of a 29-row canvas.
+        let (top, bottom) = color_rows(&screen, Fg::Yellow).expect("Y axis");
+        assert!(
+            bottom - top >= 8,
+            "the origin cross must have real size, got rows {top}..={bottom}"
+        );
+        // It is a cross, not a full field: most cells stay untouched.
+        let lit = (0..30)
+            .flat_map(|y| (0..120).map(move |x| (x, y)))
+            .filter(|&(x, y)| screen.cell(x, y) != pack(' ', Fg::Default as u8))
+            .count();
+        assert!(
+            lit < 30 * 120 / 4,
+            "an empty scene must stay mostly blank, lit {lit} cells"
+        );
+    }
+
+    #[test]
+    fn empty_model_view_rotates_and_pans() {
+        // "The model is empty but the space still exists": every camera key
+        // must still change what is on screen, so the origin cross (the only
+        // geometry there is) has to move when the view does.
+        let m = Model::default();
+        let mut v = ViewState::default();
+        v.fit_to(&m);
+        let mut raster = Rasterizer::new();
+        raster.resize(120, 29);
+        let frame = |v: &ViewState, raster: &mut Rasterizer| {
+            let mut screen = Screen::new(120, 30);
+            raster.render(&m, v, (0, 1, 120, 29), true, &mut screen);
+            (0..30)
+                .flat_map(|y| (0..120).map(move |x| (x, y)))
+                .map(|(x, y)| screen.cell(x, y))
+                .collect::<Vec<u64>>()
+        };
+        // The X arm's endpoint is the corner the cross is read by.
+        let x_end = view::model_extent(&m) / 0.618;
+        let base = frame(&v, &mut raster);
+        let (x_before, _) =
+            view::project_point((x_end, 0.0, 0.0), &v, 116).expect("X arm must project");
+
+        v.add_yaw(0.4);
+        let yawed = frame(&v, &mut raster);
+        assert_ne!(base, yawed, "yaw must redraw the empty scene");
+        let (x_after, _) =
+            view::project_point((x_end, 0.0, 0.0), &v, 116).expect("X arm must project");
+        assert!(
+            (x_before - x_after).abs() > 1.0,
+            "yaw must swing the X axis across the canvas: {x_before} vs {x_after}"
+        );
+
+        v.pan_x = 1.0;
+        let panned = frame(&v, &mut raster);
+        assert_ne!(yawed, panned, "pan must redraw the empty scene");
+
+        v.add_dist_delta(-1.0);
+        let dollied = frame(&v, &mut raster);
+        assert_ne!(panned, dollied, "dolly must redraw the empty scene");
+
+        // Tab still turns the axes off: with no geometry, that now leaves a
+        // genuinely blank canvas.
+        let mut screen = Screen::new(120, 30);
+        raster.render(&m, &v, (0, 1, 120, 29), false, &mut screen);
+        let lit = (0..30)
+            .flat_map(|y| (0..120).map(move |x| (x, y)))
+            .filter(|&(x, y)| screen.cell(x, y) != pack(' ', Fg::Default as u8))
+            .count();
+        assert_eq!(lit, 0, "axes off on an empty model draws nothing");
     }
 
     #[test]

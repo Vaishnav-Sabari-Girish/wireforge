@@ -9,6 +9,13 @@ pub const FOV_DEG: f64 = 60.0;
 /// Auto-fit headroom: the model fills 1/FIT_MARGIN of the screen height.
 pub const FIT_MARGIN: f64 = 2.0;
 
+/// The extent reported for a model with no geometry. An empty model has
+/// `(inf, -inf)` bounds, whose dimensions are `-inf` and whose extent is
+/// `NaN`; this floor keeps every extent-derived value a real number (see
+/// [`extent_from_bounds`]). It also fixes what an empty scene is *taken to
+/// be* — unit scale, the same size as a model one unit across.
+pub const MIN_EXTENT: f64 = 1.0;
+
 /// A 3x3 row-major rotation matrix (model -> world).
 pub type Mat3 = [[f64; 3]; 3];
 
@@ -101,6 +108,12 @@ pub fn model_extent(m: &Model) -> f64 {
 
 /// [`model_extent`] from an already-computed bounding box — for callers
 /// that keep their own (e.g. rayon-parallel) `bounds` pass.
+///
+/// Never returns a non-finite value: a flat model floors at `1e-9` per axis,
+/// and an EMPTY model — whose [`bounds`] are `(inf, -inf)` and whose
+/// dimensions are therefore `-inf` — floors at [`MIN_EXTENT`]. The result is
+/// always `>= MIN_EXTENT`, so projecting with an extent-derived camera
+/// distance can never divide by a zero or NaN extent.
 pub fn extent_from_bounds(b: ([f64; 3], [f64; 3])) -> f64 {
     let (min, max) = b;
     let (dx, dy, dz) = (
@@ -108,7 +121,7 @@ pub fn extent_from_bounds(b: ([f64; 3], [f64; 3])) -> f64 {
         (max[1] - min[1]).max(1e-9),
         (max[2] - min[2]).max(1e-9),
     );
-    (dx * dy * dz).cbrt()
+    (dx * dy * dz).cbrt().max(MIN_EXTENT)
 }
 
 /// Auto camera distance (the fork's `fit_to` math): the geometric-mean
@@ -160,6 +173,36 @@ mod tests {
             model_extent(&long) < 20.0,
             "geomean dominated by the long axis"
         );
+    }
+
+    #[test]
+    fn empty_model_extent_is_finite() {
+        // A model with no vertices must not make every extent-derived value
+        // NaN: the dimensions of (inf, -inf) bounds are -inf, so the geomean
+        // is NaN and the fit distance would poison the whole projection.
+        let empty = Model::default();
+        assert_eq!(
+            model_extent(&empty),
+            MIN_EXTENT,
+            "an empty model must report MIN_EXTENT, never NaN"
+        );
+        let d = auto_dist(&empty);
+        assert!(
+            d.is_finite() && d > 0.0,
+            "auto-fit of an empty model must stay finite and positive, got {d}"
+        );
+        // The floor is the *unit scene*: an empty model sits at the viewer's
+        // default distance (1 / tan(FOV/2) * FIT_MARGIN).
+        let expected = 1.0 / (FOV_DEG / 2.0).to_radians().tan() * FIT_MARGIN;
+        assert!((d - expected).abs() < 1e-9, "got {d} expected {expected}");
+        // A single point (all dimensions zero, not an empty bounding box)
+        // stays finite too.
+        let point = Model {
+            vertices: vec![(5.0, 5.0, 5.0)],
+            edges: vec![],
+        };
+        let d = auto_dist(&point);
+        assert!(d.is_finite() && d > 0.0, "one-vertex model: {d}");
     }
 
     #[test]

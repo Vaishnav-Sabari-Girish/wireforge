@@ -30,7 +30,8 @@ Wireforge is a small set of tools arranged around that format:
   projection and braille rasterization used by both the CLI and the viewer,
   byte-identical to ratatui's canvas.
 - **`wireforge`** — the viewer. Open a file and turn it around with the
-  keyboard.
+  keyboard; run it with no file and the empty space still comes up, XYZ axes
+  and all.
 
 Each part works on its own.
 

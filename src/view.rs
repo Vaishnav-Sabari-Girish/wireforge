@@ -122,7 +122,10 @@ impl ViewState {
         self.dist = (self.dist + delta).clamp(0.05, 100_000.0);
     }
 
-    /// Auto-fit: set the distance so the model fills the view.
+    /// Auto-fit: set the distance so the model fills the view. An empty
+    /// model has no extent to frame, so it is framed as the unit scene (see
+    /// `extent_from_bounds`) — a finite distance, never the NaN an
+    /// `(inf, -inf)` bounding box would produce.
     pub fn fit_to(&mut self, m: &Model) {
         self.dist = auto_dist(m);
     }
@@ -542,6 +545,45 @@ mod tests {
             (v.yaw - 90.0f64.to_radians()).abs() < 1e-9,
             "yaw should accumulate under local spin, got {}",
             v.yaw
+        );
+    }
+
+    #[test]
+    fn empty_model_fits_at_a_finite_distance() {
+        // The blank start-up view: no vertices, so there is no extent to
+        // frame. The camera distance must still be a real number — a NaN or
+        // infinite distance turns every later projection into NaN and the
+        // canvas renders nothing at all.
+        let empty = Model::default();
+        let mut v = ViewState::default();
+        v.fit_to(&empty);
+        assert!(
+            v.dist.is_finite() && v.dist > 0.0,
+            "fit of an empty model must be finite and positive, got {}",
+            v.dist
+        );
+        // The floor is the unit scene (see `extent_from_bounds`), so the
+        // empty view is framed exactly like a unit-sized model would be.
+        let expected = 1.0 / (FOV_DEG / 2.0).to_radians().tan() * FIT_MARGIN;
+        assert!(
+            (v.dist - expected).abs() < 1e-9,
+            "got {} expected {expected}",
+            v.dist
+        );
+        // The origin — the only thing an empty scene has — projects to the
+        // centre of the canvas instead of vanishing to NaN.
+        let (x, y) = project_point((0.0, 0.0, 0.0), &v, 100).expect("origin must project");
+        assert!(x.abs() < 1e-9 && y.abs() < 1e-9, "origin at ({x},{y})");
+        // Reset (key `0`) re-fits and is equally safe on an empty model.
+        v.dist = 1234.0;
+        v.reset(&empty);
+        assert!(v.dist.is_finite() && v.dist > 0.0, "reset: {}", v.dist);
+        // Continuous motion scales by the model extent, which is undefined
+        // here: the pan must stay finite rather than running off to infinity.
+        let scale = model_extent(&empty);
+        assert!(
+            scale.is_finite() && scale > 0.0,
+            "move scale of an empty model must be finite, got {scale}"
         );
     }
 

@@ -1,4 +1,4 @@
-use clap::{CommandFactory, Parser};
+use clap::Parser;
 use crossterm::{
     cursor::{Hide, Show},
     event::{
@@ -59,7 +59,8 @@ const LEGACY_HOLD_TIMEOUT: Duration = Duration::from_secs(1);
     about = "TUI editor and viewer for .wrfm 3D models"
 )]
 struct Args {
-    /// `.wrfm` file to open, or `-` to read from stdin (the default when stdin is not a terminal)
+    /// `.wrfm` file to open, or `-` to read from stdin (the default when stdin is
+    /// not a terminal). Omit it on a terminal to open an empty canvas
     file: Option<PathBuf>,
 }
 
@@ -479,11 +480,16 @@ struct App {
 
 impl App {
     fn new(current: Model, name: String, row0_label: Option<String>) -> Self {
+        let mut view = ViewState::default();
+        // Frame the model (an empty one lands at the default distance), so a
+        // fresh App is always correctly framed — including the blank start-up
+        // view, whose extent is undefined.
+        view.fit_to(&current);
         App {
             current,
             name,
             row0_label,
-            view: ViewState::default(),
+            view,
             held: HashMap::new(),
             release_seen: false,
             auto_spin: false,
@@ -871,25 +877,34 @@ fn main() -> Result<(), Box<dyn Error>> {
         default_hook(info);
     }));
     let args = Args::parse();
-    // No FILE: read stdin when it is not a terminal (`cat m.wrfm | wireforge`).
-    // On a terminal the argument is genuinely missing, so fail the way clap
-    // would — same message and exit code 2 — instead of blocking on stdin EOF.
-    let target_file = match args.file {
-        Some(file) => file,
-        None if !io::stdin().is_terminal() => PathBuf::from("-"),
-        None => Args::command()
-            .error(
-                clap::error::ErrorKind::MissingRequiredArgument,
-                "the following required arguments were not provided:\n  <FILE>\n\n  \
-                 provide a .wrfm file path, or `-` (or a pipe) to read the model from stdin",
-            )
-            .exit(),
+    // FILE has no default value: what happens without it depends on stdin.
+    //
+    // * stdin is NOT a terminal: it is a stream (`cat m.wrfm | wireforge`),
+    //   so read the model from there — the same thing `wireforge -` asks for.
+    // * stdin IS a terminal: there is nothing to read and nothing to open,
+    //   so start with an empty canvas. The viewer comes up blank and stays
+    //   interactive (a model is only read at start-up; run wireforge with a
+    //   path to view one).
+    //
+    // A terminal check rather than `None == blank` outright: that keeps
+    // `wireforge < /dev/null` (a script, an editor, a null device) failing
+    // loudly instead of parking an invisible TUI on a blank screen. Use `-`
+    // for an explicit stdin read.
+    let blank = args.file.is_none() && io::stdin().is_terminal();
+    let target_file = if blank {
+        // No FILE and no stream: nothing to load. `target_file` is only read
+        // by the branches below, which this flag rules out.
+        PathBuf::new()
+    } else {
+        // FILE, or `-` for the stream a bare invocation implies when stdin is
+        // a pipe. A path is never guessed here.
+        args.file.unwrap_or_else(|| PathBuf::from("-"))
     };
 
     // Regular files are probed through PROBE_BYTES and loaded from the path;
     // `-`/FIFO read the whole stream once, at start-up.
     let is_stdin = target_file == Path::new("-");
-    let is_fifo = !is_stdin && is_fifo_path(&target_file);
+    let is_fifo = !is_stdin && !blank && is_fifo_path(&target_file);
     let is_stream = is_stdin || is_fifo;
     // Row 0 label override: the FIFO's full path (its model name is only the
     // file stem). stdin and regular files show their model name.
@@ -907,7 +922,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         std::process::exit(1);
     }
 
-    let (current_model, model_name) = if is_stream {
+    let (current_model, model_name) = if blank {
+        // No FILE on a terminal: nothing to read, nothing to open. The
+        // viewer starts on an empty canvas — Row 0 says "no file" — and every
+        // key keeps working; there is no model to rotate.
+        (Model::default(), "no file".to_string())
+    } else if is_stream {
         // Stream path: read all of stdin (or the FIFO) once, probe the
         // whole BUFFER (not the path) and parse it.
         let mut buf = String::new();
@@ -986,7 +1006,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     // L2 engine + viewer state.
     let (cols, rows) = crossterm::terminal::size()?;
     let mut app = App::new(current_model, model_name, row0_label);
-    app.view.fit_to(&app.current);
     let mut engine = Engine::new(cols as usize, rows as usize);
     let mut timers = TimerScheduler::new();
     let mut last = Instant::now();
@@ -1316,6 +1335,27 @@ mod tests {
         assert!(
             !labelled.contains("[?] keys"),
             "the expanded HUD hides the hint: {labelled}"
+        );
+    }
+
+    #[test]
+    fn hud_row0_names_the_empty_state() {
+        // Started with no FILE on a terminal: there is no model to name, so
+        // Row 0 says so and the view line still reports the camera.
+        let app = App::new(Model::default(), "no file".to_string(), None);
+        let row0 = hud_layout(
+            &app.name,
+            &app.view,
+            app.hud == Hud::Collapsed,
+            app.row0_label.as_deref(),
+        );
+        assert!(
+            row0.starts_with("Wireforge: no file | yaw="),
+            "blank row0: {row0}"
+        );
+        assert!(
+            row0.contains("dist=") && row0.ends_with("[?] keys"),
+            "blank row0 must keep the view line and the hint: {row0}"
         );
     }
 
