@@ -4,10 +4,7 @@ on:
   push:
       branches: [ "main" ]
       tags:
-          - "wireforge-v*"
-          - "wrfm-v*"
-          - "wrfm-cli-v*"
-          - "wrfm-raster-v*"
+          - "v*"
   workflow_dispatch:
 
 # We need to give the bot permission to push commits to your repo
@@ -21,7 +18,7 @@ concurrency:
 
 jobs:
   update-changelog:
-    name: Update CHANGELOG.md files
+    name: Update CHANGELOG.md
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -30,61 +27,17 @@ jobs:
           fetch-depth: 0
           ref: main
 
-      # wireforge (root package) — versioned by its own tags: wireforge-v*
-      # Commits that only touch crates/** belong to the sub-crates, not to wireforge
-      - name: Generate wireforge changelog
+      # wireforge is the only tagged project: its tags look like `v0.7.0`
+      - name: Generate a changelog
         uses: orhun/git-cliff-action@main
-        id: git-cliff-wireforge
+        id: git-cliff
         with:
           config: cliff.toml
           args: >-
             --verbose
-            --tag-pattern '^wireforge-v[0-9]'
-            --exclude-path 'crates/**'
+            --tag-pattern '^v[0-9]'
         env:
           OUTPUT: CHANGELOG.md
-          GITHUB_REPO: ${{ github.repository }}
-
-      # crates/wrfm — versioned by its own tags: wrfm-v*
-      - name: Generate wrfm changelog
-        uses: orhun/git-cliff-action@main
-        id: git-cliff-wrfm
-        with:
-          config: cliff.toml
-          args: >-
-            --verbose
-            --tag-pattern '^wrfm-v[0-9]'
-            --include-path 'crates/wrfm/**'
-        env:
-          OUTPUT: crates/wrfm/CHANGELOG.md
-          GITHUB_REPO: ${{ github.repository }}
-
-      # crates/wrfm-cli — versioned by its own tags: wrfm-cli-v*
-      - name: Generate wrfm-cli changelog
-        uses: orhun/git-cliff-action@main
-        id: git-cliff-wrfm-cli
-        with:
-          config: cliff.toml
-          args: >-
-            --verbose
-            --tag-pattern '^wrfm-cli-v[0-9]'
-            --include-path 'crates/wrfm-cli/**'
-        env:
-          OUTPUT: crates/wrfm-cli/CHANGELOG.md
-          GITHUB_REPO: ${{ github.repository }}
-
-      # crates/wrfm-raster — versioned by its own tags: wrfm-raster-v*
-      - name: Generate wrfm-raster changelog
-        uses: orhun/git-cliff-action@main
-        id: git-cliff-wrfm-raster
-        with:
-          config: cliff.toml
-          args: >-
-            --verbose
-            --tag-pattern '^wrfm-raster-v[0-9]'
-            --include-path 'crates/wrfm-raster/**'
-        env:
-          OUTPUT: crates/wrfm-raster/CHANGELOG.md
           GITHUB_REPO: ${{ github.repository }}
 
       - name: Commit and push changes
@@ -93,11 +46,11 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
 
-          # Add the updated files
-          git add CHANGELOG.md crates/wrfm/CHANGELOG.md crates/wrfm-cli/CHANGELOG.md crates/wrfm-raster/CHANGELOG.md
+          # Add the updated file
+          git add CHANGELOG.md
 
           # Commit the changes (the || exit 0 prevents the workflow from failing if there are no changes)
-          git commit -m "chore(changelog): update CHANGELOG.md files [skip ci]" || exit 0
+          git commit -m "chore(changelog): update CHANGELOG.md [skip ci]" || exit 0
 
           # Push the commit back to the branch
           git push origin HEAD:main || true
