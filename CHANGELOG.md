@@ -5,7 +5,28 @@
 
 ### :rocket: New features
 
+- **(viewer)** Draw a lualine-style statusline
+
 - **(viewer)** Start with an empty canvas when FILE is omitted
+
+
+### :bug: Bug fixes
+
+- **(render)** Clip segments at the near plane
+
+- **(hud)** Draw the model around the help panel
+
+
+### :zap: Performance
+
+- **(viewer)** Cache the model extent instead of rescanning per frame
+
+- **(viewer)** Size the raster canvas on Resize, not every frame
+
+
+### :recycle: Refactoring
+
+- **(render)** Drop allow(dead_code) from test-only accessors
 
 
 ## v0.8.0 - 2026-10-09
