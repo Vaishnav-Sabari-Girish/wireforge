@@ -2,8 +2,8 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use wrfm_raster::Model;
 use wrfm_raster::geometry::{auto_dist, bounds, world_rot};
-use wrfm_raster::projection::{Camera, focal};
-use wrfm_raster::raster::{Bounds, dots_to_lines, rasterize_line};
+use wrfm_raster::projection::{Camera, focal, project_camera_point};
+use wrfm_raster::raster::{Bounds, dots_to_lines, rasterize_camera_line};
 
 /// Camera distance used when `auto_dist=false` — the fork's default distance (no auto camera distance).
 pub const DEFAULT_DIST: f64 = 8.0;
@@ -426,12 +426,20 @@ fn render_braille(m: &Model, g: &GeomParams) -> Vec<String> {
 
     let mut dots = vec![0u8; cw * ch];
     for &(a, b) in &m.edges {
-        if let (Some(p1), Some(p2)) = (cam.project(m.vertices[a], f), cam.project(m.vertices[b], f))
-        {
-            rasterize_line(p1.0, p1.1, p2.0, p2.1, dots_w, dots_h, win, |cell, bit| {
-                dots[cell] |= bit
-            });
-        }
+        // Clip the edge at the camera's near plane instead of dropping it
+        // when one endpoint is culled: the part in front of the plane is
+        // still visible (see `rasterize_camera_line`). Both ends go through
+        // the same focal divide the vertex projection uses, so the clipped
+        // line lands exactly where the visible part belongs.
+        rasterize_camera_line(
+            cam.camera_space(m.vertices[a]),
+            cam.camera_space(m.vertices[b]),
+            |p| project_camera_point(p, f),
+            dots_w,
+            dots_h,
+            win,
+            |cell, bit| dots[cell] |= bit,
+        );
     }
     dots_to_lines(&dots, cw, ch)
 }
@@ -1590,6 +1598,39 @@ mod tests {
         assert_eq!(
             with_fit, without_fit,
             "explicit --region must win over --fit"
+        );
+    }
+
+    #[test]
+    fn edge_crossing_the_camera_plane_still_renders() {
+        // A frame whose only edge runs from in front of the camera plane to
+        // behind it: the visible part must be rasterized instead of the
+        // whole edge being dropped with its culled endpoint.
+        // The frame is 40x16 characters = 80x64 dots, so the canvas window
+        // is 40 wide either side of centre. At dist = 1 the visible vertex
+        // (depth 0.5) projects to x = 0.3 * focal(64) / 0.5 = 33.2, inside
+        // that window; its clipped end lands at half of it.
+        let m = Model {
+            vertices: vec![(0.3, 0.0, 0.5), (0.3, 0.0, 1.0)],
+            edges: vec![(0, 1)],
+        };
+        let mut o = opts(Format::Braille, vec![]);
+        o.auto_dist = false;
+        o.dist = Some(1.0); // camera at z = 1: depth is `dist - z` per vertex
+        let frame = render_single_to_text(&m, 0.0, 0.0, 0.0, &o);
+        assert!(
+            frame.chars().any(|c| c != ' ' && c != '\n'),
+            "the part of the edge in front of the camera must render:\n{frame}"
+        );
+        // An edge entirely behind the plane still renders nothing.
+        let behind = Model {
+            vertices: vec![(0.3, 0.0, 1.0), (0.3, 0.0, 2.0)],
+            edges: vec![(0, 1)],
+        };
+        let blank = render_single_to_text(&behind, 0.0, 0.0, 0.0, &o);
+        assert!(
+            blank.chars().all(|c| c == ' ' || c == '\n'),
+            "an edge behind the camera plane must not render:\n{blank}"
         );
     }
 

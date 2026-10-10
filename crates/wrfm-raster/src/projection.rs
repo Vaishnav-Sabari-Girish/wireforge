@@ -8,12 +8,34 @@
 
 use crate::geometry::{FOV_DEG, Mat3};
 
+/// How close to the camera a vertex may come before it counts as behind the
+/// camera plane: [`Camera::project_full`] culls a vertex whose depth
+/// (`dist - rz`, see [`Camera::camera_space`]) is at or below this, and
+/// [`crate::raster::rasterize_camera_line`] clips a segment crossing it.
+///
+/// The two MUST use the same value: a segment is only ever passed to the
+/// clipper with at least one endpoint the projection kept, and the clipper
+/// has to agree on where "kept" ends.
+pub const NEAR: f64 = 0.1;
+
 /// Focal length in canvas units for a dot-grid height of `px_h`:
 /// `f = (px_h / 2) / tan(FOV / 2)`.
 ///
 /// `px_h` is the grid height in DOTS (character rows x 4 for braille).
 pub fn focal(px_h: f64) -> f64 {
     (px_h / 2.0) / (FOV_DEG / 2.0).to_radians().tan()
+}
+
+/// Project one CAMERA-SPACE point (`Camera::camera_space` output) to canvas
+/// coordinates at focal length `f`: the focal divide `[x, y] * f / z`, with
+/// no rotation, pan or roll — those are already in the point.
+///
+/// This is what a clipped segment is drawn through, so the visible part
+/// keeps the position the vertex projection would have given it. The point
+/// must be in front of the camera plane (`z > NEAR`), which is what
+/// [`crate::raster::rasterize_camera_line`] guarantees when it calls this.
+pub fn project_camera_point(p: [f64; 3], f: f64) -> (f64, f64) {
+    (p[0] * f / p[2], p[1] * f / p[2])
 }
 
 /// One projected vertex: canvas coordinates (origin at the view centre,
@@ -80,7 +102,7 @@ impl Camera {
 
         // Fixed camera at [0,0,dist] looking down -Z.
         let z = self.dist - rz;
-        if z <= 0.1 {
+        if z <= NEAR {
             return None;
         }
 
@@ -100,6 +122,25 @@ impl Camera {
     /// Project one vertex to canvas coordinates; `None` behind the camera.
     pub fn project(&self, p: (f64, f64, f64), f: f64) -> Option<(f64, f64)> {
         self.project_full(p, f).map(|q| (q.px, q.py))
+    }
+
+    /// The camera-space position of a model-space vertex: `[x, y, z]` with
+    /// the pan added to `x`/`y`, straight through the model -> world
+    /// rotation, and `z` the depth in front of the camera (the `dist - rz`
+    /// of [`Camera::project_full`], so `z <= NEAR` is behind the plane).
+    ///
+    /// Canvas coordinates follow as `[x, y] * scale` — the [`focal`] length
+    /// of the grid. Callers that rasterize SEGMENTS rather than vertices
+    /// keep these points so they can clip at the near plane (see
+    /// [`crate::raster::rasterize_camera_line`]) instead of dropping a whole
+    /// segment because one endpoint is behind the camera.
+    pub fn camera_space(&self, p: (f64, f64, f64)) -> [f64; 3] {
+        let rot = self.rot;
+        [
+            rot[0][0] * p.0 + rot[0][1] * p.1 + rot[0][2] * p.2 + self.pan_x,
+            rot[1][0] * p.0 + rot[1][1] * p.1 + rot[1][2] * p.2 + self.pan_y,
+            self.dist - (rot[2][0] * p.0 + rot[2][1] * p.1 + rot[2][2] * p.2),
+        ]
     }
 
     /// Project one vertex into pre-allocated slots (for hot loops and rayon
@@ -129,6 +170,32 @@ impl Camera {
         debug_assert_eq!(verts.len(), ok.len());
         for i in 0..verts.len() {
             self.project_into(verts[i], f, &mut out[i], &mut ok[i]);
+        }
+    }
+
+    /// [`Camera::project_all`] plus the camera-space point of every vertex
+    /// that projected, for callers that rasterize SEGMENTS: a segment is
+    /// clipped at the near plane with [`crate::raster::rasterize_camera_line`]
+    /// rather than dropped when one of its endpoints is culled.
+    ///
+    /// `cam` is only written where `ok` becomes `true`, and the `out`/`ok`
+    /// results are identical to [`Camera::project_all`]'s.
+    pub fn project_all_with_camera_space(
+        &self,
+        verts: &[(f64, f64, f64)],
+        f: f64,
+        out: &mut [[f64; 2]],
+        ok: &mut [bool],
+        cam: &mut [[f64; 3]],
+    ) {
+        debug_assert_eq!(verts.len(), out.len());
+        debug_assert_eq!(verts.len(), ok.len());
+        debug_assert_eq!(verts.len(), cam.len());
+        for i in 0..verts.len() {
+            self.project_into(verts[i], f, &mut out[i], &mut ok[i]);
+            if ok[i] {
+                cam[i] = self.camera_space(verts[i]);
+            }
         }
     }
 }
@@ -390,6 +457,46 @@ mod tests {
                     (ok, want) => panic!("f32 cull mismatch {p:?}: ok={ok} want={want:?}"),
                 }
             }
+        }
+    }
+
+    #[test]
+    fn batch_projection_with_camera_space_matches_project_all() {
+        // The camera-space points are what the near-plane clipper clips:
+        // they must be the projection's own `(rx, ry, dist - rz)`, and `out`
+        // / `ok` must stay identical to the plain batch projection.
+        let cam = Camera::new(rot_axis([1.0, 2.0, 0.5], 37.0), 9.0, 0.4, 1.0, -1.0);
+        let f = focal(320.0);
+        let verts = points();
+        let n = verts.len();
+        let mut out = vec![[0.0; 2]; n];
+        let mut ok = vec![false; n];
+        let mut space = vec![[0.0; 3]; n];
+        cam.project_all_with_camera_space(&verts, f, &mut out, &mut ok, &mut space);
+        let mut want_out = vec![[0.0; 2]; n];
+        let mut want_ok = vec![false; n];
+        cam.project_all(&verts, f, &mut want_out, &mut want_ok);
+        assert_eq!(out, want_out, "screen coordinates to the bit");
+        assert_eq!(ok, want_ok, "cull flags to the bit");
+        for i in 0..n {
+            if !ok[i] {
+                continue;
+            }
+            let want = cam.camera_space(verts[i]);
+            assert_eq!(space[i], want, "camera-space point {i}");
+            // Depth counts UP from the camera and a projected vertex is in
+            // front of the plane.
+            let z = space[i][2];
+            assert!(z > NEAR, "a projected vertex sits in front: {i} z={z}");
+            // The canvas coordinate is the camera-space point at this scale
+            // up to the camera roll (which `camera_space` deliberately omits:
+            // clipping happens before it is applied).
+            let (sr, cr) = cam.roll.sin_cos();
+            let (dx, dy) = (space[i][0] - cam.pan_x, space[i][1] - cam.pan_y);
+            let rx = cam.pan_x + dx * cr - dy * sr;
+            let ry = cam.pan_y + dx * sr + dy * cr;
+            assert!((out[i][0] - rx * f / z).abs() < 1e-9, "px {i}");
+            assert!((out[i][1] - ry * f / z).abs() < 1e-9, "py {i}");
         }
     }
 

@@ -101,6 +101,71 @@ pub fn braille_char(pattern: u8) -> char {
     BRAILLE[pattern as usize]
 }
 
+/// Clip one segment against the camera's near plane and rasterize the
+/// visible part into a braille grid.
+///
+/// `a` and `b` are camera-space points (`[x, y, z]`, `z` = distance in front
+/// of the camera, with `z <= NEAR` behind it, see
+/// [`crate::projection::NEAR`]); `project` maps such a point to canvas
+/// coordinates — for [`crate::projection::Camera`] that is the focal divide
+/// `[x, y] * focal / z`. [`crate::projection::project_camera_point`] is the
+/// free-function form of it.
+///
+/// Dropping a segment because ONE endpoint sits behind the camera plane
+/// throws away the part that is still in view: the whole segment vanishes.
+/// This clips the segment at the plane first and rasterizes the remainder
+/// through the SAME `project`, so the visible part lands exactly where its
+/// unclipped projection would. A segment entirely behind the plane draws
+/// nothing, and `project` is only ever called with points in front of the
+/// plane, so it never has to divide by a zero depth.
+pub fn rasterize_camera_line(
+    a: [f64; 3],
+    b: [f64; 3],
+    project: impl Fn([f64; 3]) -> (f64, f64),
+    px_w: usize,
+    px_h: usize,
+    bounds: Bounds,
+    on_cell: impl FnMut(usize, u8),
+) {
+    let Some((p1, p2)) = clip_near(a, b) else {
+        return;
+    };
+    let (x1, y1) = project(p1);
+    let (x2, y2) = project(p2);
+    rasterize_line(x1, y1, x2, y2, px_w, px_h, bounds, on_cell);
+}
+
+/// Clip a camera-space segment at the near plane, returning two
+/// camera-space points that are both in front of it (`z > NEAR`).
+///
+/// `None` when the whole segment is behind the plane. This is what
+/// [`rasterize_camera_line`] clips with; callers that want the clipped
+/// endpoint itself (to hang a label on, say) can call it directly.
+pub fn clip_near(a: [f64; 3], b: [f64; 3]) -> Option<([f64; 3], [f64; 3])> {
+    let near = crate::projection::NEAR;
+    let behind_a = a[2] <= near;
+    let behind_b = b[2] <= near;
+    if behind_a && behind_b {
+        return None;
+    }
+    if !behind_a && !behind_b {
+        return Some((a, b));
+    }
+    // One endpoint is behind the plane: solve `lerp(front, behind, t).z == near`.
+    let (front, behind) = if behind_a { (b, a) } else { (a, b) };
+    let t = (near - front[2]) / (behind[2] - front[2]);
+    let hit = [
+        front[0] + t * (behind[0] - front[0]),
+        front[1] + t * (behind[1] - front[1]),
+        near,
+    ];
+    if behind_a {
+        Some((hit, b))
+    } else {
+        Some((a, hit))
+    }
+}
+
 /// Encode a dot grid (`cw * ch` per-cell patterns, row-major) as braille
 /// lines. A zero pattern becomes a space — that is what ratatui's Canvas
 /// leaves in an empty buffer cell, so text output stays byte-identical.
@@ -364,5 +429,117 @@ mod tests {
         assert_eq!(get_point(20.0, -16.0, 40, 32, b), Some((39, 31)));
         assert_eq!(get_point(-20.1, 0.0, 40, 32, b), None);
         assert_eq!(get_point(0.0, 16.1, 40, 32, b), None);
+    }
+
+    /// Collect the cells `rasterize_camera_line` lights. A scale of 1 makes
+    /// the canvases below read as camera-space coordinates.
+    fn camera_line_cells(a: [f64; 3], b: [f64; 3], scale: f64) -> Vec<usize> {
+        let (px_w, px_h) = (40usize, 32usize);
+        let mut cells = Vec::new();
+        rasterize_camera_line(
+            a,
+            b,
+            |p| crate::projection::project_camera_point(p, scale),
+            px_w,
+            px_h,
+            Bounds::centered(px_w, px_h),
+            |cell, _| cells.push(cell),
+        );
+        cells.sort_unstable();
+        cells.dedup();
+        cells
+    }
+
+    #[test]
+    fn camera_line_clips_at_the_near_plane() {
+        // 40x32 dots with scale 1: the canvas covers x in [-20, 20].
+        // A segment from (30, 0, 2) — off the canvas to the right — to
+        // (2.5, 0, 0.05), whose second endpoint is behind the camera plane.
+        // It crosses the plane at x = 5.286…, so the visible part runs from
+        // the canvas edge in to x = 5.286: cells must be lit. Dropping the
+        // segment with its culled endpoint lit nothing at all.
+        let scale = 1.0;
+        let cells = camera_line_cells([30.0, 0.0, 2.0], [2.5, 0.0, 0.05], scale);
+        assert!(
+            !cells.is_empty(),
+            "the part of the segment in front of the camera must be drawn"
+        );
+        // The visible part ends mid-canvas, so the head of the clipped
+        // segment is lit while the tail (off the canvas edge) is not: the
+        // clipped segment spans a proper sub-run of the row, not the whole
+        // canvas width.
+        let (px_w, _px_h) = (40usize, 32usize);
+        assert!(
+            cells.len() < px_w / 2,
+            "the clipped segment must not span the canvas: {cells:?}"
+        );
+        assert!(
+            cells
+                .iter()
+                .all(|c| c / (px_w / 2) == cells[0] / (px_w / 2)),
+            "the segment stays on one row: {cells:?}"
+        );
+        // A segment whose visible part lies entirely outside the canvas
+        // draws nothing — clipping must not invent geometry.
+        assert!(
+            camera_line_cells([60.0, 0.0, 2.0], [40.0, 0.0, 0.05], scale).is_empty(),
+            "an off-canvas visible part stays off canvas"
+        );
+    }
+
+    #[test]
+    fn camera_line_keeps_fully_visible_segments_identical() {
+        // Both endpoints in front of the plane: this entry point must
+        // rasterize exactly what `rasterize_line` does with the same
+        // projection applied to the endpoints.
+        let f = crate::projection::focal(32.0);
+        let project = |p: [f64; 3]| crate::projection::project_camera_point(p, f);
+        let (a, b) = ([3.0, -2.0, 6.0], [-4.0, 5.0, 9.0]);
+        let want = {
+            let (px_w, px_h) = (40usize, 32usize);
+            let (x1, y1) = project(a);
+            let (x2, y2) = project(b);
+            let mut cells = Vec::new();
+            rasterize_line(
+                x1,
+                y1,
+                x2,
+                y2,
+                px_w,
+                px_h,
+                Bounds::centered(px_w, px_h),
+                |cell, _| cells.push(cell),
+            );
+            cells.sort_unstable();
+            cells.dedup();
+            cells
+        };
+        assert_eq!(camera_line_cells(a, b, f), want);
+    }
+
+    #[test]
+    fn camera_line_behind_the_camera_draws_nothing() {
+        // Both endpoints behind the plane: no dot, no panic (the clip
+        // denominator would be zero or negative here).
+        for b in [[0.0, 0.0, 0.05], [0.0, 0.0, 0.0], [0.0, 0.0, -5.0]] {
+            assert!(
+                camera_line_cells([1.0, 1.0, 0.1], b, 100.0).is_empty(),
+                "segment behind the camera plane drew dots: b={b:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn camera_line_at_the_plane_does_not_produce_nan() {
+        // An endpoint exactly ON the plane with the other one in front:
+        // the interpolation divides by (behind - front).z, which is zero
+        // when the "behind" endpoint sits exactly at NEAR. The clipped dot
+        // grid must stay a real coordinate (no NaN cell index).
+        let cells = camera_line_cells([0.0, 0.0, 1.0], [10.0, 0.0, crate::projection::NEAR], 1.0);
+        assert!(!cells.is_empty(), "the segment in front must still draw");
+        assert!(
+            cells.iter().all(|&c| c < 40 * 32),
+            "cell indices must stay in the grid: {cells:?}"
+        );
     }
 }

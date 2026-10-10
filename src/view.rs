@@ -202,13 +202,55 @@ pub fn model_extent(m: &Model) -> f64 {
 
 /// The shared camera built from this view state. `Camera::new` precomputes
 /// `roll.sin_cos()`, which is bit-identical to computing it per call.
-fn camera(v: &ViewState) -> Camera {
+pub fn camera(v: &ViewState) -> Camera {
     Camera::new(v.rot, v.dist, v.roll, v.pan_x, v.pan_y)
 }
 
 /// Project a model-space vertex to canvas coordinates; `None` when behind the camera.
+///
+/// Test-only since the renderer rasterizes clipped SEGMENTS from
+/// [`project_batch_with_camera_space`] instead; the parity tests still use
+/// this single-vertex form as their reference.
+#[cfg(test)]
 pub fn project_point(p: (f64, f64, f64), v: &ViewState, px_h: usize) -> Option<(f64, f64)> {
     camera(v).project(p, focal(px_h as f64))
+}
+
+/// [`project_batch`] plus every vertex's camera-space point, so callers that
+/// rasterize SEGMENTS can clip them at the near plane instead of dropping a
+/// whole segment because one endpoint is behind the camera.
+///
+/// Same two paths as [`project_batch`], with the same `out` and `ok`
+/// results: above [`PARALLEL_THRESHOLD`] the per-vertex work (projection and
+/// camera-space point) runs on rayon threads. `cam` is only written where
+/// `ok` becomes `true`.
+pub fn project_batch_with_camera_space(
+    verts: &[(f64, f64, f64)],
+    v: &ViewState,
+    px_h: usize,
+    out: &mut [[f64; 2]],
+    ok: &mut [bool],
+    cam: &mut [[f64; 3]],
+) {
+    let f = focal(px_h as f64);
+    let camera = camera(v);
+    if verts.len() >= PARALLEL_THRESHOLD {
+        // rayon: projecting a vertex and reading its camera-space point are
+        // independent per vertex (same split as `project_batch`).
+        verts
+            .par_iter()
+            .zip(out.par_iter_mut())
+            .zip(ok.par_iter_mut())
+            .zip(cam.par_iter_mut())
+            .for_each(|(((p, o), ok_slot), cam_slot)| {
+                camera.project_into(*p, f, o, ok_slot);
+                if *ok_slot {
+                    *cam_slot = camera.camera_space(*p);
+                }
+            });
+        return;
+    }
+    camera.project_all_with_camera_space(verts, f, out, ok, cam);
 }
 
 /// Batch-project all vertices (identical math to `project_point`).
@@ -217,6 +259,7 @@ pub fn project_point(p: (f64, f64, f64), v: &ViewState, px_h: usize) -> Option<(
 /// through the shared `project_into`; the serial path is the shared
 /// `project_all`. Both go through the same single-vertex implementation, so
 /// the parallel and serial results stay bit-identical.
+#[cfg(test)]
 pub fn project_batch(
     verts: &[(f64, f64, f64)],
     v: &ViewState,

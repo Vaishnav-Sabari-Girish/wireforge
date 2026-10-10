@@ -3,7 +3,9 @@ use std::io::Write;
 use wrfm_raster::Model;
 
 use crate::view::{self, ViewState};
-use wrfm_raster::raster::{Bounds, rasterize_line};
+use wrfm_raster::projection::focal;
+use wrfm_raster::projection::project_camera_point;
+use wrfm_raster::raster::{Bounds, clip_near, rasterize_camera_line};
 
 /// An empty cell: a space in the terminal's own colors, on its own background.
 const SPACE: u64 = (' ' as u64) << 16;
@@ -306,6 +308,9 @@ pub struct Rasterizer {
     proj32: Vec<[f32; 2]>,
     /// per-vertex "in front of the camera" flags
     proj_ok: Vec<bool>,
+    /// per-vertex camera-space point `[x, y, z]` (z = depth, `<= NEAR`
+    /// behind the camera), for near-plane clipping the segments
+    proj_cam: Vec<[f64; 3]>,
     /// projection cache key: the view that produced the cache
     proj_view: ViewState,
     /// projection cache key: dot-grid width
@@ -334,6 +339,7 @@ impl Rasterizer {
             proj: Vec::new(),
             proj32: Vec::new(),
             proj_ok: Vec::new(),
+            proj_cam: Vec::new(),
             proj_view: ViewState::default(),
             proj_px_w: 0,
             proj_px_h: 0,
@@ -349,6 +355,7 @@ impl Rasterizer {
         self.colors = vec![0; cw * ch];
         self.proj_px_w = 0;
         self.proj_px_h = 0;
+        self.proj_len = 0;
     }
 
     /// The canvas grid size in cells, `(width, height)` (used by the canvas
@@ -374,6 +381,8 @@ impl Rasterizer {
         self.proj32.resize(n, [0.0; 2]);
         self.proj_ok.clear();
         self.proj_ok.resize(n, false);
+        self.proj_cam.clear();
+        self.proj_cam.resize(n, [0.0; 3]);
         if n >= F32_PROJECT_THRESHOLD {
             view::project_batch_f32(
                 &model.vertices,
@@ -383,17 +392,27 @@ impl Rasterizer {
                 &mut self.proj_ok,
             );
             // Widen f32 -> f64 (exact) so the downstream clip/rounding runs
-            // in the same f64 math as the exact path.
+            // in the same f64 math as the exact path. The camera-space point
+            // stays f64: the clipper interpolates with it, and the f32
+            // screen coordinates would lose the far point of a long segment.
+            let cam = view::camera(view);
             for i in 0..n {
                 self.proj[i] = [self.proj32[i][0] as f64, self.proj32[i][1] as f64];
+                if self.proj_ok[i] {
+                    self.proj_cam[i] = cam.camera_space(model.vertices[i]);
+                }
             }
         } else {
-            view::project_batch(
+            // The camera-space point is what the near-plane clipper needs;
+            // the batch keeps the same per-vertex split as `project_batch`,
+            // so the parallel and serial results stay identical.
+            view::project_batch_with_camera_space(
                 &model.vertices,
                 view,
                 px_h,
                 &mut self.proj,
                 &mut self.proj_ok,
+                &mut self.proj_cam,
             );
         }
         self.proj_view = *view;
@@ -433,8 +452,9 @@ impl Rasterizer {
             // cyan, so the merge is order-independent.
             let (dots, colors) = rasterize_edges_par(
                 &model.edges,
-                &self.proj,
+                &self.proj_cam,
                 &self.proj_ok,
+                focal(px_h as f64),
                 self.cw,
                 px_w,
                 px_h,
@@ -444,22 +464,22 @@ impl Rasterizer {
             self.colors = colors;
         } else {
             for &(a, b) in &model.edges {
-                if self.proj_ok[a] && self.proj_ok[b] {
-                    let [x1, y1] = self.proj[a];
-                    let [x2, y2] = self.proj[b];
-                    paint_line_into(
-                        x1,
-                        y1,
-                        x2,
-                        y2,
-                        cyan,
-                        self.cw,
-                        px_w,
-                        px_h,
-                        &mut self.dots,
-                        &mut self.colors,
-                    );
+                if !self.proj_ok[a] && !self.proj_ok[b] {
+                    continue;
                 }
+                paint_segment_into(
+                    self.proj_cam[a],
+                    self.proj_ok[a],
+                    self.proj_cam[b],
+                    self.proj_ok[b],
+                    cyan,
+                    focal(px_h as f64),
+                    self.cw,
+                    px_w,
+                    px_h,
+                    &mut self.dots,
+                    &mut self.colors,
+                );
             }
         }
 
@@ -475,42 +495,50 @@ impl Rasterizer {
         let mut labels: Vec<(f64, f64, &str, u8)> = Vec::new();
         if show_axes {
             let axis_len = extent / 0.618;
-            let origin = view::project_point((0.0, 0.0, 0.0), view, px_h);
+            let cam = view::camera(view);
+            let scale = focal(px_h as f64);
+            let origin = cam.camera_space((0.0, 0.0, 0.0));
+            let origin_ok = origin[2] > wrfm_raster::projection::NEAR;
             let ends = [
-                (
-                    view::project_point((axis_len, 0.0, 0.0), view, px_h),
-                    "X",
-                    Ink::Red as u8,
-                ),
-                (
-                    view::project_point((0.0, axis_len, 0.0), view, px_h),
-                    "Y",
-                    Ink::Yellow as u8,
-                ),
-                (
-                    view::project_point((0.0, 0.0, axis_len), view, px_h),
-                    "Z",
-                    Ink::LightBlue as u8,
-                ),
+                ((axis_len, 0.0, 0.0), "X", Ink::Red as u8),
+                ((0.0, axis_len, 0.0), "Y", Ink::Yellow as u8),
+                ((0.0, 0.0, axis_len), "Z", Ink::LightBlue as u8),
             ];
-            if let Some((ox, oy)) = origin {
-                for (end, label, color) in ends {
-                    if let Some((ex, ey)) = end {
-                        paint_line_into(
-                            ox,
-                            oy,
-                            ex,
-                            ey,
-                            color,
-                            self.cw,
-                            px_w,
-                            px_h,
-                            &mut self.dots,
-                            &mut self.colors,
-                        );
-                        labels.push((ex, ey, label, color));
-                    }
+            for (tip, label, color) in ends {
+                let end = cam.camera_space(tip);
+                let end_ok = end[2] > wrfm_raster::projection::NEAR;
+                if !origin_ok && !end_ok {
+                    continue;
                 }
+                paint_segment_into(
+                    origin,
+                    origin_ok,
+                    end,
+                    end_ok,
+                    color,
+                    scale,
+                    self.cw,
+                    px_w,
+                    px_h,
+                    &mut self.dots,
+                    &mut self.colors,
+                );
+                // The label rides the visible end of the arm; when the origin
+                // itself is behind the plane the arm's near end is the
+                // clipped crossing, not a projected vertex. An end that
+                // projects outside the canvas gets no label: the arm is cut
+                // off by the frame there, so a floating "Y" would not name
+                // anything the viewer can see.
+                let visible_end = if end_ok {
+                    end
+                } else {
+                    clip_near(origin, end).map_or(origin, |(_, hit)| hit)
+                };
+                let (lx, ly) = project_camera_point(visible_end, scale);
+                if !point_is_on_canvas(lx, ly, px_w, px_h) {
+                    continue;
+                }
+                labels.push((lx, ly, label, color));
             }
         }
 
@@ -583,15 +611,31 @@ impl Rasterizer {
     }
 }
 
-/// Clip and rasterize one line into the shared braille grid (wrfm-raster's
-/// port of ratatui's canvas algorithm), stamping each lit cell's color.
+/// Whether a projected point lies inside the centered canvas window — the
+/// same bounds test ratatui's `Canvas` applies to a label before printing it.
+fn point_is_on_canvas(x: f64, y: f64, px_w: usize, px_h: usize) -> bool {
+    let (left, right) = (-(px_w as f64) / 2.0, px_w as f64 / 2.0);
+    let (bottom, top) = (-(px_h as f64) / 2.0, px_h as f64 / 2.0);
+    x >= left && x <= right && y >= bottom && y <= top
+}
+
+/// Rasterize one edge from its two camera-space points, clipping it at the
+/// near plane first.
+///
+/// A vertex behind the camera plane has no canvas coordinate (see
+/// `Camera::project_full`), but the part of the edge in front of the plane
+/// is still visible: dropping the whole edge with its culled endpoint is
+/// what used to punch holes in a model the camera had entered. Rasterizing
+/// the clipped remainder keeps that part — and this is also what keeps the
+/// axes on screen when the camera reaches the file origin they start from.
 #[allow(clippy::too_many_arguments)] // primitive geometry helper
-fn paint_line_into(
-    x1: f64,
-    y1: f64,
-    x2: f64,
-    y2: f64,
+fn paint_segment_into(
+    a: [f64; 3],
+    a_ok: bool,
+    b: [f64; 3],
+    b_ok: bool,
     color: u8,
+    scale: f64,
     cw: usize,
     px_w: usize,
     px_h: usize,
@@ -599,11 +643,14 @@ fn paint_line_into(
     colors: &mut [u8],
 ) {
     debug_assert_eq!(cw * 2, px_w, "dot width must be 2 per character cell");
-    rasterize_line(
-        x1,
-        y1,
-        x2,
-        y2,
+    debug_assert!(
+        a_ok || b_ok,
+        "an edge with both endpoints behind the camera plane draws nothing"
+    );
+    rasterize_camera_line(
+        a,
+        b,
+        |p| project_camera_point(p, scale),
         px_w,
         px_h,
         Bounds::centered(px_w, px_h),
@@ -618,8 +665,9 @@ fn paint_line_into(
 #[allow(clippy::too_many_arguments)] // primitive geometry helper
 fn rasterize_edges_par(
     edges: &[(usize, usize)],
-    proj: &[[f64; 2]],
+    cam: &[[f64; 3]],
     ok: &[bool],
+    scale: f64,
     cw: usize,
     px_w: usize,
     px_h: usize,
@@ -635,10 +683,11 @@ fn rasterize_edges_par(
             || (vec![0u8; cells], vec![0u8; cells]),
             |(mut pat, mut col), chunk| {
                 for &(a, b) in chunk {
-                    if ok[a] && ok[b] {
-                        let [x1, y1] = proj[a];
-                        let [x2, y2] = proj[b];
-                        paint_line_into(x1, y1, x2, y2, color, cw, px_w, px_h, &mut pat, &mut col);
+                    if ok[a] || ok[b] {
+                        paint_segment_into(
+                            cam[a], ok[a], cam[b], ok[b], color, scale, cw, px_w, px_h, &mut pat,
+                            &mut col,
+                        );
                     }
                 }
                 (pat, col)
@@ -721,66 +770,93 @@ mod tests {
             .x_bounds([-(px_w as f64) / 2.0, (px_w as f64) / 2.0])
             .y_bounds([-(px_h as f64) / 2.0, (px_h as f64) / 2.0])
             .paint(|ctx| {
+                // An edge the camera plane cuts in two is clipped, not
+                // dropped: `clipped_segment` is the ratatui-side model of
+                // the near-plane clipping `rasterize_camera_line` does.
+                let cam = crate::view::camera(view);
+                let scale = focal(px_h as f64);
                 for &(a, b) in &model.edges {
-                    if let (Some(p1), Some(p2)) = (
-                        crate::view::project_point(model.vertices[a], view, px_h),
-                        crate::view::project_point(model.vertices[b], view, px_h),
-                    ) {
+                    if let Some((ca, cb)) =
+                        clipped_segment(&cam, model.vertices[a], model.vertices[b])
+                    {
+                        let (x1, y1) = project_camera_point(ca, scale);
+                        let (x2, y2) = project_camera_point(cb, scale);
                         ctx.draw(&Line {
-                            x1: p1.0,
-                            y1: p1.1,
-                            x2: p2.0,
-                            y2: p2.1,
+                            x1,
+                            y1,
+                            x2,
+                            y2,
                             color: Color::Cyan,
                         });
                     }
                 }
                 let axis_len = crate::view::model_extent(model) / 0.618;
-                let origin = crate::view::project_point((0.0, 0.0, 0.0), view, px_h);
+                let origin = cam.camera_space((0.0, 0.0, 0.0));
                 let ends = [
-                    (
-                        crate::view::project_point((axis_len, 0.0, 0.0), view, px_h),
-                        "X",
-                        Color::Red,
-                    ),
-                    (
-                        crate::view::project_point((0.0, axis_len, 0.0), view, px_h),
-                        "Y",
-                        Color::Yellow,
-                    ),
-                    (
-                        crate::view::project_point((0.0, 0.0, axis_len), view, px_h),
-                        "Z",
-                        Color::LightBlue,
-                    ),
+                    ((axis_len, 0.0, 0.0), "X", Color::Red),
+                    ((0.0, axis_len, 0.0), "Y", Color::Yellow),
+                    ((0.0, 0.0, axis_len), "Z", Color::LightBlue),
                 ];
-                if let Some(o) = origin {
-                    for (end, label, color) in ends {
-                        if let Some(e) = end {
-                            ctx.draw(&Line {
-                                x1: o.0,
-                                y1: o.1,
-                                x2: e.0,
-                                y2: e.1,
-                                color,
-                            });
-                            let left = -(px_w as f64) / 2.0;
-                            let top = (px_h as f64) / 2.0;
-                            let cell_w = (px_w as f64) / (w - 1) as f64;
-                            let cell_h = (px_h as f64) / (h - 1) as f64;
-                            let label_x = left + ((e.0 - left) / cell_w).round() * cell_w;
-                            let label_y = top - ((top - e.1) / cell_h).round() * cell_h;
-                            ctx.print(
-                                label_x,
-                                label_y,
-                                Span::styled(label, Style::default().fg(color)),
-                            );
-                        }
+                for (tip, label, color) in ends {
+                    let end = cam.camera_space(tip);
+                    let (origin_ok, end_ok) = (
+                        origin[2] > wrfm_raster::projection::NEAR,
+                        end[2] > wrfm_raster::projection::NEAR,
+                    );
+                    if !origin_ok && !end_ok {
+                        continue;
                     }
+                    if let Some((ca, cb)) = clipped_segment(&cam, (0.0, 0.0, 0.0), tip) {
+                        let (x1, y1) = project_camera_point(ca, scale);
+                        let (x2, y2) = project_camera_point(cb, scale);
+                        ctx.draw(&Line {
+                            x1,
+                            y1,
+                            x2,
+                            y2,
+                            color,
+                        });
+                    }
+                    let visible_end = if end[2] > wrfm_raster::projection::NEAR {
+                        end
+                    } else {
+                        clip_near(origin, end).map_or(origin, |(_, hit)| hit)
+                    };
+                    let e = project_camera_point(visible_end, scale);
+                    if !point_is_on_canvas(e.0, e.1, px_w, px_h) {
+                        continue;
+                    }
+                    let left = -(px_w as f64) / 2.0;
+                    let top = (px_h as f64) / 2.0;
+                    let cell_w = (px_w as f64) / (w - 1) as f64;
+                    let cell_h = (px_h as f64) / (h - 1) as f64;
+                    let label_x = left + ((e.0 - left) / cell_w).round() * cell_w;
+                    let label_y = top - ((top - e.1) / cell_h).round() * cell_h;
+                    ctx.print(
+                        label_x,
+                        label_y,
+                        Span::styled(label, Style::default().fg(color)),
+                    );
                 }
             });
         canvas.render(Rect::new(0, 0, w, h), &mut buf);
         buf
+    }
+
+    /// The golden side of the near-plane clip: the camera-space endpoints of
+    /// the visible part of `a`..`b`, in canvas coordinates. This mirrors
+    /// `rasterize_camera_line` so the ratatui comparison renders the same
+    /// geometry the renderer under test does.
+    fn clipped_segment(
+        cam: &wrfm_raster::projection::Camera,
+        a: (f64, f64, f64),
+        b: (f64, f64, f64),
+    ) -> Option<([f64; 3], [f64; 3])> {
+        let (ca, cb) = (cam.camera_space(a), cam.camera_space(b));
+        if ca[2] <= wrfm_raster::projection::NEAR && cb[2] <= wrfm_raster::projection::NEAR {
+            return None;
+        }
+        clip_near(ca, cb)
     }
 
     /// Compare the L2 rasterizer against the ratatui golden render cell by cell.
@@ -805,6 +881,24 @@ mod tests {
                 let got = screen.cell(x as usize, y as usize);
                 let got_ch = char::from_u32((got >> 16) as u32).unwrap();
                 let got_fg = (got & 0xff) as u8;
+                if got_ch != expected_ch {
+                    eprintln!(
+                        "MISMATCH ({x},{y}) ours={got_ch:?} gold={expected_ch:?}\n ours: {:?}\n gold: {:?}",
+                        (0..h)
+                            .map(|yy| (0..w)
+                                .map(|xx| char::from_u32(
+                                    (screen.cell(xx as usize, yy as usize) >> 16) as u32
+                                )
+                                .unwrap_or('?'))
+                                .collect::<String>())
+                            .collect::<Vec<_>>(),
+                        (0..h)
+                            .map(|yy| (0..w)
+                                .map(|xx| golden[(xx, yy)].symbol().chars().next().unwrap_or(' '))
+                                .collect::<String>())
+                            .collect::<Vec<_>>(),
+                    );
+                }
                 assert_eq!(
                     got_ch, expected_ch,
                     "char mismatch at ({x},{y}) view={view:?}"
@@ -1176,9 +1270,19 @@ mod tests {
         let panned = frame(&v, &mut raster);
         assert_ne!(yawed, panned, "pan must redraw the empty scene");
 
+        // Dolly the camera onto the file origin the axes start from. The
+        // frame may legitimately come out the same here — a panned axis ends
+        // up rasterizing the same cells as a clipped one — but the camera
+        // must still be usable: the arms that remain in front of the plane
+        // are drawn, and the projection cache must not go stale.
+        let before = v.dist;
         v.add_dist_delta(-1.0);
+        assert_ne!(v.dist, before, "the dolly must move the camera");
         let dollied = frame(&v, &mut raster);
-        assert_ne!(panned, dollied, "dolly must redraw the empty scene");
+        assert!(
+            dollied.iter().any(|c| *c != pack(' ', 0, 0)),
+            "a dolly must not blank the empty scene"
+        );
 
         // Tab still turns the axes off: with no geometry, that now leaves a
         // genuinely blank canvas.
@@ -1191,6 +1295,109 @@ mod tests {
             })
             .count();
         assert_eq!(lit, 0, "axes off on an empty model draws nothing");
+    }
+
+    /// The number of canvas cells carrying `ink`.
+    fn count_ink(screen: &Screen, ink: Ink) -> usize {
+        let (w, h) = screen.size();
+        (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .filter(|&(x, y)| screen.cell(x, y) as u8 == ink as u8)
+            .count()
+    }
+
+    #[test]
+    fn axes_survive_the_camera_standing_on_the_origin() {
+        // Dolly in until the camera plane reaches the file origin. The origin
+        // is where all three axes start, so the arms have to be CLIPPED there
+        // rather than dropped with their culled endpoint: as long as any of
+        // the arm is in front of the plane, it stays on screen.
+        //
+        // `NEAR` is a fixed offset in front of the camera, so the legs
+        // survive while the origin sits at least that far in front of the
+        // plane; dolly closer and the origin itself is behind the camera,
+        // where the file origin genuinely is off screen and nothing about
+        // the arms can be drawn.
+        let m = cube();
+        let e = view::model_extent(&m);
+        let mut v = ViewState::default();
+        v.fit_to(&m);
+        let mut raster = Rasterizer::new();
+        raster.resize(120, 29);
+        let axis_ink = |screen: &Screen| {
+            [Ink::Red, Ink::Yellow, Ink::LightBlue]
+                .into_iter()
+                .map(|ink| count_ink(screen, ink))
+                .sum::<usize>()
+        };
+        for dist in [1.0, 0.5, 0.3, 0.2] {
+            v.dist = dist;
+            let mut screen = Screen::new(120, 30);
+            raster.render(&m, &v, (0, 1, 120, 29), true, e, &mut screen);
+            let origin_depth = view::camera(&v).camera_space((0.0, 0.0, 0.0))[2];
+            assert!(
+                origin_depth > wrfm_raster::projection::NEAR,
+                "test setup: the origin must still be in front at dist={dist}"
+            );
+            assert!(
+                axis_ink(&screen) > 0,
+                "dist={dist}: the arms in front of the plane must be drawn \
+                 (origin depth {origin_depth}, model {} cells)",
+                count_ink(&screen, Ink::Cyan)
+            );
+        }
+        // Past that point the origin is behind the camera plane: the arms
+        // have nothing in front of it to show, and drawing them would mean
+        // inventing geometry.
+        v.dist = 0.1;
+        let origin_depth = view::camera(&v).camera_space((0.0, 0.0, 0.0))[2];
+        assert!(
+            origin_depth <= wrfm_raster::projection::NEAR,
+            "at dist=0.1 the origin is on the camera plane"
+        );
+        let mut screen = Screen::new(120, 30);
+        raster.render(&m, &v, (0, 1, 120, 29), true, e, &mut screen);
+        assert_eq!(
+            axis_ink(&screen),
+            0,
+            "with the whole arm behind the plane nothing may be drawn"
+        );
+    }
+
+    #[test]
+    fn edge_crossing_the_camera_plane_still_draws() {
+        // An edge running from in front of the camera plane to behind it: the
+        // visible part must still be rasterized instead of the whole segment
+        // being dropped along with its culled endpoint.
+        //
+        // With the camera at z = dist = 1.0 a vertex's depth is
+        // `dist - z` (see `Camera::camera_space`), so z = 0.5 sits 0.5 in
+        // front of the plane and z = 1.0 sits exactly on it, inside the
+        // `z <= NEAR` cull. The segment between them crosses the plane.
+        let m = Model {
+            vertices: vec![(0.5, 0.0, 0.5), (0.5, 0.0, 1.0)],
+            edges: vec![(0, 1)],
+        };
+        let e = view::model_extent(&m);
+        let v = ViewState {
+            dist: 1.0,
+            ..Default::default()
+        };
+        let front = view::project_point((0.5, 0.0, 0.5), &v, 116);
+        let behind = view::project_point((0.5, 0.0, 1.0), &v, 116);
+        assert!(front.is_some(), "the front vertex must project: {front:?}");
+        assert!(
+            behind.is_none(),
+            "the rear vertex must be culled: {behind:?}"
+        );
+        let mut raster = Rasterizer::new();
+        raster.resize(120, 29);
+        let mut screen = Screen::new(120, 30);
+        raster.render(&m, &v, (0, 1, 120, 29), false, e, &mut screen);
+        assert!(
+            count_ink(&screen, Ink::Cyan) > 0,
+            "the part of the edge in front of the camera must be drawn"
+        );
     }
 
     #[test]
