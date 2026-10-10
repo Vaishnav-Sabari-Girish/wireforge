@@ -127,7 +127,14 @@ pub fn extent_from_bounds(b: ([f64; 3], [f64; 3])) -> f64 {
 /// Auto camera distance (the fork's `fit_to` math): the geometric-mean
 /// extent fills 1/FIT_MARGIN of the screen half-height.
 pub fn auto_dist(m: &Model) -> f64 {
-    let r = model_extent(m).max(1e-6);
+    auto_dist_from_extent(model_extent(m))
+}
+
+/// [`auto_dist`] from an already-computed [`model_extent`] — for callers that
+/// keep their own (e.g. the viewer caches it once, since a loaded model is
+/// immutable and the extent does not move with the view).
+pub fn auto_dist_from_extent(extent: f64) -> f64 {
+    let r = extent.max(1e-6);
     r / (FOV_DEG / 2.0).to_radians().tan() * FIT_MARGIN
 }
 
@@ -173,6 +180,20 @@ mod tests {
             model_extent(&long) < 20.0,
             "geomean dominated by the long axis"
         );
+    }
+
+    #[test]
+    fn auto_dist_from_extent_matches_auto_dist() {
+        // The extent-taking form is the primitive `auto_dist` is built on, so
+        // a caller that caches the extent gets the very same distance (the
+        // viewer's `fit_to` relies on that: it must not drift from the CLI's).
+        for m in [tetra(), Model::default()] {
+            assert_eq!(
+                auto_dist(&m),
+                auto_dist_from_extent(model_extent(&m)),
+                "cached-extent distance must be bit-identical"
+            );
+        }
     }
 
     #[test]

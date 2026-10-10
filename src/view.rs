@@ -1,6 +1,6 @@
 use rayon::prelude::*;
 use wrfm_raster::Model;
-use wrfm_raster::geometry::{IDENTITY, auto_dist, mat_mul, rot_x, rot_y, rot_z};
+use wrfm_raster::geometry::{IDENTITY, auto_dist_from_extent, mat_mul, rot_x, rot_y, rot_z};
 use wrfm_raster::projection::{Camera, CameraF32, focal};
 
 /// Above this vertex count, projection and bounds switch to the rayon
@@ -126,19 +126,38 @@ impl ViewState {
     /// model has no extent to frame, so it is framed as the unit scene (see
     /// `extent_from_bounds`) — a finite distance, never the NaN an
     /// `(inf, -inf)` bounding box would produce.
+    ///
+    /// Convenience for tests, which hold a model but no cached extent.
+    /// Production code caches the extent and calls
+    /// [`ViewState::fit_to_extent`], so the O(n) bounds scan stays off the
+    /// per-frame path.
+    #[cfg(test)]
     pub fn fit_to(&mut self, m: &Model) {
-        self.dist = auto_dist(m);
+        self.fit_to_extent(model_extent(m));
     }
 
-    /// Reset rotation/pan and re-fit the distance.
+    /// [`ViewState::fit_to`] from an already-computed [`model_extent`]: the
+    /// distance is exactly what `fit_to` would set, without re-scanning every
+    /// vertex for a bounding box that cannot have changed.
+    pub fn fit_to_extent(&mut self, extent: f64) {
+        self.dist = auto_dist_from_extent(extent);
+    }
+
+    /// Reset rotation/pan and re-fit the distance (see [`ViewState::fit_to`]).
+    #[cfg(test)]
     pub fn reset(&mut self, m: &Model) {
+        self.reset_with_extent(model_extent(m));
+    }
+
+    /// [`ViewState::reset`] from an already-computed [`model_extent`].
+    pub fn reset_with_extent(&mut self, extent: f64) {
         self.rot = IDENTITY;
         self.yaw = 0.0;
         self.pitch = 0.0;
         self.roll = 0.0;
         self.pan_x = 0.0;
         self.pan_y = 0.0;
-        self.fit_to(m);
+        self.fit_to_extent(extent);
     }
 }
 

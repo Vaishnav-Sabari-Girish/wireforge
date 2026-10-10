@@ -403,12 +403,18 @@ impl Rasterizer {
     }
 
     /// Render the model (edges + optional axes + labels) into the screen.
+    ///
+    /// `extent` is the model's geometric-mean length ([`view::model_extent`]),
+    /// which sizes the axes. It is passed in rather than recomputed here
+    /// because the caller knows the model is immutable: re-deriving it would
+    /// put an O(n) bounds scan on every frame.
     pub fn render(
         &mut self,
         model: &Model,
         view: &ViewState,
         region: (usize, usize, usize, usize),
         show_axes: bool,
+        extent: f64,
         screen: &mut Screen,
     ) {
         let (rx, ry, cw, ch) = region;
@@ -468,7 +474,7 @@ impl Rasterizer {
         // would otherwise collapse onto the origin as a single dot.
         let mut labels: Vec<(f64, f64, &str, u8)> = Vec::new();
         if show_axes {
-            let axis_len = view::model_extent(model) / 0.618;
+            let axis_len = extent / 0.618;
             let origin = view::project_point((0.0, 0.0, 0.0), view, px_h);
             let ends = [
                 (
@@ -788,6 +794,7 @@ mod tests {
             view,
             (0, 0, w as usize, h as usize),
             true,
+            view::model_extent(model),
             &mut screen,
         );
         for y in 0..h {
@@ -1094,12 +1101,13 @@ mod tests {
         // scene (see `extent_from_bounds`), so the viewer shows an origin
         // cross instead of an empty field, and X/Y/Z stay visible labels.
         let m = Model::default();
+        let e = view::model_extent(&m);
         let mut v = ViewState::default();
         v.fit_to(&m);
         let mut raster = Rasterizer::new();
         raster.resize(120, 29);
         let mut screen = Screen::new(120, 30);
-        raster.render(&m, &v, (0, 1, 120, 29), true, &mut screen);
+        raster.render(&m, &v, (0, 1, 120, 29), true, e, &mut screen);
 
         // All three axes are on screen, in their own colors.
         for (axis, color) in [("X", Ink::Red), ("Y", Ink::Yellow), ("Z", Ink::LightBlue)] {
@@ -1135,13 +1143,14 @@ mod tests {
         // must still change what is on screen, so the origin cross (the only
         // geometry there is) has to move when the view does.
         let m = Model::default();
+        let e = view::model_extent(&m);
         let mut v = ViewState::default();
         v.fit_to(&m);
         let mut raster = Rasterizer::new();
         raster.resize(120, 29);
         let frame = |v: &ViewState, raster: &mut Rasterizer| {
             let mut screen = Screen::new(120, 30);
-            raster.render(&m, v, (0, 1, 120, 29), true, &mut screen);
+            raster.render(&m, v, (0, 1, 120, 29), true, e, &mut screen);
             (0..30)
                 .flat_map(|y| (0..120).map(move |x| (x, y)))
                 .map(|(x, y)| screen.cell(x, y))
@@ -1174,7 +1183,7 @@ mod tests {
         // Tab still turns the axes off: with no geometry, that now leaves a
         // genuinely blank canvas.
         let mut screen = Screen::new(120, 30);
-        raster.render(&m, &v, (0, 1, 120, 29), false, &mut screen);
+        raster.render(&m, &v, (0, 1, 120, 29), false, e, &mut screen);
         let lit = (0..30)
             .flat_map(|y| (0..120).map(move |x| (x, y)))
             .filter(|&(x, y)| {
@@ -1225,6 +1234,7 @@ mod tests {
     #[test]
     fn bench_frame_cost_small() {
         let m = cube();
+        let e = view::model_extent(&m);
         let mut v = ViewState::default();
         v.fit_to(&m);
         let mut raster = Rasterizer::new();
@@ -1234,7 +1244,7 @@ mod tests {
         // warm-up (allocation + caches)
         for _ in 0..100 {
             v.add_yaw(0.001);
-            raster.render(&m, &v, (0, 1, 120, 29), true, &mut screen);
+            raster.render(&m, &v, (0, 1, 120, 29), true, e, &mut screen);
             let _ = screen.present(&mut out).unwrap();
             out.clear();
         }
@@ -1242,7 +1252,7 @@ mod tests {
         let t0 = std::time::Instant::now();
         for _ in 0..n {
             v.add_yaw(0.001);
-            raster.render(&m, &v, (0, 1, 120, 29), true, &mut screen);
+            raster.render(&m, &v, (0, 1, 120, 29), true, e, &mut screen);
             let _ = screen.present(&mut out).unwrap();
             out.clear();
         }
@@ -1259,6 +1269,7 @@ mod tests {
     #[test]
     fn bench_frame_cost_20k() {
         let m = grid(100, 100); // 10k verts / 19.8k edges
+        let e = view::model_extent(&m);
         let mut v = ViewState::default();
         v.fit_to(&m);
         let mut raster = Rasterizer::new();
@@ -1267,7 +1278,7 @@ mod tests {
         let mut out = Vec::new();
         for _ in 0..20 {
             v.add_yaw(0.001);
-            raster.render(&m, &v, (0, 1, 120, 29), true, &mut screen);
+            raster.render(&m, &v, (0, 1, 120, 29), true, e, &mut screen);
             let _ = screen.present(&mut out).unwrap();
             out.clear();
         }
@@ -1275,7 +1286,7 @@ mod tests {
         let t0 = std::time::Instant::now();
         for _ in 0..n {
             v.add_yaw(0.001);
-            raster.render(&m, &v, (0, 1, 120, 29), true, &mut screen);
+            raster.render(&m, &v, (0, 1, 120, 29), true, e, &mut screen);
             let _ = screen.present(&mut out).unwrap();
             out.clear();
         }
@@ -1293,6 +1304,7 @@ mod tests {
     fn bench_frame_cost_medium_and_parallel() {
         // ~182-vertex "real" model (the plan's exit.wrfm was 182v/193e).
         let med = grid(14, 13); // 182 verts / 338 edges
+        let me = view::model_extent(&med);
         let mut vm = ViewState::default();
         vm.fit_to(&med);
         let mut r1 = Rasterizer::new();
@@ -1301,7 +1313,7 @@ mod tests {
         let mut out = Vec::new();
         for _ in 0..100 {
             vm.add_yaw(0.001);
-            r1.render(&med, &vm, (0, 1, 120, 29), true, &mut s1);
+            r1.render(&med, &vm, (0, 1, 120, 29), true, me, &mut s1);
             let _ = s1.present(&mut out).unwrap();
             out.clear();
         }
@@ -1309,7 +1321,7 @@ mod tests {
         let t0 = std::time::Instant::now();
         for _ in 0..n {
             vm.add_yaw(0.001);
-            r1.render(&med, &vm, (0, 1, 120, 29), true, &mut s1);
+            r1.render(&med, &vm, (0, 1, 120, 29), true, me, &mut s1);
             let _ = s1.present(&mut out).unwrap();
             out.clear();
         }
@@ -1324,6 +1336,7 @@ mod tests {
 
         // >50k edges: exercises the parallel rasterization path (Stage C).
         let big = grid(240, 240); // 57.6k verts / 114.7k edges
+        let be = view::model_extent(&big);
         let mut vb = ViewState::default();
         vb.fit_to(&big);
         let mut r2 = Rasterizer::new();
@@ -1331,7 +1344,7 @@ mod tests {
         let mut s2 = Screen::new(120, 30);
         for _ in 0..3 {
             vb.add_yaw(0.001);
-            r2.render(&big, &vb, (0, 1, 120, 29), true, &mut s2);
+            r2.render(&big, &vb, (0, 1, 120, 29), true, be, &mut s2);
             let _ = s2.present(&mut out).unwrap();
             out.clear();
         }
@@ -1339,7 +1352,7 @@ mod tests {
         let t1 = std::time::Instant::now();
         for _ in 0..nb {
             vb.add_yaw(0.001);
-            r2.render(&big, &vb, (0, 1, 120, 29), true, &mut s2);
+            r2.render(&big, &vb, (0, 1, 120, 29), true, be, &mut s2);
             let _ = s2.present(&mut out).unwrap();
             out.clear();
         }

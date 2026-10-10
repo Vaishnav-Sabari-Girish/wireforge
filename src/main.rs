@@ -1249,6 +1249,14 @@ struct Hold {
 /// All viewer state owned by the main loop.
 struct App {
     current: Model,
+    /// The model's geometric-mean length ([`view::model_extent`]), computed
+    /// once because `current` is never mutated after `App::new`.
+    ///
+    /// It sizes the axes and the pan/zoom step, so re-deriving it per frame
+    /// would put an O(n) bounds scan on every frame — and it is needed twice
+    /// per frame (axes + held motion). The bounding box only depends on the
+    /// model, never on the view, so one scan at load is enough.
+    extent: f64,
     name: String,
     /// Statusline label override: the FIFO path for a stream preview, whose
     /// model name is only the file stem; `None` shows the model name.
@@ -1276,13 +1284,17 @@ struct App {
 
 impl App {
     fn new(current: Model, name: String, strip_label: Option<String>) -> Self {
+        // One extent for the whole session: it frames the model now and then
+        // serves every later frame (see the field's docs).
+        let extent = view::model_extent(&current);
         let mut view = ViewState::default();
         // Frame the model (an empty one lands at the default distance), so a
         // fresh App is always correctly framed — including the blank start-up
         // view, whose extent is undefined.
-        view.fit_to(&current);
+        view.fit_to_extent(extent);
         App {
             current,
+            extent,
             name,
             strip_label,
             view,
@@ -1321,7 +1333,7 @@ impl App {
 
     /// Translation speed scales with the model's geometric-mean extent.
     fn move_scale(&self) -> f64 {
-        view::model_extent(&self.current)
+        self.extent
     }
 
     /// Record that the keyboard said something at `now`.
@@ -1452,7 +1464,7 @@ impl App {
             }
             // Reset: the file's own framing (rotation, pan and distance).
             Action::Reset => {
-                self.view.reset(&self.current);
+                self.view.reset_with_extent(self.extent);
                 self.dirty = true;
             }
         }
@@ -1748,6 +1760,7 @@ fn compose_frame(app: &mut App, engine: &mut Engine) {
             &app.view,
             (canvas_x, canvas_top as usize, canvas_w, canvas_h as usize),
             app.show_axes,
+            app.extent,
             &mut engine.screen,
         );
     }
@@ -3164,6 +3177,48 @@ mod tests {
         assert!(app.held.is_empty(), "focus loss must stop every hold");
         assert!(app.dirty, "the cleared hold must repaint");
     }
+
+    /// The model is immutable once loaded, so its extent is measured once and
+    /// reused: the axes, the auto-fit distance and the pan/zoom step must all
+    /// read that cached value instead of re-scanning every vertex per frame.
+    #[test]
+    fn app_caches_the_model_extent_for_every_frame_use() {
+        // A +-1 cube: the geometric mean of (2,2,2) is 2.
+        let cube = || Model {
+            vertices: vec![
+                (1.0, 1.0, 1.0),
+                (1.0, -1.0, -1.0),
+                (-1.0, 1.0, -1.0),
+                (-1.0, -1.0, 1.0),
+            ],
+            edges: vec![(0, 1), (0, 2), (0, 3), (1, 2), (2, 3), (3, 1)],
+        };
+        let mut app = App::new(cube(), "cube".to_string(), None);
+        assert_eq!(app.extent, 2.0, "the extent is cached at construction");
+
+        // The framing distance comes from that same cached extent, so it cannot
+        // drift from what re-measuring the model would have produced.
+        let expected = wrfm_raster::geometry::auto_dist_from_extent(app.extent);
+        assert_eq!(
+            app.view.dist, expected,
+            "App::new must frame from the cached extent"
+        );
+
+        // The pan/zoom step is the cached extent, not a per-frame scan.
+        assert_eq!(app.move_scale(), app.extent);
+
+        // Key `c` re-fits from the cache too, rather than a fresh bounds scan.
+        app.view.dist = 1234.0;
+        app.handle_input(Event::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(
+            app.view.dist, expected,
+            "reset must re-fit from the cached extent"
+        );
+    }
+
     #[test]
     fn app_handle_input_motion_press_starts_continuous() {
         let mut app = App::new(
@@ -3174,7 +3229,6 @@ mod tests {
             "cube".to_string(),
             None,
         );
-        app.view.fit_to(&app.current);
         let yaw0 = app.view.yaw;
         // Press: enter continuous state (motion applied by update_held)
         app.handle_input(Event::Key(KeyEvent::new(
