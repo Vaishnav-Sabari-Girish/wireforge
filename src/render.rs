@@ -174,14 +174,14 @@ impl Screen {
     }
 
     /// The packed value of a current-frame cell (used by the golden tests).
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn cell(&self, x: usize, y: usize) -> u64 {
         self.cur[y * self.w + x]
     }
 
     /// The char drawn in a current-frame cell (used by the frame tests, which
     /// read composition through the screen rather than through the widgets).
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn symbol(&self, x: usize, y: usize) -> char {
         char::from_u32((self.cur[y * self.w + x] >> 16) as u32).unwrap_or(' ')
     }
