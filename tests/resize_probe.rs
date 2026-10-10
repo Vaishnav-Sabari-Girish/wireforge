@@ -131,6 +131,63 @@ fn drain_until_quiet(
     }
 }
 
+/// Whether `params` (the bytes of one `ESC[…m`) leave a background colour
+/// selected. `0` resets, `49` is the default background, `40..=47` /
+/// `100..=107` pick one — Wireforge only emits a leading reset, an fg slot
+/// and a bg slot, but this reads any SGR.
+fn sgr_selects_background(params: &[u8]) -> bool {
+    let mut bg = false;
+    for part in String::from_utf8_lossy(params).split(';') {
+        match part.parse::<u16>() {
+            Ok(0) | Ok(49) => bg = false,
+            Ok(40..=47) | Ok(100..=107) => bg = true,
+            _ => {}
+        }
+    }
+    bg
+}
+
+/// Walk one session's captured output — every frame concatenated, exactly as
+/// the terminal sees it — and report, as `(clear, end)`, whether any `ESC[2J`
+/// ran while a background colour was selected and whether the stream ends
+/// with one still selected.
+///
+/// Both matter: an erase fills with the *selected* background on any terminal
+/// with background-colour-erase (xterm's default), so a clear in that state
+/// paints the screen with that colour instead of blanking it — and a
+/// background left selected paints the next erase the terminal does on its
+/// own, which is what a window resize exposes.
+fn background_leaks(data: &[u8]) -> (bool, bool) {
+    let mut bg = false;
+    let mut clear = false;
+    let mut i = 0;
+    while i < data.len() {
+        if data[i] != 0x1b {
+            i += 1;
+            continue;
+        }
+        if data.get(i + 1) != Some(&b'[') {
+            i += 2;
+            continue;
+        }
+        let start = i + 2;
+        let mut end = start;
+        while end < data.len() && !(0x40..=0x7e).contains(&data[end]) {
+            end += 1;
+        }
+        if end >= data.len() {
+            break;
+        }
+        match data[end] {
+            b'm' => bg = sgr_selects_background(&data[start..end]),
+            b'J' if &data[start..end] == b"2" && bg => clear = true,
+            _ => {}
+        }
+        i = end + 1;
+    }
+    (clear, bg)
+}
+
 /// Remove ANSI escape sequences from captured pty output, leaving the text
 /// the terminal would display.
 fn strip_ansi(data: &str) -> String {
@@ -172,16 +229,20 @@ fn no_file_argument_opens_the_empty_space() {
     let text = strip_ansi(&String::from_utf8_lossy(&seen));
     eprintln!("no-args probe: {} bytes of TUI output", seen.len());
     assert!(
-        text.contains("Wireforge:"),
-        "blank viewer must render its HUD, got: {text:?}"
+        text.contains("yaw=") && text.contains("dist="),
+        "blank viewer must render its telemetry row, got: {text:?}"
     );
     // ratatui's diff-based present skips spaces and repaints only changed
     // cells, so compare with every space removed: a text cell like "no file"
     // arrives as the fragments "no" and "file".
     let packed: String = text.chars().filter(|c| !c.is_whitespace()).collect();
     assert!(
-        packed.contains("Wireforge:nofile|"),
-        "Row 0 must name the empty state, got: {text:?}"
+        packed.contains("nofile\u{e0b0}"),
+        "the statusline pill must name the empty state, got: {text:?}"
+    );
+    assert!(
+        !text.contains("Wireforge:"),
+        "the model's name belongs on the statusline, not Row 0: {text:?}"
     );
     // The empty model still draws the space: the origin cross is rasterized
     // as braille dots (`U+2800..=U+28FF`) and carries the X/Y/Z axis labels.
@@ -198,6 +259,28 @@ fn no_file_argument_opens_the_empty_space() {
         "the axes must keep their labels, got: {text:?}"
     );
     eprintln!("no-args probe: {braille} braille cells on the empty scene");
+    // The statusline: the lamps and the everyday chords are on screen, and the
+    // ground under them reached the terminal as a background SGR. Wireforge
+    // paints no background anywhere else, so this is also the end-to-end proof
+    // that a cell's background survives the blit and the diffing writer.
+    assert!(
+        packed.contains("●SPIN") && packed.contains("●AXES"),
+        "the statusline must carry its state lamps, got: {text:?}"
+    );
+    assert!(
+        packed.contains("?help") && packed.contains("qquit"),
+        "the statusline must carry the everyday chords, got: {text:?}"
+    );
+    assert!(
+        seen.windows(10).any(|w| w == b"\x1b[0;30;42m"),
+        "the name pill must paint its accent ground, got {} bytes",
+        seen.len()
+    );
+    assert!(
+        seen.windows(7).any(|w| w == b"\x1b[0;40m"),
+        "the strip must paint its own ground, got {} bytes",
+        seen.len()
+    );
     assert!(
         !text.contains("required arguments"),
         "no arguments must start the viewer, not fail with a clap error: {text:?}"
@@ -205,6 +288,41 @@ fn no_file_argument_opens_the_empty_space() {
     assert!(
         child.try_wait().expect("try_wait").is_none(),
         "the empty viewer must still be running, waiting for input"
+    );
+
+    // Holding a modifier switches the hints. The kitty keyboard protocol
+    // reports the modifier key itself — `ESC[57442u` is left Ctrl down, and
+    // with event types on, `ESC[57442;1:3u` is it coming back up. This pty is
+    // not a kitty terminal, but the app parses whatever bytes it is handed,
+    // which is the half of the feature that lives here.
+    let mut next_frame = |master: &mut std::fs::File| -> String {
+        let (seen, quiet) = drain_until_quiet(
+            master,
+            &mut buf,
+            Instant::now() + Duration::from_secs(5),
+            Duration::from_millis(300),
+        );
+        assert!(quiet, "the viewer must repaint and then idle");
+        strip_ansi(&String::from_utf8_lossy(&seen))
+    };
+    master.write_all(b"\x1b[57442u").expect("ctrl down");
+    let held = next_frame(&mut master);
+    let held_packed: String = held.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        held_packed.contains("Ctrl+h/l/k/j/d/f"),
+        "holding Ctrl must switch the hints to the Ctrl chords, got: {held:?}"
+    );
+    assert!(
+        !held_packed.contains("?help"),
+        "the everyday hints step aside while Ctrl is held, got: {held:?}"
+    );
+
+    master.write_all(b"\x1b[57442;1:3u").expect("ctrl up");
+    let released = next_frame(&mut master);
+    let released_packed: String = released.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        released_packed.contains("?help") && released_packed.contains("Spacespin"),
+        "letting Ctrl go must bring the everyday hints back, got: {released:?}"
     );
 
     // `q` quits the empty view like it quits a model view.
@@ -284,6 +402,9 @@ fn sigwinch_delivers_resize_event() {
         libc::fcntl(fd, libc::F_SETFL, flags);
     };
     set_nonblock(master.as_raw_fd(), true);
+    // Everything the app has written so far, frames concatenated: the SGR
+    // state a later escape runs in is the one the earlier frames left.
+    let mut stream: Vec<u8> = Vec::new();
     // drain until no bytes arrive for 400 ms (app fully idle)
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut quiet = false;
@@ -293,7 +414,10 @@ fn sigwinch_delivers_resize_event() {
         while Instant::now() - read_start < Duration::from_millis(400) {
             match master.read(&mut buf) {
                 Ok(0) => {}
-                Ok(_) => any = true,
+                Ok(n) => {
+                    stream.extend_from_slice(&buf[..n]);
+                    any = true;
+                }
                 Err(_) => break,
             }
         }
@@ -317,23 +441,46 @@ fn sigwinch_delivers_resize_event() {
     }
     // Wait for the repaint (Resize event or the 500 ms fallback timer).
     std::thread::sleep(Duration::from_millis(2500));
-    let mut total = 0;
+    let mut post: Vec<u8> = Vec::new();
     while let Ok(n) = master.read(&mut buf) {
-        total += n;
+        if n == 0 {
+            break;
+        }
+        post.extend_from_slice(&buf[..n]);
     }
+    stream.extend_from_slice(&post);
     set_nonblock(master.as_raw_fd(), false);
     let _ = child.kill();
     let _ = child.wait();
     // The repaint must wipe the OLD size's pixels first (ESC[2J), otherwise
-    // stale model pixels survive next to the re-projected model.
-    let has_clear = buf.windows(4).any(|w| w == b"\x1b[2J");
-    eprintln!("resize probe: repaint bytes after resize = {total}, clear-screen = {has_clear}");
+    // stale model pixels survive next to the re-projected model — and it must
+    // erase at DEFAULT colours: the frame before it ends on the statusline's
+    // ground, so an ESC[2J issued with that background still selected fills
+    // the whole screen with it (background-colour-erase) and the strip's
+    // colour floods the canvas.
+    let has_clear = post.windows(4).any(|w| w == b"\x1b[2J");
+    let (clear_leak, end_leak) = background_leaks(&stream);
+    let post_len = post.len();
+    eprintln!(
+        "resize probe: repaint bytes after resize = {post_len}, clear-screen = {has_clear}, \
+         clear-at-background = {clear_leak}, ends-with-background = {end_leak}"
+    );
     assert!(
-        total > 0,
+        !post.is_empty(),
         "no repaint after resize (resize handling broken)"
     );
     assert!(
         has_clear,
         "resize repaint must emit a clear-screen (stale-model bug)"
+    );
+    assert!(
+        !clear_leak,
+        "ESC[2J must erase at default colours, never with the statusline's \
+         background selected (it would flood the canvas)"
+    );
+    assert!(
+        !end_leak,
+        "the app must leave no background selected between frames, or the \
+         terminal's own erase on the next resize paints the strip's colour"
     );
 }

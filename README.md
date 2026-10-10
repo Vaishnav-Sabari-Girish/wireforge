@@ -45,9 +45,10 @@ The repository holds the viewer and the pieces around it:
   hint to run `wrfm convert`, and a broken model fails with the parser's
   line-and-column report on stderr.
 - **Keyboard control.** Rotate, pan and zoom with `hjkl`, the arrow
-  keys, `r`/`e` and `=`/`-`. `Ctrl` turns the model around its own axes instead
-  of the world's, and `Shift + f` frames whatever is in the file. A HUD line
-  tells you where you are, and `?` shows every binding.
+  keys, `d`/`f` and `=`/`-`. `Ctrl` turns the model around its own axes instead
+  of the world's, and `c` resets the view to the file's own framing. A telemetry
+  line reports the camera, a statusline strip names the model and carries the
+  everyday keys, and `?` opens a grouped reference to every binding.
 - **Everything is a pipe.** The viewer reads stdin (`wireforge -`) and the CLI
   writes nothing to disk, so commands chain with pipes:
 

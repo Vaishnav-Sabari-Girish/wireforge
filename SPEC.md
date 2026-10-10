@@ -48,7 +48,7 @@ editing it.
 
 Run `wireforge` with no file at all and it opens the viewer with an empty
 model: the XYZ axes are drawn at the origin, so rotating, panning and zooming
-still work, and Row 0 reads `Wireforge: no file`.
+still work, and the statusline's pill reads `no file`.
 A menu entry or launcher gets the same empty canvas if it runs the viewer in a
 terminal and gives it nothing on stdin. If stdin is piped or redirected, a
 bare `wireforge` reads the stream as a model instead
@@ -57,6 +57,38 @@ bare `wireforge` reads the stream as a model instead
 ```bash
 wireforge
 ```
+
+### The screen
+
+Three regions, top to bottom. Row 0 is the camera's telemetry: yaw, pitch,
+roll, distance and pan, and nothing else — the model's name is not repeated
+there. The middle is the model itself. The last row is a statusline strip,
+which is where that name lives:
+
+```text
+ model.wrfm ▶ ● SPIN  ● AXES ▶        ◀ ? help  q quit  Space spin  Tab axes
+```
+
+The name sits on the accent colour, the two lamps report whether the model is
+spinning and whether the axes are drawn (a lit dot means on), and the
+right-hand hints carry the everyday chords. The strip fills the row edge to
+edge, and the pill yields at most half of it so a long name can never crowd
+out the rest. When the terminal is too narrow for all of it, hints are dropped
+from the right, then the lamps, then the name is shortened with `…`. `?`
+always opens the full list.
+
+The hints also follow a held modifier, so the strip answers the question the
+hand is already asking:
+
+```text
+ model.wrfm ▶ ● SPIN  ● AXES ▶        ◀ Ctrl+h/l/k/j/d/f turn its own axes
+```
+
+Press `Ctrl` and the everyday chords give way to the chords `Ctrl` unlocks;
+let it go and they come back. This needs a terminal that reports the modifier
+key on its own — the kitty keyboard protocol, which foot, kitty, wezterm and
+ghostty speak. A terminal that does not report modifiers simply keeps the
+everyday hints, so nothing is lost where the protocol is missing.
 
 ### Stream input
 
@@ -86,25 +118,71 @@ wrfm edit model.wrfm --extract-group cabinet | wrfm transform - --scale 2 | wire
 
 ### Key bindings
 
-| Key                             | Action                                                                         |
-| :------------------------------ | :----------------------------------------------------------------------------- |
-| `Space`                         | Toggle automatic spinning                                                      |
-| `↑` / `↓`                       | Rotate Pitch (X-axis)                                                          |
-| `←` / `→`                       | Rotate Yaw (Y-axis)                                                            |
-| `h` / `j` / `k` / `l`           | Rotate Yaw / Pitch (same as `←` / `→` / `↑` / `↓`)                             |
-| `r` / `e`                       | Rotate Roll (view axis)                                                        |
-| `Ctrl` + `←` / `→` / `↑` / `↓`  | Rotate Yaw / Pitch around the model's own axes (local frame)                   |
-| `Ctrl` + `h` / `j` / `k` / `l`  | Rotate Yaw / Pitch around the model's own axes (same as `Ctrl` + arrows)       |
-| `Ctrl` + `r` / `e`              | Rotate Roll around the model's own (local) Z-axis                              |
-| `Shift` + `←` / `→` / `↑` / `↓` | Move the model                                                                 |
-| `Shift` + `h` / `j` / `k` / `l` | Move the model                                                                 |
-| `=` / `-`                       | Move nearer / farther                                                          |
-| `f`                             | Center the world origin (0,0,0) on screen                                      |
-| `Shift` + `f`                   | Fit the model to the view                                                      |
-| `0`                             | Reset rotation, pan and distance                                               |
-| `?`                             | Toggle the key help overlay                                                    |
-| `Tab` / `Shift` + `Tab`         | Toggle the XYZ axes                                                            |
-| `q` / `Esc` / `Ctrl` + `C`      | Quit the application                                                           |
+Bindings are grouped by what you are doing, not by which modifier you hold.
+Chords are spelled `Ctrl+Shift+Key`; the arrow keys work wherever `hjkl` do.
+
+The bindings are declared once, in one table in the source. The viewer's key
+lookup is generated from that table by the compiler, and the statusline hints
+read it directly — so a rebind moves the keyboard and the hints together. The
+help overlay is not generated: it is written out by hand, and a test checks
+every chord in the table against that page, so the two cannot drift apart
+without the suite failing. The tables below are that same list written out for
+reading.
+
+#### Rotate — the world's axes
+
+Left and right read as you see them: the model faces out of the screen, so
+`h` sweeps its nose toward your left.
+
+| Key                       | Action                              |
+| :------------------------ | :---------------------------------- |
+| `h` / `Left`              | Yaw left                            |
+| `l` / `Right`             | Yaw right                           |
+| `k` / `Up`                | Pitch up                            |
+| `j` / `Down`              | Pitch down                          |
+| `d`                       | Roll clockwise (view axis)          |
+| `f`                       | Roll anticlockwise (view axis)      |
+
+#### Move — the world's plane
+
+| Key                            | Action                              |
+| :----------------------------- | :---------------------------------- |
+| `Shift+h` / `Shift+Left`       | Pan left                            |
+| `Shift+l` / `Shift+Right`      | Pan right                           |
+| `Shift+k` / `Shift+Up`         | Pan up                              |
+| `Shift+j` / `Shift+Down`       | Pan down                            |
+| `=` / `+`                      | Dolly nearer                        |
+| `-` / `_`                      | Dolly farther                       |
+
+#### Rotate — the model's own axes
+
+Same turns, but around the model's own frame: `Ctrl+h` yaws it to *its* left.
+
+| Key                              | Action                              |
+| :------------------------------- | :---------------------------------- |
+| `Ctrl+h` / `Ctrl+Left`           | Yaw to its own left                 |
+| `Ctrl+l` / `Ctrl+Right`          | Yaw to its own right                |
+| `Ctrl+k` / `Ctrl+Up`             | Pitch up                            |
+| `Ctrl+j` / `Ctrl+Down`           | Pitch down                          |
+| `Ctrl+d`                         | Roll clockwise                      |
+| `Ctrl+f`                         | Roll anticlockwise                  |
+
+#### Frame — where the model sits on screen
+
+| Key        | Action                              |
+| :--------- | :---------------------------------- |
+| `c`        | Reset rotation, pan and distance    |
+
+#### Session
+
+| Key                       | Action                              |
+| :------------------------ | :---------------------------------- |
+| `Space`                   | Toggle automatic spinning           |
+| `Tab` / `Shift+Tab`       | Toggle the XYZ axes                 |
+| `?`                       | Toggle the key help overlay         |
+| `q` / `Esc` / `Ctrl+c`    | Quit the application                |
+
+The help overlay lists every binding, grouped the same way.
 
 ## The `.wrfm` Format
 

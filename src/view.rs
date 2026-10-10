@@ -100,9 +100,9 @@ impl ViewState {
     /// model to its own right (right-hand turn about the nose axis, so its
     /// starboard side dips). Plain `Motion::RollPlus` is the *viewer's* frame
     /// instead — it rolls about the sight line, which points into the screen
-    /// while the nose points out of it, so at the default view plain `r` and
-    /// `Ctrl+r` read as mirror images (plain `r` dips the viewer's right,
-    /// `Ctrl+r` dips the model's starboard). Unlike yaw/pitch it does NOT
+    /// while the nose points out of it, so at the default view the plain roll
+    /// key (`d`) and `Ctrl+d` read as mirror images (plain `d` dips the
+    /// viewer's right, `Ctrl+d` dips the model's starboard). Unlike yaw/pitch it does NOT
     /// touch the `roll` field: `roll` is the authoritative camera-frame
     /// angle applied by `project_point`, so ticking it here as well would
     /// rotate the image twice; the HUD therefore reports world-frame roll
@@ -139,12 +139,6 @@ impl ViewState {
         self.pan_x = 0.0;
         self.pan_y = 0.0;
         self.fit_to(m);
-    }
-
-    /// Pan the model so the file origin projects to the screen centre.
-    pub fn center_origin(&mut self) {
-        self.pan_x = 0.0;
-        self.pan_y = 0.0;
     }
 }
 
@@ -574,7 +568,7 @@ mod tests {
         // centre of the canvas instead of vanishing to NaN.
         let (x, y) = project_point((0.0, 0.0, 0.0), &v, 100).expect("origin must project");
         assert!(x.abs() < 1e-9 && y.abs() < 1e-9, "origin at ({x},{y})");
-        // Reset (key `0`) re-fits and is equally safe on an empty model.
+        // Reset (key `c`) re-fits and is equally safe on an empty model.
         v.dist = 1234.0;
         v.reset(&empty);
         assert!(v.dist.is_finite() && v.dist > 0.0, "reset: {}", v.dist);
@@ -606,31 +600,6 @@ mod tests {
             e2 < 20.0,
             "geomean must not be dominated by the long axis, got {e2}"
         );
-    }
-
-    #[test]
-    fn center_origin_pans_origin_to_screen_centre() {
-        let mut v = view();
-        v.pan_x = 3.0;
-        v.pan_y = -2.0;
-        v.add_yaw(37.0f64.to_radians());
-        v.add_pitch(-14.0f64.to_radians());
-        v.roll = 0.3;
-        v.dist = 12.0;
-        let (yaw, pitch, roll, dist) = (v.yaw, v.pitch, v.roll, v.dist);
-        v.center_origin();
-        // The origin must now project exactly to the screen centre (0, 0).
-        let (x, y) = project_point((0.0, 0.0, 0.0), &v, 100).unwrap();
-        assert!(
-            x.abs() < 1e-9 && y.abs() < 1e-9,
-            "origin should be at screen centre, got ({x},{y})"
-        );
-        // Angles and distance are untouched — a pure translation.
-        assert_eq!(v.yaw, yaw);
-        assert_eq!(v.pitch, pitch);
-        assert_eq!(v.roll, roll);
-        assert_eq!(v.dist, dist);
-        assert_eq!((v.pan_x, v.pan_y), (0.0, 0.0));
     }
 
     #[test]

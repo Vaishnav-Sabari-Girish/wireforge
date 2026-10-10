@@ -5,13 +5,17 @@ use wrfm_raster::Model;
 use crate::view::{self, ViewState};
 use wrfm_raster::raster::{Bounds, rasterize_line};
 
-/// An empty cell: a space with the default foreground color.
-const SPACE: u64 = (' ' as u64) << 8;
+/// An empty cell: a space in the terminal's own colors, on its own background.
+const SPACE: u64 = (' ' as u64) << 16;
 
-/// Pack a char + color index into one u64 cell.
+/// Pack a char + foreground + background ink index into one u64 cell.
+///
+/// Foreground sits in the low byte so `cell as u8` still reads back the
+/// foreground, which is how the rasterizer-only tests have always inspected a
+/// cell. Foreground `Default` on background `Default` is `SPACE`.
 #[inline(always)]
-fn pack(ch: char, fg: u8) -> u64 {
-    (ch as u64) << 8 | fg as u64
+fn pack(ch: char, fg: u8, bg: u8) -> u64 {
+    (ch as u64) << 16 | (bg as u64) << 8 | fg as u64
 }
 
 /// Model edges are rasterized in parallel above this many edges (Stage C).
@@ -19,50 +23,96 @@ const PARALLEL_EDGE_THRESHOLD: usize = 50_000;
 /// The f32 batch-projection path is used above this many vertices.
 const F32_PROJECT_THRESHOLD: usize = 4_096;
 
-/// Foreground colors used by the viewer, mapped to small indices for packed cells.
+/// One slot of the viewer's 16-color palette, usable as a foreground *or* a
+/// background: the two uses differ only by the ANSI `30↔40` / `90↔100` offset,
+/// so one enum covers both.
+///
+/// The slots are named after the ANSI color a terminal palette entry holds.
+/// Wireforge draws in the *theme's* colors, so the theme decides the actual
+/// RGB: on the everforest palette these names were chosen against, `Green` is
+/// `#A7C080` and `Grey` is `#5d686f`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
-pub enum Fg {
+pub enum Ink {
+    /// The terminal's own foreground / background: no SGR color is set.
     Default = 0,
     Cyan = 1,
     Red = 2,
     Yellow = 3,
     LightBlue = 4,
+    /// ANSI 0 — the statusline's dark block.
+    Black = 5,
+    /// ANSI 2 — the accent, worn by the statusline's leading pill.
+    Green = 6,
+    /// ANSI 8 (bright black) — the statusline's lighter block.
+    Grey = 7,
+    /// ANSI 7 — body text.
+    White = 8,
 }
 
-impl Fg {
-    /// The ANSI SGR sequence selecting this foreground color.
-    pub fn sgr(self) -> &'static [u8] {
-        match self {
-            Fg::Default => b"\x1b[0m",
-            Fg::Cyan => b"\x1b[36m",
-            Fg::Red => b"\x1b[31m",
-            Fg::Yellow => b"\x1b[33m",
-            Fg::LightBlue => b"\x1b[94m",
-        }
-    }
-
-    /// Recover the [`Fg`] from a packed-cell color byte.
-    pub fn from_u8(v: u8) -> Fg {
+impl Ink {
+    /// Recover the [`Ink`] from a packed-cell ink byte.
+    pub fn from_u8(v: u8) -> Ink {
         match v {
-            1 => Fg::Cyan,
-            2 => Fg::Red,
-            3 => Fg::Yellow,
-            4 => Fg::LightBlue,
-            _ => Fg::Default,
+            1 => Ink::Cyan,
+            2 => Ink::Red,
+            3 => Ink::Yellow,
+            4 => Ink::LightBlue,
+            5 => Ink::Black,
+            6 => Ink::Green,
+            7 => Ink::Grey,
+            8 => Ink::White,
+            _ => Ink::Default,
+        }
+    }
+
+    /// The SGR color parameter for this slot, or `None` when it is
+    /// [`Ink::Default`] and the terminal's own color should stand.
+    fn code(self) -> Option<u8> {
+        match self {
+            Ink::Default => None,
+            Ink::Black => Some(30),
+            Ink::Red => Some(31),
+            Ink::Green => Some(32),
+            Ink::Yellow => Some(33),
+            Ink::Cyan => Some(36),
+            Ink::White => Some(37),
+            Ink::Grey => Some(90),
+            Ink::LightBlue => Some(94),
         }
     }
 }
 
-/// Map a ratatui `Color` to the small `Fg` index.
-pub fn color_idx(c: Color) -> u8 {
+/// Map a ratatui `Color` to the palette slot holding it. Colors outside the
+/// palette (including `Color::Reset`) fall back to the terminal default.
+pub fn ink_idx(c: Color) -> u8 {
     match c {
-        Color::Cyan => Fg::Cyan as u8,
-        Color::Red => Fg::Red as u8,
-        Color::Yellow => Fg::Yellow as u8,
-        Color::LightBlue => Fg::LightBlue as u8,
-        _ => Fg::Default as u8,
+        Color::Cyan => Ink::Cyan as u8,
+        Color::Red => Ink::Red as u8,
+        Color::Yellow => Ink::Yellow as u8,
+        Color::LightBlue => Ink::LightBlue as u8,
+        Color::Black => Ink::Black as u8,
+        Color::Green => Ink::Green as u8,
+        Color::DarkGray => Ink::Grey as u8,
+        Color::White => Ink::White as u8,
+        _ => Ink::Default as u8,
     }
+}
+
+/// Append the SGR sequence selecting `fg` on `bg`.
+///
+/// Always opens with a reset so a cell can never inherit an ink from its
+/// neighbour; when both slots are default that is exactly `ESC[0m`, the
+/// sequence this writer emitted before backgrounds existed.
+fn push_sgr(out: &mut Vec<u8>, fg: Ink, bg: Ink) {
+    out.extend_from_slice(b"\x1b[0");
+    // A background slot is its foreground slot's SGR parameter + 10: 30..37
+    // become 40..47, 90..97 become 100..107.
+    for code in [fg.code(), bg.code().map(|c| c + 10)].into_iter().flatten() {
+        out.push(b';');
+        Screen::push_usize(out, code as usize);
+    }
+    out.push(b'm');
 }
 
 /// A retained-mode full-screen cell grid (packed u64 cells).
@@ -114,11 +164,12 @@ impl Screen {
         (self.w, self.h)
     }
 
-    /// Set one cell of the current frame (out-of-range writes are ignored).
+    /// Set one cell of the current frame: a char drawn in `fg` on `bg`
+    /// (out-of-range writes are ignored).
     #[inline]
-    pub fn set(&mut self, x: usize, y: usize, ch: char, fg: u8) {
+    pub fn set(&mut self, x: usize, y: usize, ch: char, fg: u8, bg: u8) {
         if x < self.w && y < self.h {
-            self.cur[y * self.w + x] = pack(ch, fg);
+            self.cur[y * self.w + x] = pack(ch, fg, bg);
         }
     }
 
@@ -155,9 +206,21 @@ impl Screen {
     }
 
     /// Diff the current frame against the last, write the changed cells as one batch.
+    ///
+    /// Every frame leaves the terminal's SGR at *defaults* (see the two resets
+    /// below): the last run a frame writes is the statusline, whose ground is a
+    /// filled background, and a selected background is contagious — any erase
+    /// that follows, ours or the terminal's own, paints with it.
     pub fn present<W: Write>(&mut self, out: &mut W) -> std::io::Result<usize> {
         self.out.clear();
         if self.full_repaint {
+            // Reset BEFORE erasing. An erase fills with the background the
+            // terminal currently has selected (background-colour-erase, the
+            // default in xterm and friends), and the frame before this one
+            // ended on the statusline's ground — so clearing in that state
+            // would flood the whole screen, canvas included, with the
+            // strip's colour instead of blanking it.
+            self.out.extend_from_slice(b"\x1b[0m");
             // Wipe the previous size's pixels from the terminal once; the
             // diff below then redraws every non-space cell of the new frame
             // (prev is all-space after the resize).
@@ -184,20 +247,30 @@ impl Screen {
                 }
                 let end = x;
                 Self::push_cursor(&mut self.out, y, start);
-                let mut last_fg = u8::MAX;
+                let mut last = (u8::MAX, u8::MAX);
                 for &cell in &cur_row[start..end] {
                     let fg = (cell & 0xff) as u8;
-                    if fg != last_fg {
-                        self.out.extend_from_slice(Fg::from_u8(fg).sgr());
-                        last_fg = fg;
+                    let bg = ((cell >> 8) & 0xff) as u8;
+                    if (fg, bg) != last {
+                        push_sgr(&mut self.out, Ink::from_u8(fg), Ink::from_u8(bg));
+                        last = (fg, bg);
                     }
-                    let ch = char::from_u32((cell >> 8) as u32).unwrap_or(' ');
+                    let ch = char::from_u32((cell >> 16) as u32).unwrap_or(' ');
                     let mut b = [0u8; 4];
                     self.out
                         .extend_from_slice(ch.encode_utf8(&mut b).as_bytes());
                 }
                 changed += end - start;
             }
+        }
+        if changed > 0 {
+            // Reset AFTER writing, for the erases the terminal does by itself:
+            // the fill of the rows a resize exposes, a clear triggered by the
+            // window manager, an erase on scroll. Without this the strip's
+            // ground stays selected between frames and spills over the canvas
+            // the moment the terminal erases anything — which is exactly what
+            // a window resize looked like.
+            self.out.extend_from_slice(b"\x1b[0m");
         }
         std::mem::swap(&mut self.cur, &mut self.prev);
         // `cur` now holds the old `prev`; blank it for the next frame.
@@ -333,7 +406,7 @@ impl Rasterizer {
         self.dots.fill(0);
         self.colors.fill(0);
 
-        let cyan = Fg::Cyan as u8;
+        let cyan = Ink::Cyan as u8;
         if model.edges.len() > PARALLEL_EDGE_THRESHOLD {
             // Stage C: parallel rasterization over edge chunks. Each
             // worker paints into its own scratch grid; all model dots are
@@ -387,17 +460,17 @@ impl Rasterizer {
                 (
                     view::project_point((axis_len, 0.0, 0.0), view, px_h),
                     "X",
-                    Fg::Red as u8,
+                    Ink::Red as u8,
                 ),
                 (
                     view::project_point((0.0, axis_len, 0.0), view, px_h),
                     "Y",
-                    Fg::Yellow as u8,
+                    Ink::Yellow as u8,
                 ),
                 (
                     view::project_point((0.0, 0.0, axis_len), view, px_h),
                     "Z",
-                    Fg::LightBlue as u8,
+                    Ink::LightBlue as u8,
                 ),
             ];
             if let Some((ox, oy)) = origin {
@@ -428,7 +501,13 @@ impl Rasterizer {
                 let i = cy * cw + cx;
                 let p = self.dots[i];
                 if p != 0 {
-                    screen.set(rx + cx, ry + cy, braille[p as usize], self.colors[i]);
+                    screen.set(
+                        rx + cx,
+                        ry + cy,
+                        braille[p as usize],
+                        self.colors[i],
+                        Ink::Default as u8,
+                    );
                 }
             }
         }
@@ -472,7 +551,13 @@ impl Rasterizer {
             let x = ((label_x - left) * (self.cw - 1) as f64 / px_w as f64) as u16;
             let y = ((top - label_y) * (self.ch - 1) as f64 / px_h as f64) as u16;
             if let Some(ch) = label.chars().next() {
-                screen.set(rx + x as usize, ry + y as usize, ch, color);
+                screen.set(
+                    rx + x as usize,
+                    ry + y as usize,
+                    ch,
+                    color,
+                    Ink::Default as u8,
+                );
             }
         }
     }
@@ -695,9 +780,9 @@ mod tests {
             for x in 0..w {
                 let cell = &golden[(x, y)];
                 let expected_ch = cell.symbol().chars().next().unwrap_or(' ');
-                let expected_fg = color_idx(cell.fg);
+                let expected_fg = ink_idx(cell.fg);
                 let got = screen.cell(x as usize, y as usize);
-                let got_ch = char::from_u32((got >> 8) as u32).unwrap();
+                let got_ch = char::from_u32((got >> 16) as u32).unwrap();
                 let got_fg = (got & 0xff) as u8;
                 assert_eq!(
                     got_ch, expected_ch,
@@ -772,11 +857,47 @@ mod tests {
     }
 
     #[test]
+    fn screen_present_writes_the_background_with_the_foreground() {
+        // The statusline is drawn on a filled ground, so a cell's SGR has to
+        // carry both inks; the default pair must still collapse to a bare
+        // reset, which is what the canvas (all default cells) relies on.
+        let mut s = Screen::new(2, 1);
+        s.set(0, 0, 'A', Ink::White as u8, Ink::Green as u8);
+        s.set(1, 0, 'B', Ink::Default as u8, Ink::Default as u8);
+        let mut out = Vec::new();
+        s.present(&mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("\x1b[0;37;42m"), "white on green: {text:?}");
+        assert!(
+            text.contains("\x1b[0m"),
+            "a default pair is a bare reset: {text:?}"
+        );
+    }
+
+    #[test]
+    fn screen_treats_a_repainted_background_as_a_change() {
+        // Diffs compare the whole cell, so repainting a ground under unchanged
+        // text still reaches the terminal.
+        let mut s = Screen::new(1, 1);
+        s.set(0, 0, 'A', Ink::White as u8, Ink::Default as u8);
+        let mut out = Vec::new();
+        s.present(&mut out).unwrap();
+        s.set(0, 0, 'A', Ink::White as u8, Ink::Green as u8);
+        out.clear();
+        assert_eq!(s.present(&mut out).unwrap(), 1, "the ground changed");
+        // The render loop redraws every frame; the same ground again is a
+        // no-op, so the repaint costs nothing after the first.
+        s.set(0, 0, 'A', Ink::White as u8, Ink::Green as u8);
+        out.clear();
+        assert_eq!(s.present(&mut out).unwrap(), 0, "and only once");
+    }
+
+    #[test]
     fn screen_present_writes_only_changed_cells() {
         let mut s = Screen::new(5, 3);
         let draw = |s: &mut Screen| {
-            s.set(0, 0, 'A', Fg::Cyan as u8);
-            s.set(4, 2, '⣿', Fg::Red as u8);
+            s.set(0, 0, 'A', Ink::Cyan as u8, Ink::Default as u8);
+            s.set(4, 2, '⣿', Ink::Red as u8, Ink::Default as u8);
         };
         draw(&mut s);
         let mut out = Vec::new();
@@ -791,7 +912,7 @@ mod tests {
         assert!(out.is_empty(), "identical frame must emit nothing");
         // Changing one cell emits only that cell's run.
         draw(&mut s);
-        s.set(2, 1, 'B', Fg::Default as u8);
+        s.set(2, 1, 'B', Ink::Default as u8, Ink::Default as u8);
         out.clear();
         let changed3 = s.present(&mut out).unwrap();
         assert_eq!(changed3, 1);
@@ -803,7 +924,7 @@ mod tests {
         // wiped with ESC[2J, or stale model pixels survive alongside the
         // re-projected model ("two models" after resizing).
         let mut s = Screen::new(4, 2);
-        s.set(0, 0, 'Z', Fg::Yellow as u8);
+        s.set(0, 0, 'Z', Ink::Yellow as u8, Ink::Default as u8);
         let mut out = Vec::new();
         s.present(&mut out).unwrap();
         s.resize(8, 3);
@@ -826,11 +947,11 @@ mod tests {
     #[test]
     fn screen_resize_repaints_fully() {
         let mut s = Screen::new(4, 2);
-        s.set(0, 0, 'Z', Fg::Yellow as u8);
+        s.set(0, 0, 'Z', Ink::Yellow as u8, Ink::Default as u8);
         let mut out = Vec::new();
         s.present(&mut out).unwrap();
         s.resize(8, 3);
-        s.set(7, 2, 'Q', Fg::Red as u8);
+        s.set(7, 2, 'Q', Ink::Red as u8, Ink::Default as u8);
         out.clear();
         // After a resize the previous frame is all-space, so the single
         // non-space cell is the only change.
@@ -838,9 +959,110 @@ mod tests {
         assert_eq!(changed, 1);
     }
 
+    /// Whether `params` (the bytes of one `ESC[…m`) leave a background colour
+    /// selected. Our writer only ever emits a leading reset, an fg slot and a
+    /// bg slot, but this reads any SGR: `0` clears, `49` is the default
+    /// background, `40..=47` / `100..=107` select one.
+    fn sgr_selects_background(params: &[u8]) -> bool {
+        let mut bg = false;
+        for part in String::from_utf8_lossy(params).split(';') {
+            match part.parse::<u16>() {
+                Ok(0) | Ok(49) => bg = false,
+                Ok(40..=47) | Ok(100..=107) => bg = true,
+                _ => {}
+            }
+        }
+        bg
+    }
+
+    /// Whether any `ESC[2J` in `data` runs while a background colour is still
+    /// selected. An erase uses the *selected* background on any terminal with
+    /// background-colour-erase (xterm's default), so a clear in that state
+    /// floods the screen with the colour instead of blanking it.
+    fn clears_with_background_selected(data: &[u8]) -> bool {
+        let mut bg = false;
+        let mut i = 0;
+        while i < data.len() {
+            if data[i] != 0x1b {
+                i += 1;
+                continue;
+            }
+            if data.get(i + 1) != Some(&b'[') {
+                i += 2;
+                continue;
+            }
+            let start = i + 2;
+            let mut end = start;
+            while end < data.len() && !(0x40..=0x7e).contains(&data[end]) {
+                end += 1;
+            }
+            if end >= data.len() {
+                break;
+            }
+            match data[end] {
+                b'm' => bg = sgr_selects_background(&data[start..end]),
+                b'J' if &data[start..end] == b"2" && bg => return true,
+                _ => {}
+            }
+            i = end + 1;
+        }
+        false
+    }
+
+    #[test]
+    fn present_leaves_no_background_selected() {
+        // A frame's last run is the statusline, whose ground is a filled
+        // background. Leaving it selected hands every later erase — the
+        // clear-screen of a resize, the terminal's own fill of the rows a
+        // resize exposes — the strip's colour, which then shows up as the
+        // statusline's background flooding the canvas.
+        let mut s = Screen::new(4, 2);
+        s.set(0, 1, 'X', Ink::White as u8, Ink::Black as u8);
+        let mut out = Vec::new();
+        s.present(&mut out).unwrap();
+        assert!(
+            out.ends_with(b"\x1b[0m"),
+            "the frame must end with default colours: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+        // A frame that redraws exactly what is already on the terminal has
+        // nothing to write — and so nothing to reset either.
+        s.set(0, 1, 'X', Ink::White as u8, Ink::Black as u8);
+        out.clear();
+        assert_eq!(s.present(&mut out).unwrap(), 0);
+        assert!(out.is_empty(), "an idle frame writes nothing: {out:?}");
+    }
+
+    #[test]
+    fn resize_clear_never_erases_with_a_background_selected() {
+        // Regression: the frame before the resize leaves the statusline's
+        // ground selected, so the resize's ESC[2J would paint the whole
+        // screen — canvas included — with it.
+        // Both frames go to the SAME stream, exactly as stdout sees them:
+        // the clear is emitted by the second frame, but the colours it erases
+        // with are the ones the first frame left selected.
+        let mut s = Screen::new(4, 2);
+        s.set(0, 1, 'X', Ink::White as u8, Ink::Black as u8);
+        let mut out = Vec::new();
+        s.present(&mut out).unwrap();
+        s.resize(8, 4);
+        s.set(0, 3, 'Y', Ink::Cyan as u8, Ink::Default as u8);
+        s.present(&mut out).unwrap();
+        assert!(
+            !clears_with_background_selected(&out),
+            "ESC[2J must run at default colours: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+        assert!(
+            out.windows(4).any(|w| w == b"\x1b[2J"),
+            "the resize still clears: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
     /// The rows `(top, bottom)` that hold a cell of `color`, or `None` when
     /// no cell of that color is on screen.
-    fn color_rows(screen: &Screen, color: Fg) -> Option<(usize, usize)> {
+    fn color_rows(screen: &Screen, color: Ink) -> Option<(usize, usize)> {
         let (w, h) = screen.size();
         let mut rows: Vec<usize> = Vec::new();
         for y in 0..h {
@@ -866,7 +1088,7 @@ mod tests {
         raster.render(&m, &v, (0, 1, 120, 29), true, &mut screen);
 
         // All three axes are on screen, in their own colors.
-        for (axis, color) in [("X", Fg::Red), ("Y", Fg::Yellow), ("Z", Fg::LightBlue)] {
+        for (axis, color) in [("X", Ink::Red), ("Y", Ink::Yellow), ("Z", Ink::LightBlue)] {
             assert!(
                 color_rows(&screen, color).is_some(),
                 "{axis} axis must be drawn for an empty model"
@@ -875,7 +1097,7 @@ mod tests {
         // The cross is sized by the unit scene, not collapsed into one dot:
         // the Y arm is 1.618 world units at the fit distance, which is a
         // substantial part of a 29-row canvas.
-        let (top, bottom) = color_rows(&screen, Fg::Yellow).expect("Y axis");
+        let (top, bottom) = color_rows(&screen, Ink::Yellow).expect("Y axis");
         assert!(
             bottom - top >= 8,
             "the origin cross must have real size, got rows {top}..={bottom}"
@@ -883,7 +1105,9 @@ mod tests {
         // It is a cross, not a full field: most cells stay untouched.
         let lit = (0..30)
             .flat_map(|y| (0..120).map(move |x| (x, y)))
-            .filter(|&(x, y)| screen.cell(x, y) != pack(' ', Fg::Default as u8))
+            .filter(|&(x, y)| {
+                screen.cell(x, y) != pack(' ', Ink::Default as u8, Ink::Default as u8)
+            })
             .count();
         assert!(
             lit < 30 * 120 / 4,
@@ -939,7 +1163,9 @@ mod tests {
         raster.render(&m, &v, (0, 1, 120, 29), false, &mut screen);
         let lit = (0..30)
             .flat_map(|y| (0..120).map(move |x| (x, y)))
-            .filter(|&(x, y)| screen.cell(x, y) != pack(' ', Fg::Default as u8))
+            .filter(|&(x, y)| {
+                screen.cell(x, y) != pack(' ', Ink::Default as u8, Ink::Default as u8)
+            })
             .count();
         assert_eq!(lit, 0, "axes off on an empty model draws nothing");
     }

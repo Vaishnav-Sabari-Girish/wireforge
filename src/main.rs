@@ -3,7 +3,8 @@ use crossterm::{
     cursor::{Hide, Show},
     event::{
         self, DisableFocusChange, EnableFocusChange, Event, KeyCode, KeyEventKind, KeyModifiers,
-        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        KeyboardEnhancementFlags, ModifierKeyCode, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -12,6 +13,8 @@ use crossterm::{
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
+    style::{Color, Style},
+    text::{Line, Span},
     widgets::{Block, BorderType, Borders, Padding, Paragraph, Widget},
 };
 
@@ -20,6 +23,7 @@ use std::{
     error::Error,
     io::{self, IsTerminal, Read},
     path::{Path, PathBuf},
+    sync::OnceLock,
     sync::mpsc::{self, Sender},
     thread,
     time::{Duration, Instant},
@@ -74,7 +78,7 @@ enum Hud {
 /// One continuous degree of freedom: rotation (yaw / pitch / roll) and translation (pan / dolly).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Motion {
-    // Rotation (world-frame: fixed world axes; h/l/r/e read left/right as
+    // Rotation (world-frame: fixed world axes; h/l/d/f read left/right as
     // the viewer sees them — the model faces out of the screen).
     YawLeft,
     YawRight,
@@ -106,10 +110,25 @@ enum Action {
     Help,
     Spin,
     Axes,
-    Center,
-    Fit,
     Reset,
     Motion(Motion),
+}
+
+/// The flag a bare modifier key raises: `LeftControl` and `RightControl` are
+/// one `CONTROL`, and a chord never cares which hand pressed it.
+///
+/// The two ISO level shifts are layout keys rather than modifiers a chord can
+/// wear, so they raise nothing.
+fn modifier_flag(m: ModifierKeyCode) -> KeyModifiers {
+    match m {
+        ModifierKeyCode::LeftShift | ModifierKeyCode::RightShift => KeyModifiers::SHIFT,
+        ModifierKeyCode::LeftControl | ModifierKeyCode::RightControl => KeyModifiers::CONTROL,
+        ModifierKeyCode::LeftAlt | ModifierKeyCode::RightAlt => KeyModifiers::ALT,
+        ModifierKeyCode::LeftSuper | ModifierKeyCode::RightSuper => KeyModifiers::SUPER,
+        ModifierKeyCode::LeftHyper | ModifierKeyCode::RightHyper => KeyModifiers::HYPER,
+        ModifierKeyCode::LeftMeta | ModifierKeyCode::RightMeta => KeyModifiers::META,
+        ModifierKeyCode::IsoLevel3Shift | ModifierKeyCode::IsoLevel5Shift => KeyModifiers::empty(),
+    }
 }
 
 /// Fold one terminal key event into the key's identity (its *base*, un-shifted
@@ -118,7 +137,7 @@ enum Action {
 ///
 /// * the kitty protocol sends the layout's **shifted glyph** for every key
 ///   that has an alternate (`REPORT_ALTERNATE_KEYS` is pushed): `Shift+h` ->
-///   `Char('H')`, `Shift+0` -> `Char(')')` — crossterm applies the alternate
+///   `Char('H')`, `Shift+-` -> `Char('_')` — crossterm applies the alternate
 ///   and clears SHIFT. Keys without an alternate keep the modifier instead
 ///   (`Shift+Left` -> `Left` + SHIFT, `Shift+Space` -> `Char(' ')` + SHIFT);
 /// * a legacy terminal sends the shifted **glyph** too, and crossterm
@@ -127,97 +146,403 @@ enum Action {
 ///
 /// So an upper-case char implies shift, a known shifted glyph folds back to
 /// its base key + shift, and anything else keeps the SHIFT modifier. The glyph
-/// table maps the four shifted glyphs the bindings use back to their US base
+/// table maps the three shifted glyphs the bindings use back to their US base
 /// keys — the layouts' own glyphs arrive unchanged, so the same table serves
 /// both paths. Caps lock therefore counts as shift on the legacy path and is
 /// a no-op under kitty (crossterm files the kitty caps-lock bit under
 /// `KeyEventState`, which is never read here) — the two cannot be told apart
 /// from here.
-fn canonical_key(code: KeyCode, mods: KeyModifiers) -> (KeyCode, bool) {
+const fn canonical_key(code: KeyCode, mods: KeyModifiers) -> (KeyCode, bool) {
     use KeyCode::Char;
     let shift = mods.contains(KeyModifiers::SHIFT);
+    // Const-evaluable throughout: the keymap is folded at compile time, so
+    // this may not reach for Unicode tables (`is_uppercase`) or allocating
+    // case folding (`to_lowercase`). Every chord is ASCII.
     match code {
-        Char(c) if c.is_uppercase() => (Char(c.to_lowercase().next().unwrap_or(c)), true),
+        Char(c) if c.is_ascii_uppercase() => (Char(c.to_ascii_lowercase()), true),
         Char('?') => (Char('/'), true),
         Char('_') => (Char('-'), true),
         Char('+') => (Char('='), true),
-        Char(')') => (Char('0'), true),
+        // BackTab *is* Shift+Tab: the legacy encoding reports it as its own
+        // key with no modifier, the kitty one keeps SHIFT. Folding it to the
+        // shifted form lets one chord cover both.
+        KeyCode::BackTab => (KeyCode::BackTab, true),
+        // Space and Esc are the two keys a terminal cannot report SHIFT for:
+        // the legacy encoding sends the same bytes either way, so treating the
+        // shifted spelling as a different key could only make the two terminal
+        // paths disagree about a key that is in fact the same one.
+        Char(' ') | KeyCode::Esc => (code, false),
         _ => (code, shift),
     }
 }
 
-/// Map one terminal key event to the identity its hold is stored under and the
-/// action it performs; `None` for an unbound key (which includes the modifier
-/// keys themselves, reported by the kitty protocol).
+/// The task a binding belongs to. Grouping is by what the operator wants to
+/// *do*, never by which modifier the chord wears: "how do I move it?" is a
+/// question about the task, while "what does Shift do?" is a question about
+/// the parser. The statusline's modifier hints key off this; the help overlay
+/// is written by hand and does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Group {
+    /// Turning the model on the world's axes (h / l / k / j / r / e).
+    Rotate,
+    /// Sliding the model in the world's plane (Shift + hjkl, = / -).
+    Move,
+    /// Turning the model on its own axes (Ctrl + hjkl / r / e).
+    Local,
+    /// Where the model sits on screen (c).
+    Frame,
+    /// Session control (Space / Tab / ? / q).
+    Session,
+}
+
+/// One way to press a binding: the terminal key event *as the terminal
+/// reports it*, plus the label shown to the operator.
 ///
-/// SHIFT is the only modifier that changes an action (see `canonical_key`),
-/// and a shifted chord acts only where the table below lists it: `Shift+0` is
-/// `)` and does nothing, while `Shift+h` is the documented pan. Ctrl binds
-/// quitting (raw mode delivers Ctrl+C / Ctrl+Q as key events, with no
-/// SIGINT) plus the local-frame rotation chords `Ctrl` + arrows / `hjkl` /
-/// `e` / `r` — rotation around the model's own axes instead of the world's;
-/// every other modifier swallows the key, so a stray `Alt+h` can never
-/// rotate the model.
+/// `code` / `mods` are the legacy (no kitty protocol) encoding, which is the
+/// more explicit of the two: a shifted letter arrives as its upper-case glyph
+/// **with** SHIFT still set, and a shifted symbol as that symbol (`?`, `+`,
+/// `_`) with no modifier. Feeding these through `canonical_key` folds them
+/// back to the documented chord, so the cross-check tests can prove each
+/// binding resolves to the action it claims. The kitty encoding is covered
+/// separately by `resolve_key_event_folds_both_terminal_encodings`.
+///
+/// `label` follows one convention everywhere: modifiers in `Ctrl+Shift+`
+/// order, then the key — lower-case for a bare letter (`h`), upper-case when
+/// SHIFT is part of the chord (`Shift+H`), verbatim for named keys
+/// (`Left`, `Space`, `Tab`).
+/// A chord is plain data, small enough to copy: the compile-time keymap
+/// indexes chords by value.
+#[derive(Clone, Copy)]
+struct Chord {
+    code: KeyCode,
+    mods: KeyModifiers,
+}
+
+/// A chord with no modifier.
+const fn key(code: KeyCode) -> Chord {
+    Chord {
+        code,
+        mods: KeyModifiers::NONE,
+    }
+}
+
+/// `Shift` + `code`.
+const fn shift(code: KeyCode) -> Chord {
+    Chord {
+        code,
+        mods: KeyModifiers::SHIFT,
+    }
+}
+
+/// `Ctrl` + `code`.
+const fn ctrl(code: KeyCode) -> Chord {
+    Chord {
+        code,
+        mods: KeyModifiers::CONTROL,
+    }
+}
+
+/// One binding: an action, the task it belongs to, and every way to press it.
+///
+/// This table is what the statusline hints read and — via [`keymap`] — what
+/// the resolver itself is built from. It is deliberately *not* what the help
+/// overlay is drawn from: that page is written out by hand under
+/// [`HELP_LEFT`] / [`HELP_RIGHT`], and the cross-check test is what keeps the
+/// two honest about each other.
+#[derive(Clone, Copy)]
+struct Binding {
+    action: Action,
+    group: Group,
+    /// Every documented way to press it.
+    chords: &'static [Chord],
+}
+
+/// Every binding, in the order the statusline hints list them. This is the
+/// keymap's one source: the lookup the viewer resolves against is built from
+/// it by the compiler, so a binding cannot exist without a key to press, and a
+/// key cannot be pressed without a binding.
+const BINDINGS: &[Binding] = &[
+    // --- Rotate: the world's axes ---
+    Binding {
+        action: Action::Motion(Motion::YawLeft),
+        group: Group::Rotate,
+        chords: &[key(KeyCode::Char('h')), key(KeyCode::Left)],
+    },
+    Binding {
+        action: Action::Motion(Motion::YawRight),
+        group: Group::Rotate,
+        chords: &[key(KeyCode::Char('l')), key(KeyCode::Right)],
+    },
+    Binding {
+        action: Action::Motion(Motion::PitchUp),
+        group: Group::Rotate,
+        chords: &[key(KeyCode::Char('k')), key(KeyCode::Up)],
+    },
+    Binding {
+        action: Action::Motion(Motion::PitchDown),
+        group: Group::Rotate,
+        chords: &[key(KeyCode::Char('j')), key(KeyCode::Down)],
+    },
+    Binding {
+        action: Action::Motion(Motion::RollPlus),
+        group: Group::Rotate,
+        chords: &[key(KeyCode::Char('d'))],
+    },
+    Binding {
+        action: Action::Motion(Motion::RollMinus),
+        group: Group::Rotate,
+        chords: &[key(KeyCode::Char('f'))],
+    },
+    // --- Move: slide in the world's plane ---
+    Binding {
+        action: Action::Motion(Motion::MoveLeft),
+        group: Group::Move,
+        chords: &[shift(KeyCode::Char('H')), shift(KeyCode::Left)],
+    },
+    Binding {
+        action: Action::Motion(Motion::MoveRight),
+        group: Group::Move,
+        chords: &[shift(KeyCode::Char('L')), shift(KeyCode::Right)],
+    },
+    Binding {
+        action: Action::Motion(Motion::MoveUp),
+        group: Group::Move,
+        chords: &[shift(KeyCode::Char('K')), shift(KeyCode::Up)],
+    },
+    Binding {
+        action: Action::Motion(Motion::MoveDown),
+        group: Group::Move,
+        chords: &[shift(KeyCode::Char('J')), shift(KeyCode::Down)],
+    },
+    Binding {
+        action: Action::Motion(Motion::MoveForward),
+        group: Group::Move,
+        // `+` is how several layouts spell the shifted `=`; it folds to `=`.
+        chords: &[key(KeyCode::Char('=')), key(KeyCode::Char('+'))],
+    },
+    Binding {
+        action: Action::Motion(Motion::MoveBack),
+        group: Group::Move,
+        // `_` is the shifted `-` on several layouts; it folds to `-`.
+        chords: &[key(KeyCode::Char('-')), key(KeyCode::Char('_'))],
+    },
+    // --- Local: the model's own axes ---
+    Binding {
+        action: Action::Motion(Motion::LocalYawLeft),
+        group: Group::Local,
+        chords: &[ctrl(KeyCode::Char('h')), ctrl(KeyCode::Left)],
+    },
+    Binding {
+        action: Action::Motion(Motion::LocalYawRight),
+        group: Group::Local,
+        chords: &[ctrl(KeyCode::Char('l')), ctrl(KeyCode::Right)],
+    },
+    Binding {
+        action: Action::Motion(Motion::LocalPitchUp),
+        group: Group::Local,
+        chords: &[ctrl(KeyCode::Char('k')), ctrl(KeyCode::Up)],
+    },
+    Binding {
+        action: Action::Motion(Motion::LocalPitchDown),
+        group: Group::Local,
+        chords: &[ctrl(KeyCode::Char('j')), ctrl(KeyCode::Down)],
+    },
+    Binding {
+        action: Action::Motion(Motion::LocalRollPlus),
+        group: Group::Local,
+        chords: &[ctrl(KeyCode::Char('d'))],
+    },
+    Binding {
+        action: Action::Motion(Motion::LocalRollMinus),
+        group: Group::Local,
+        chords: &[ctrl(KeyCode::Char('f'))],
+    },
+    // --- Frame: where it sits on screen ---
+    Binding {
+        action: Action::Reset,
+        group: Group::Frame,
+        chords: &[key(KeyCode::Char('c'))],
+    },
+    // --- Session ---
+    Binding {
+        action: Action::Spin,
+        group: Group::Session,
+        chords: &[key(KeyCode::Char(' '))],
+    },
+    Binding {
+        action: Action::Axes,
+        group: Group::Session,
+        chords: &[
+            key(KeyCode::Tab),
+            // A legacy terminal reports Shift+Tab as BackTab; kitty reports
+            // Tab with SHIFT. BackTab is the spelling both paths agree on.
+            shift(KeyCode::BackTab),
+        ],
+    },
+    Binding {
+        action: Action::Help,
+        group: Group::Session,
+        chords: &[key(KeyCode::Char('?'))],
+    },
+    Binding {
+        action: Action::Quit,
+        group: Group::Session,
+        chords: &[
+            key(KeyCode::Char('q')),
+            key(KeyCode::Esc),
+            ctrl(KeyCode::Char('c')),
+            // Raw mode turns Ctrl+C and Ctrl+Q into plain key events (no
+            // SIGINT), so both are ours to bind.
+            ctrl(KeyCode::Char('q')),
+        ],
+    },
+];
+
+impl Chord {
+    /// The label as shown to the operator, derived from the chord itself so
+    /// it can never disagree with the key it names. Modifiers come first in
+    /// `Ctrl+Shift+` order, then the key: lower-case for a bare letter (`h`),
+    /// upper-case when SHIFT is part of the chord (`Shift+H`), a plain glyph
+    /// for symbols, and the key's name for named keys (`Space`, `Left`).
+    fn label(&self) -> String {
+        let mut out = String::new();
+        if self.mods.contains(KeyModifiers::CONTROL) {
+            out.push_str("Ctrl+");
+        }
+        if self.mods.contains(KeyModifiers::SHIFT) {
+            out.push_str("Shift+");
+        }
+        match self.code {
+            KeyCode::Char(' ') => out.push_str("Space"),
+            KeyCode::Char(c) => out.push(c),
+            KeyCode::Esc => out.push_str("Esc"),
+            KeyCode::Tab => out.push_str("Tab"),
+            // BackTab IS Shift+Tab; spelling the modifier again would double it.
+            KeyCode::BackTab => out.push_str(if self.mods.contains(KeyModifiers::SHIFT) {
+                "Tab"
+            } else {
+                "BackTab"
+            }),
+            KeyCode::Left => out.push_str("Left"),
+            KeyCode::Right => out.push_str("Right"),
+            KeyCode::Up => out.push_str("Up"),
+            KeyCode::Down => out.push_str("Down"),
+            other => out.push_str(&format!("{other:?}")),
+        }
+        out
+    }
+}
+
+/// Resolve a terminal key event to the key's identity and the action it fires.
+///
+/// A lookup, not a list: the keymap was built from [`BINDINGS`] by the
+/// compiler, so a rebind is one edit that the resolver cannot be left behind
+/// by. The identity that comes back is what a hold is filed under, so a
+/// Release with different modifiers still finds the motion it started.
 fn resolve_key_event(code: KeyCode, mods: KeyModifiers) -> Option<(KeyCode, Action)> {
-    use KeyCode::*;
-    // Alt / Super / Hyper / Meta bind nothing.
-    let other = KeyModifiers::ALT | KeyModifiers::SUPER | KeyModifiers::HYPER | KeyModifiers::META;
-    if mods.intersects(other) {
+    // A chord is a key plus at most Shift and Ctrl: Alt, Super, Hyper and Meta
+    // bind nothing, whatever the key is.
+    let binds = KeyModifiers::SHIFT.union(KeyModifiers::CONTROL);
+    if !mods.difference(binds).is_empty() {
         return None;
     }
     let (base, shift) = canonical_key(code, mods);
-    if mods.contains(KeyModifiers::CONTROL) {
-        // Ctrl+C / Ctrl+Q quit (raw mode turns them into plain key events,
-        // with no SIGINT); the rotation arrows and letters rotate in the
-        // model's own frame. Every other Ctrl chord stays unbound.
-        let action = match base {
-            Char('q') | Char('c') => Action::Quit,
-            Left | Char('h') => Action::Motion(Motion::LocalYawLeft),
-            Right | Char('l') => Action::Motion(Motion::LocalYawRight),
-            Up | Char('k') => Action::Motion(Motion::LocalPitchUp),
-            Down | Char('j') => Action::Motion(Motion::LocalPitchDown),
-            Char('r') => Action::Motion(Motion::LocalRollPlus),
-            Char('e') => Action::Motion(Motion::LocalRollMinus),
-            _ => return None,
-        };
-        return Some((base, action));
-    }
-    let action = match (base, shift) {
-        // One-shot keys. Shift is a real chord component, so a shifted key is
-        // bound ONLY where it is listed below: `Shift+0` (which a US layout
-        // types as `)`) is not `0`, and `Shift+Q` is not `q`. The two
-        // exceptions are Space and Esc, which a legacy terminal encodes as the
-        // very same bytes with or without Shift — strictness there could only
-        // make the two terminal paths disagree.
-        (Char('q'), false) | (Esc, _) => Action::Quit,
-        (Char(' '), _) => Action::Spin,
-        // Shift+Tab arrives as BackTab on both paths and IS listed.
-        (Tab, false) | (BackTab, _) => Action::Axes,
-        (Char('0'), false) => Action::Reset,
-        // Help is `?`, i.e. the listed chord shift + `/`.
-        (Char('/'), true) => Action::Help,
-        (Char('f'), true) => Action::Fit,
-        (Char('f'), false) => Action::Center,
-        // Unshifted arrows / hjkl rotate; r / e roll.
-        (Left, false) | (Char('h'), false) => Action::Motion(Motion::YawLeft),
-        (Right, false) | (Char('l'), false) => Action::Motion(Motion::YawRight),
-        (Up, false) | (Char('k'), false) => Action::Motion(Motion::PitchUp),
-        (Down, false) | (Char('j'), false) => Action::Motion(Motion::PitchDown),
-        (Char('r'), false) => Action::Motion(Motion::RollPlus),
-        (Char('e'), false) => Action::Motion(Motion::RollMinus),
-        // The listed shifted chords translate instead.
-        (Left, true) | (Char('h'), true) => Action::Motion(Motion::MoveLeft),
-        (Right, true) | (Char('l'), true) => Action::Motion(Motion::MoveRight),
-        (Up, true) | (Char('k'), true) => Action::Motion(Motion::MoveUp),
-        (Down, true) | (Char('j'), true) => Action::Motion(Motion::MoveDown),
-        // Dolly: `=` / `-` plus their shifted spellings `+` / `_`, which is
-        // how those keys are labelled on several layouts.
-        (Char('='), _) => Action::Motion(Motion::MoveForward),
-        (Char('-'), _) => Action::Motion(Motion::MoveBack),
-        _ => return None,
+    let mut want = if shift {
+        KeyModifiers::SHIFT
+    } else {
+        KeyModifiers::empty()
     };
-    Some((base, action))
+    if mods.contains(KeyModifiers::CONTROL) {
+        want = want.union(KeyModifiers::CONTROL);
+    }
+    KEYMAP
+        .iter()
+        .find(|entry| entry.base == base && want.intersection(entry.mask) == entry.mods)
+        .map(|entry| (base, entry.action))
 }
+
+/// One entry of the keymap: a chord's canonical identity, and what it does.
+///
+/// The identity is what [`canonical_key`] folds a terminal event to, so the
+/// chord *as written in the table* and the event *as the terminal reports it*
+/// meet on the same value — that is what lets the table be built ahead of time
+/// instead of matched by hand.
+#[derive(Clone, Copy)]
+struct KeymapEntry {
+    /// The key's identity, which is also the id a hold is filed under.
+    base: KeyCode,
+    /// Which modifier bits this chord cares about, and which it requires.
+    ///
+    /// A Ctrl chord ignores Shift: `Ctrl+Shift+h` is `Ctrl+h`, because the
+    /// shift is not part of what the operator meant to press. Every other
+    /// chord is strict, because there `Shift` *is* the difference between
+    /// rotating and panning.
+    mask: KeyModifiers,
+    mods: KeyModifiers,
+    action: Action,
+}
+
+/// How many chords the keymap holds: every chord of every binding.
+const fn chord_count() -> usize {
+    let mut n = 0;
+    let mut b = 0;
+    while b < BINDINGS.len() {
+        n += BINDINGS[b].chords.len();
+        b += 1;
+    }
+    n
+}
+
+/// Flatten [`BINDINGS`] into the keymap, folding each chord exactly the way an
+/// incoming event is folded.
+///
+/// This runs in the compiler. The viewer therefore has no key list to
+/// initialise, no lookup to build and nothing to keep in step: the declaration
+/// above *is* the keymap.
+const fn keymap() -> [KeymapEntry; chord_count()] {
+    let mut out = [KeymapEntry {
+        base: KeyCode::Null,
+        mask: KeyModifiers::empty(),
+        mods: KeyModifiers::empty(),
+        action: Action::Quit,
+    }; chord_count()];
+    let mut written = 0;
+    let mut b = 0;
+    while b < BINDINGS.len() {
+        let binding = BINDINGS[b];
+        let mut c = 0;
+        while c < binding.chords.len() {
+            let chord = binding.chords[c];
+            let (base, shift) = canonical_key(chord.code, chord.mods);
+            let control = chord.mods.contains(KeyModifiers::CONTROL);
+            let mut mods = if shift {
+                KeyModifiers::SHIFT
+            } else {
+                KeyModifiers::empty()
+            };
+            if control {
+                mods = mods.union(KeyModifiers::CONTROL);
+            }
+            out[written] = KeymapEntry {
+                base,
+                mask: if control {
+                    KeyModifiers::CONTROL
+                } else {
+                    KeyModifiers::SHIFT.union(KeyModifiers::CONTROL)
+                },
+                mods,
+                action: binding.action,
+            };
+            written += 1;
+            c += 1;
+        }
+        b += 1;
+    }
+    out
+}
+
+/// The whole keymap, ready in read-only memory before `main` runs.
+const KEYMAP: [KeymapEntry; chord_count()] = keymap();
 
 /// One frame of smooth continuous motion for a held key (model follows key).
 fn continuous_step(view: &mut ViewState, m: Motion, scale: f64, dt: f64) {
@@ -241,12 +566,12 @@ fn apply_motion_step(view: &mut ViewState, m: Motion, rot: f64, mv: f64) {
         Motion::YawRight => view.add_yaw(rot),
         Motion::PitchUp => view.add_pitch(-rot),
         Motion::PitchDown => view.add_pitch(rot),
-        // View-frame roll: `r` rolls about the sight line (into the
+        // View-frame roll: `d` rolls about the sight line (into the
         // screen) in the viewer's sense — the viewer's right side (screen
-        // right) dips, i.e. the image turns clockwise; `e` is the mirror.
+        // right) dips, i.e. the image turns clockwise; `f` is the mirror.
         // That axis is anti-parallel to the model's front (+Z out of the
-        // screen), so plain r and Ctrl+r read as mirror images at the
-        // default view: Ctrl+r keeps the body reading (starboard dips).
+        // screen), so plain d and Ctrl+d read as mirror images at the
+        // default view: Ctrl+d keeps the body reading (starboard dips).
         Motion::RollPlus => view.roll -= rot,
         Motion::RollMinus => view.roll += rot,
         // Local-frame rotation: the same step post-multiplied, so the axis
@@ -398,49 +723,515 @@ fn load_model_from_text(name: &str, text: &str) -> Result<(Model, String), Strin
     Ok((model, wrfm_data.name))
 }
 
-/// HUD layout: Row 0 is the fixed model + view line. `label` overrides the
-/// model name (the FIFO path for a stream preview, whose model name is only
-/// the file stem); regular files pass `None` and show their own name.
-fn hud_layout(name: &str, view: &ViewState, collapsed: bool, label: Option<&str>) -> String {
-    let title = label.unwrap_or(name);
-    let mut row0 = format!(
-        "Wireforge: {} | yaw={:.2} pitch={:.2} roll={:.2} dist={:.2} pan=({:.2},{:.2})",
-        title, view.yaw, view.pitch, view.roll, view.dist, view.pan_x, view.pan_y
-    );
-    if collapsed {
-        row0.push_str("   [?] keys");
-    }
-    row0
+/// Row 0 of the HUD: the camera telemetry line, and nothing else.
+///
+/// The model's name is not repeated here — it leads the [`status_line`], which
+/// is where the eye already goes for "what am I looking at", and one fact
+/// belongs in one place. What is left is deliberately *only* telemetry: this
+/// line is routinely wider than the terminal, so anything appended to it (as
+/// the old `[?] keys` hint was) is the first thing clipped.
+fn telemetry_line(view: &ViewState) -> String {
+    format!(
+        "yaw={:.2} pitch={:.2} roll={:.2} dist={:.2} pan=({:.2},{:.2})",
+        view.yaw, view.pitch, view.roll, view.dist, view.pan_x, view.pan_y
+    )
 }
 
-/// The full help overlay (shown when the HUD is expanded).
-const HELP: &[&str] = &[
-    "=== wireforge keys ===",
-    "",
-    "No Shift (world axes; left/right as you see them):",
-    "  yaw left  <- / h       yaw right  -> / l",
-    "  pitch up  ^ / k        pitch down v / j",
-    "  roll      r / e        farther    -",
-    "  nearer    =",
-    "",
-    "Shift:",
-    "  left      <- / h       right      -> / l",
-    "  up        ^ / k        down       v / j",
-    "",
-    "Ctrl (the model's own axes / its own left-right):",
-    "  yaw left  Ctrl+h       yaw right  Ctrl+l",
-    "  pitch up  Ctrl+k       pitch down Ctrl+j",
-    "  roll      Ctrl+r / e",
-    "  Ctrl + arrows work like Ctrl + hjkl",
-    "",
-    "Keys:",
-    "  center    f            fit        Shift+f",
-    "  reset     0            spin       Space",
-    "  axes      Tab          help       ?",
-    "  quit      q / Esc / Ctrl+C",
-    "",
-    "[?] close help",
+/// The order the statusline's modifier hints list their groups in. This is the
+/// *hints'* split, not the overlay's: the help page has its own hand-written
+/// columns below and reads nothing from here.
+const HINT_GROUPS: &[&[Group]] = &[
+    &[Group::Rotate, Group::Move],
+    &[Group::Local, Group::Frame, Group::Session],
 ];
+
+// ---------------------------------------------------------------------------
+// The help overlay
+// ---------------------------------------------------------------------------
+
+/// One row of the overlay: `(chord, doc)` — the chord as the operator reads
+/// it, and what it does. Written by hand — nothing derives these from
+/// [`BINDINGS`], so the page says only what its author typed, and
+/// `help_overlay_lists_every_binding_once` is what proves the two have not
+/// drifted apart.
+#[derive(Clone, Copy)]
+struct HelpRow(&'static str, &'static str);
+
+/// One group of the overlay: `(heading, rows)`. The frame is named on every
+/// heading, so no reader has to inherit it from a section header the way the
+/// old modifier-grouped overlay demanded.
+#[derive(Clone, Copy)]
+struct HelpGroup(&'static str, &'static [HelpRow]);
+
+/// The overlay's left column: Rotate and Move, the world-frame pair.
+const HELP_LEFT: &[HelpGroup] = &[
+    HelpGroup(
+        "ROTATE  world axes",
+        &[
+            HelpRow("h", "yaw left"),
+            HelpRow("l", "yaw right"),
+            HelpRow("k", "pitch up"),
+            HelpRow("j", "pitch down"),
+            HelpRow("d", "roll clockwise"),
+            HelpRow("f", "roll anticlockwise"),
+        ],
+    ),
+    HelpGroup(
+        "MOVE  world axes",
+        &[
+            HelpRow("Shift+H", "pan left"),
+            HelpRow("Shift+L", "pan right"),
+            HelpRow("Shift+K", "pan up"),
+            HelpRow("Shift+J", "pan down"),
+            HelpRow("=", "dolly nearer"),
+            HelpRow("-", "dolly farther"),
+        ],
+    ),
+];
+
+/// The overlay's right column: Local mirrors Rotate on the model's own axes,
+/// so it sits opposite it; Frame and Session are short and stack under it.
+const HELP_RIGHT: &[HelpGroup] = &[
+    HelpGroup(
+        "ROTATE  the model's own axes",
+        &[
+            HelpRow("Ctrl+h", "yaw to its own left"),
+            HelpRow("Ctrl+l", "yaw to its own right"),
+            HelpRow("Ctrl+k", "pitch up"),
+            HelpRow("Ctrl+j", "pitch down"),
+            HelpRow("Ctrl+d", "roll clockwise"),
+            HelpRow("Ctrl+f", "roll anticlockwise"),
+        ],
+    ),
+    HelpGroup("FRAME", &[HelpRow("c", "reset the view")]),
+    HelpGroup(
+        "SESSION",
+        &[
+            HelpRow("Space", "toggle spinning"),
+            HelpRow("Tab", "toggle the XYZ axes"),
+            HelpRow("?", "toggle this help"),
+            HelpRow("q", "quit"),
+        ],
+    ),
+];
+
+/// One column of the overlay: a heading per group and one `chord  doc` row per
+/// binding, with the chord column padded to a width *measured from the data*
+/// rather than hand-counted spaces.
+///
+/// The rows are the hand-written ones above; only the padding is computed.
+/// Aliases are not listed at all, which is what keeps the overlay inside an
+/// 80-column terminal.
+fn help_column(groups: &[HelpGroup]) -> Vec<Line<'static>> {
+    let chord_w = groups
+        .iter()
+        .flat_map(|HelpGroup(_, rows)| rows.iter())
+        .map(|HelpRow(chord, _)| chord.len())
+        .max()
+        .unwrap_or(0);
+
+    let mut lines = Vec::new();
+    for &HelpGroup(title, rows) in groups {
+        lines.push(Line::from(Span::styled(
+            title,
+            Style::default().fg(Color::Yellow),
+        )));
+        for &HelpRow(chord, doc) in rows {
+            lines.push(Line::from(vec![
+                // Keys are cyan and labels light blue, so the eye can scan a
+                // column of chords without reading the prose.
+                Span::styled(
+                    format!("  {chord:<chord_w$}"),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::styled(format!("  {doc}"), Style::default().fg(Color::LightBlue)),
+            ]));
+        }
+        lines.push(Line::default());
+    }
+    lines.pop(); // no trailing gap after the last group
+    lines
+}
+
+/// The overlay, built once for the life of the process.
+///
+/// Its content is a pure function of [`HELP_LEFT`] / [`HELP_RIGHT`] — no
+/// width, no state, no clock — so there is nothing to rebuild between frames,
+/// and the panel centres itself and clips at the edges instead of reflowing.
+/// Building it costs about as much as rasterizing a small model, which is not
+/// a price to pay per frame for a view that cannot have changed.
+fn help_lines() -> &'static [Line<'static>] {
+    static LINES: OnceLock<Vec<Line<'static>>> = OnceLock::new();
+    LINES.get_or_init(build_help_lines)
+}
+
+/// The full help overlay as styled lines: two columns of task groups, each
+/// column's chord gutter measured from the data.
+fn build_help_lines() -> Vec<Line<'static>> {
+    let left = help_column(HELP_LEFT);
+    let right = help_column(HELP_RIGHT);
+    let left_w = left.iter().map(Line::width).max().unwrap_or(0);
+
+    let mut out = Vec::with_capacity(left.len().max(right.len()));
+    for i in 0..left.len().max(right.len()) {
+        let mut spans = left.get(i).map_or_else(Vec::new, |l| l.spans.clone());
+        // Pad the left column to its widest line so the right column starts in
+        // one place, then a fixed gap. A line with no left content contributes
+        // nothing, so pad by what is actually present.
+        // All help text is ASCII, so byte length == display width.
+        let have: usize = spans.iter().map(|s| s.content.len()).sum();
+        spans.push(Span::raw(" ".repeat(left_w.saturating_sub(have) + 2)));
+        if let Some(r) = right.get(i) {
+            spans.extend(r.spans.clone());
+        }
+        out.push(Line::from(spans));
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// The statusline (the last row)
+// ---------------------------------------------------------------------------
+
+/// The statusline's inks, named for the *role* each plays. Wireforge draws in
+/// the terminal theme's own palette, so these are ANSI slots rather than fixed
+/// RGB: on the everforest palette this was built against, `STRIP` is `#475258`,
+/// `LAMP` is `#5d686f`, `ACCENT` is `#A7C080` and `BODY` is `#D3C6AA` — the same
+/// dark / mid / accent triad lualine's everforest theme uses for its `c`, `b`
+/// and `a` sections.
+const STRIP: Color = Color::Black; // ANSI 0 — ink, and the full-width ground
+const LAMP: Color = Color::DarkGray; // ANSI 8 — one step lighter
+const ACCENT: Color = Color::Green; // ANSI 2 — the model-name pill
+const BODY: Color = Color::White; // ANSI 7 — text on a block
+
+/// The filled wedge that *closes* a block (U+E0B0): its ink is the block's own
+/// ground, so that colour tapers rightwards over whatever follows.
+const WEDGE_CLOSE: char = '\u{e0b0}';
+/// The filled wedge that *opens* a block (U+E0B2): same ink, but the point
+/// faces left, so the block arrives out of the ground it sits on.
+const WEDGE_OPEN: char = '\u{e0b2}';
+/// The thin divider between two items of one block (U+E0B1).
+const ITEM_DIVIDER: char = '\u{e0b1}';
+/// Strip cells kept between the left blocks and the right-hand hints, so the
+/// two never fuse into one long bar.
+const MIN_GAP: usize = 2;
+
+/// One item on the statusline: runs of text, each in its own ink, all drawn on
+/// the section's ground. A lamp spends two runs so that its dot can carry the
+/// state while its label stays readable — an unlit lamp dims its *dot*, not the
+/// word naming it.
+struct Item {
+    runs: Vec<(String, Color)>,
+}
+
+impl Item {
+    /// An item of one run.
+    fn plain(text: String, ink: Color) -> Item {
+        Item {
+            runs: vec![(text, ink)],
+        }
+    }
+
+    /// The item's text width, without the padding the section adds.
+    fn text_width(&self) -> usize {
+        self.runs.iter().map(|(t, _)| t.chars().count()).sum()
+    }
+}
+
+/// The lines the strip shows while a modifier is held, in place of the
+/// everyday hints: the keys that modifier unlocks, and what they do.
+///
+/// The keys are read out of [`BINDINGS`] — every binding whose canonical chord
+/// wears the modifier — so a rebind moves the hint with it, and only the verbs
+/// are local wording. They are joined rather than listed one row per binding
+/// because six `Ctrl+…  verb` rows do not fit in a strip that also names the
+/// model, and there is one row per *group* because a modifier can reach more
+/// than one — one verb covering two groups would be a lie.
+///
+/// Empty when nothing is held, or when what is held unlocks nothing (Alt and
+/// Super are free), which leaves the everyday hints in place.
+fn modifier_hint(mods: KeyModifiers) -> Vec<Item> {
+    // Control wins when both are down: it is the one with more to say here.
+    let (modifier, name) = if mods.contains(KeyModifiers::CONTROL) {
+        (KeyModifiers::CONTROL, "Ctrl+")
+    } else if mods.contains(KeyModifiers::SHIFT) {
+        (KeyModifiers::SHIFT, "Shift+")
+    } else {
+        return Vec::new();
+    };
+    let mut items = Vec::new();
+    // Group order follows HINT_GROUPS, which is the order the keys are
+    // documented in.
+    for group in HINT_GROUPS.iter().flat_map(|column| column.iter()).copied() {
+        let keys: Vec<String> = BINDINGS
+            .iter()
+            .filter(|b| b.group == group)
+            .map(|b| &b.chords[0])
+            .filter(|c| c.mods.contains(modifier))
+            .map(chord_key)
+            .collect();
+        if !keys.is_empty() {
+            items.push(Item::plain(
+                format!("{name}{} {}", keys.join("/"), group_verb(group)),
+                BODY,
+            ));
+        }
+    }
+    items
+}
+
+/// What a group does, in the few words the strip can afford. The overlay's
+/// headings spell the same thing out for a reader who has stopped to read;
+/// this is for a glance.
+fn group_verb(g: Group) -> &'static str {
+    match g {
+        Group::Rotate => "turn the view",
+        Group::Move => "pan the view",
+        Group::Local => "turn its own axes",
+        Group::Frame => "frame the model",
+        Group::Session => "session control",
+    }
+}
+
+/// The key half of a chord's label, lower-cased when it is a single letter:
+/// `Shift+H` reads as `h`, so a row of keys looks like keys instead of like
+/// shouting.
+fn chord_key(c: &Chord) -> String {
+    let label = c.label();
+    let key = ["Ctrl+", "Shift+"]
+        .iter()
+        .find_map(|prefix| label.strip_prefix(prefix))
+        .unwrap_or(&label);
+    if key.chars().count() == 1 {
+        key.to_lowercase()
+    } else {
+        key.to_string()
+    }
+}
+
+/// A run of items sharing one ground — lualine's `a` / `b` / `c` section.
+struct Section {
+    items: Vec<Item>,
+    ground: Color,
+}
+
+impl Section {
+    /// Cells this section occupies between `behind` and `ahead`: a cell of
+    /// padding around every item, a divider between items, and a wedge at each
+    /// end — but only where the ground actually changes, because a wedge drawn
+    /// in the ground's own colour would be invisible anyway (lualine's rule).
+    fn width(&self, behind: Color, ahead: Color) -> usize {
+        let text: usize = self.items.iter().map(|i| i.text_width() + 2).sum();
+        text + self.items.len().saturating_sub(1)
+            + usize::from(behind != self.ground)
+            + usize::from(ahead != self.ground)
+    }
+
+    /// Append the section to `spans`, wedging out of `behind` and into `ahead`.
+    fn push(&self, spans: &mut Vec<Span<'static>>, behind: Color, ahead: Color) {
+        // A divider is inked one step off its own ground, so it reads as a
+        // seam rather than as one more glyph.
+        let divider = if self.ground == STRIP { LAMP } else { STRIP };
+        let glyph = |ch: char, fg: Color, bg: Color| {
+            Span::styled(ch.to_string(), Style::default().fg(fg).bg(bg))
+        };
+        // The padding belongs to the item, so the item's ground covers it.
+        let pad = |spans: &mut Vec<Span<'static>>, fg: Color| {
+            spans.push(Span::styled(" ", Style::default().fg(fg).bg(self.ground)));
+        };
+        if behind != self.ground {
+            spans.push(glyph(WEDGE_OPEN, self.ground, behind));
+        }
+        for (i, item) in self.items.iter().enumerate() {
+            if i > 0 {
+                spans.push(glyph(ITEM_DIVIDER, divider, self.ground));
+            }
+            let first = item.runs.first().map_or(BODY, |(_, ink)| *ink);
+            pad(spans, first);
+            for (text, ink) in &item.runs {
+                spans.push(Span::styled(
+                    text.clone(),
+                    Style::default().fg(*ink).bg(self.ground),
+                ));
+            }
+            pad(spans, first);
+        }
+        if ahead != self.ground {
+            spans.push(glyph(WEDGE_CLOSE, self.ground, ahead));
+        }
+    }
+}
+
+/// The statusline as cells, ready to paint: one `(char, fg, bg)` per column,
+/// exactly `width` of them.
+///
+/// The strip is a single left-aligned row whose sections already cover it edge
+/// to edge, so cells *are* the whole of it — no widget has to lay it out, and
+/// a caller that caches them skips both the layout and the copy of it that
+/// handing a `Line` to `Paragraph` would cost.
+fn status_cells_for(app: &App, width: u16) -> Vec<(char, Color, Color)> {
+    status_line(app, width)
+        .spans
+        .iter()
+        .flat_map(|span| {
+            let fg = span.style.fg.unwrap_or(Color::Reset);
+            let bg = span.style.bg.unwrap_or(Color::Reset);
+            span.content.chars().map(move |c| (c, fg, bg))
+        })
+        .collect()
+}
+
+/// The statusline: the last row, built as a lualine-style strip.
+///
+/// Three things give lualine's statusline its look, and this copies all three:
+/// a full-width ground that carries the empty middle, sections in a lighter or
+/// accent colour sitting on that ground, and powerline wedges that hand one
+/// section's colour to the next. Left to right:
+///
+/// ```text
+///  model.wrfm ▶ ● SPIN  ● AXES ▶        ◀ ? help  q quit  Space spin  Tab axes
+/// ```
+///
+/// The pill names the model — the only place it appears, which is why Row 0 is
+/// free to be pure telemetry. The lamps are live state, and the hints are the
+/// chords that matter most, read out of [`BINDINGS`] so a key can never drift
+/// out of sync with what it claims; the hand-written overlay is checked
+/// against the same table by `help_overlay_lists_every_binding_once`.
+///
+/// The row is filled edge to edge and never exceeds `width` cells. In a narrow
+/// terminal content is shed by how little it would be missed — hints from the
+/// last one backwards, then the lamps, then the name is cut short — so the
+/// strip stays a clean band instead of a ragged line. The overlay always has
+/// the full list.
+fn status_line(app: &App, width: u16) -> Line<'static> {
+    /// The hints, most useful first: the order they appear in, and the order
+    /// they are shed in a narrow terminal.
+    const HINTS: &[(Action, &str)] = &[
+        (Action::Help, "help"),
+        (Action::Quit, "quit"),
+        (Action::Spin, "spin"),
+        (Action::Axes, "axes"),
+    ];
+    let width = width as usize;
+    // Narrower than the pill's own padding leaves nothing to draw but the
+    // strip itself; an empty pill would just be a green blob.
+    if width < 3 {
+        return Line::from(Span::styled(" ".repeat(width), Style::default().bg(STRIP)));
+    }
+    let hint = |action: Action, label: &str| -> Option<Item> {
+        BINDINGS.iter().find(|b| b.action == action).map(|b| {
+            // The canonical chord only: aliases would double the width of a
+            // row that is always on screen, and the overlay names the same
+            // chord once.
+            Item::plain(format!("{} {label}", b.chords[0].label()), BODY)
+        })
+    };
+    // A lamp is a filled dot whose ink carries the state; the label keeps the
+    // body ink either way, so "off" reads as unlit rather than as unreadable.
+    // Every lamp lights in the same accent: one colour means "on", so the ink
+    // reads as state instead of as a code the operator has to remember.
+    let lamp = |on: bool, label: &str| Item {
+        runs: vec![
+            ("● ".to_string(), if on { ACCENT } else { STRIP }),
+            (label.to_string(), BODY),
+        ],
+    };
+
+    // Hold a modifier and the hints become that modifier's chords: the strip
+    // answers the question the hand is already asking. Nothing held — or a
+    // terminal that never reports a bare modifier — leaves the everyday hints.
+    let held = modifier_hint(app.held_modifiers());
+    let mut hints: Vec<Item> = if held.is_empty() {
+        HINTS
+            .iter()
+            .filter_map(|(action, label)| hint(*action, label))
+            .collect()
+    } else {
+        held
+    };
+    let lamps = Section {
+        items: vec![lamp(app.auto_spin, "SPIN"), lamp(app.show_axes, "AXES")],
+        ground: LAMP,
+    };
+    let lamps_width = lamps.width(LAMP, STRIP);
+
+    // The pill names the model: the override when there is one (a stream's
+    // path, whose model name is only a file stem), the model name otherwise.
+    let named = app.strip_label.as_deref().unwrap_or(&app.name);
+    let full_len = named.chars().count();
+    // The whole pill — a cell of padding, the name, a cell of padding and the
+    // wedge that closes it — yields at most half the row. A model name is
+    // short, but a stream's path is not, and a pill that long would starve the
+    // lamps and the hints it shares the strip with.
+    let pill_cap = (width / 2).saturating_sub(3).max(1);
+    let mut name: Vec<char> = named.chars().take(pill_cap).collect();
+    let mut show_lamps = true;
+    // Every section draws a wedge only where its ground changes, so the pill
+    // always costs one closing wedge and the hints one opening wedge. The gap
+    // between them is the elastic part, exactly like lualine's `%=`: it takes
+    // everything the content leaves, but never shrinks below MIN_GAP while
+    // there are hints to keep clear of.
+    let hints_width = |hints: &[Item]| {
+        if hints.is_empty() {
+            0
+        } else {
+            hints.iter().map(|i| i.text_width() + 2).sum::<usize>() + hints.len()
+        }
+    };
+    let content = |name_len: usize, show_lamps: bool, hints: &[Item]| {
+        name_len + 3 + if show_lamps { lamps_width } else { 0 } + hints_width(hints)
+    };
+    let fits = |name_len: usize, show_lamps: bool, hints: &[Item]| {
+        content(name_len, show_lamps, hints) + if hints.is_empty() { 0 } else { MIN_GAP } <= width
+    };
+
+    // Shed content until the strip fits, the least-missed first: hints from
+    // the last one backwards, then the lamps, then the name a character at a
+    // time. The overlay is the backstop and always has the full list.
+    while !hints.is_empty() && !fits(name.len(), show_lamps, &hints) {
+        hints.pop();
+    }
+    if !fits(name.len(), show_lamps, &hints) {
+        show_lamps = false;
+    }
+    while !fits(name.len(), show_lamps, &hints) && !name.is_empty() {
+        name.pop();
+    }
+
+    // A name cut to fit is marked, so a shortened name is never mistaken for
+    // the whole one. It comes out empty only on a terminal too narrow for even
+    // the pill's padding.
+    let mut label: String = name.iter().collect();
+    if name.len() < full_len && !label.is_empty() {
+        label.pop();
+        label.push('…');
+    }
+
+    let pill = Section {
+        items: vec![Item::plain(label, STRIP)],
+        ground: ACCENT,
+    };
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(hints.len() * 2 + 6);
+    // The pill starts flush at the left edge — nothing precedes it to wedge out
+    // of — and hands its colour to the lamps, or straight back to the strip
+    // when the lamps had to go.
+    pill.push(&mut spans, ACCENT, if show_lamps { LAMP } else { STRIP });
+    if show_lamps {
+        lamps.push(&mut spans, LAMP, STRIP);
+    }
+    spans.push(Span::styled(
+        " ".repeat(width.saturating_sub(content(name.len(), show_lamps, &hints))),
+        Style::default().bg(STRIP),
+    ));
+    if !hints.is_empty() {
+        Section {
+            items: hints,
+            ground: LAMP,
+        }
+        .push(&mut spans, STRIP, LAMP);
+    }
+    Line::from(spans)
+}
 
 // Game-engine event loop: an input thread + channel, one scheduler owned
 // by the loop, a two-mode main loop, and dirty-flag rendering.
@@ -459,9 +1250,9 @@ struct Hold {
 struct App {
     current: Model,
     name: String,
-    /// Row 0 label override: the FIFO path for a stream preview; `None`
-    /// shows the model name.
-    row0_label: Option<String>,
+    /// Statusline label override: the FIFO path for a stream preview, whose
+    /// model name is only the file stem; `None` shows the model name.
+    strip_label: Option<String>,
     view: ViewState,
     /// Keys currently held down, keyed by their identity (the base key from
     /// `canonical_key`), so Release finds the right hold even when the
@@ -474,12 +1265,17 @@ struct App {
     auto_spin: bool,
     hud: Hud,
     show_axes: bool,
+    /// Bare modifier keys reported down right now (`LeftControl`, `RightShift`,
+    /// ...). A kitty-protocol terminal reports them on their own, which is what
+    /// lets the statusline follow a held modifier; a legacy terminal reports
+    /// none, and then this stays empty and the strip keeps its everyday hints.
+    mods_down: Vec<ModifierKeyCode>,
     /// True when the screen must be repainted before the loop blocks again.
     dirty: bool,
 }
 
 impl App {
-    fn new(current: Model, name: String, row0_label: Option<String>) -> Self {
+    fn new(current: Model, name: String, strip_label: Option<String>) -> Self {
         let mut view = ViewState::default();
         // Frame the model (an empty one lands at the default distance), so a
         // fresh App is always correctly framed — including the blank start-up
@@ -488,15 +1284,39 @@ impl App {
         App {
             current,
             name,
-            row0_label,
+            strip_label,
             view,
             held: HashMap::new(),
             release_seen: false,
             auto_spin: false,
             hud: Hud::Collapsed,
             show_axes: true,
+            mods_down: Vec::new(),
             dirty: true,
         }
+    }
+
+    /// The modifiers held down right now, as the statusline reads them.
+    fn held_modifiers(&self) -> KeyModifiers {
+        self.mods_down
+            .iter()
+            .fold(KeyModifiers::empty(), |acc, m| acc | modifier_flag(*m))
+    }
+
+    /// Record a bare modifier key going down (`down`) or coming up. Returns
+    /// whether the *set* of held modifiers changed, which is what the
+    /// statusline's hints follow: pressing the right Ctrl while the left one is
+    /// already down changes nothing on screen.
+    fn set_modifier(&mut self, m: ModifierKeyCode, down: bool) -> bool {
+        let before = self.held_modifiers();
+        if down {
+            if !self.mods_down.contains(&m) {
+                self.mods_down.push(m);
+            }
+        } else {
+            self.mods_down.retain(|k| *k != m);
+        }
+        self.held_modifiers() != before
     }
 
     /// Translation speed scales with the model's geometric-mean extent.
@@ -563,8 +1383,9 @@ impl App {
         // Focus loss: the key-up of a key held across an alt-tab reaches the
         // other window, so no Release ever arrives — drop the holds here.
         if let Event::FocusLost = ev {
-            if !self.held.is_empty() {
+            if !self.held.is_empty() || !self.mods_down.is_empty() {
                 self.held.clear();
+                self.mods_down.clear();
                 self.dirty = true;
             }
             return false;
@@ -572,6 +1393,20 @@ impl App {
         let Event::Key(key) = ev else {
             return false;
         };
+        // A bare modifier key: no action of its own, but the statusline follows
+        // it. Its hints are the chord list for whatever is held, so pressing
+        // Ctrl turns the strip into the Ctrl chords before the next key lands.
+        // A terminal that does not report modifiers never sends this and the
+        // strip simply keeps its everyday hints.
+        if let KeyCode::Modifier(m) = key.code {
+            if key.kind == KeyEventKind::Release {
+                self.release_seen = true;
+            }
+            if self.set_modifier(m, key.kind != KeyEventKind::Release) {
+                self.dirty = true;
+            }
+            return false;
+        }
         // A Release is direct evidence that the terminal reports key-up: from
         // here on a hold ends when the key does, never on a timeout. It is
         // matched by IDENTITY, because a Release may carry different modifiers
@@ -615,16 +1450,7 @@ impl App {
                 self.show_axes = !self.show_axes;
                 self.dirty = true;
             }
-            // Fit: the target at an appropriate distance (dist only — angles
-            // and pan are kept). Center: the file origin on screen (pan only).
-            Action::Fit => {
-                self.view.fit_to(&self.current);
-                self.dirty = true;
-            }
-            Action::Center => {
-                self.view.center_origin();
-                self.dirty = true;
-            }
+            // Reset: the file's own framing (rotation, pan and distance).
             Action::Reset => {
                 self.view.reset(&self.current);
                 self.dirty = true;
@@ -663,6 +1489,22 @@ struct Engine {
     screen: render::Screen,
     raster: render::Rasterizer,
     hud_buf: Option<Buffer>,
+    /// The statusline, kept between frames. Its look depends on a handful of
+    /// values, so it is rebuilt when one of them changes rather than every
+    /// frame — and rebuilding is the common case only while a modifier is
+    /// being held down.
+    status: Option<StatusCache>,
+}
+
+/// The statusline's cells, and the inputs that produced them.
+struct StatusCache {
+    /// The pill's text: the model's name, or a stream's path.
+    named: String,
+    spin: bool,
+    axes: bool,
+    mods: KeyModifiers,
+    width: u16,
+    cells: Vec<(char, Color, Color)>,
 }
 
 impl Engine {
@@ -671,6 +1513,7 @@ impl Engine {
             screen: render::Screen::new(w, h),
             raster: render::Rasterizer::new(),
             hud_buf: None,
+            status: None,
         }
     }
 
@@ -678,6 +1521,40 @@ impl Engine {
     fn resize(&mut self, w: usize, h: usize) {
         self.screen.resize(w, h);
         self.hud_buf = None;
+    }
+
+    /// Paint the statusline on `row`, rebuilding it only when something it
+    /// depends on has changed.
+    ///
+    /// It goes straight to the screen rather than through the HUD buffer: a
+    /// row of cells is what the strip *is*, and copying it into a widget to
+    /// copy it back out again would cost more than the layout it saves.
+    fn paint_status(&mut self, app: &App, width: u16, row: usize) {
+        let named = app.strip_label.as_deref().unwrap_or(&app.name);
+        let mods = app.held_modifiers();
+        let stale = self.status.as_ref().is_none_or(|cache| {
+            cache.named != named
+                || cache.spin != app.auto_spin
+                || cache.axes != app.show_axes
+                || cache.mods != mods
+                || cache.width != width
+        });
+        if stale {
+            self.status = Some(StatusCache {
+                named: named.to_string(),
+                spin: app.auto_spin,
+                axes: app.show_axes,
+                mods,
+                width,
+                cells: status_cells_for(app, width),
+            });
+        }
+        if let Some(cache) = &self.status {
+            for (x, &(ch, fg, bg)) in cache.cells.iter().enumerate() {
+                self.screen
+                    .set(x, row, ch, render::ink_idx(fg), render::ink_idx(bg));
+            }
+        }
     }
 }
 
@@ -719,14 +1596,24 @@ fn fire_due_timers(app: &mut App, engine: &mut Engine, timers: &mut TimerSchedul
     }
 }
 
-/// Copy rows `[y0, y1)` of the HUD buffer into the screen (chars + fg).
+/// Copy rows `[y0, y1)` of the HUD buffer into the screen (char + fg + bg).
+///
+/// Backgrounds matter here and nowhere else: the model canvas paints dots on
+/// the terminal's own background, while the statusline block is the one place
+/// Wireforge fills cells.
 fn blit_hud_rows(screen: &mut render::Screen, hud: &Buffer, y0: u16, y1: u16) {
     let (w, _) = screen.size();
     for y in y0..y1 {
         for x in 0..w {
             let cell = &hud[(x as u16, y)];
             let ch = cell.symbol().chars().next().unwrap_or(' ');
-            screen.set(x, y as usize, ch, render::color_idx(cell.fg));
+            screen.set(
+                x,
+                y as usize,
+                ch,
+                render::ink_idx(cell.fg),
+                render::ink_idx(cell.bg),
+            );
         }
     }
 }
@@ -743,19 +1630,13 @@ fn render_frame(
     }
     let w16 = w as u16;
     let h16 = h as u16;
-    let row0 = hud_layout(
-        &app.name,
-        &app.view,
-        app.hud == Hud::Collapsed,
-        app.row0_label.as_deref(),
-    );
-    // Row 0 is the fixed model+view line; the canvas starts right below it.
+    let row0 = telemetry_line(&app.view);
+    // Row 0 is the fixed model+view telemetry; the last row is the hint
+    // footer. The canvas is whatever is left between them.
     let canvas_top: u16 = 1;
-    let overlay = if app.hud == Hud::Expanded {
-        Some(HELP.iter().map(|s| s.to_string()).collect::<Vec<_>>())
-    } else {
-        None
-    };
+    let footer_top: u16 = h16.saturating_sub(1);
+    let canvas_h: u16 = footer_top.saturating_sub(canvas_top);
+    let overlay = app.hud == Hud::Expanded;
 
     // Reuse a persistent ratatui Buffer for the cold overlays.
     let needs_realloc = engine
@@ -768,22 +1649,35 @@ fn render_frame(
         b.reset();
     }
 
-    // Row 0 (always present above the canvas).
+    // Row 0 (telemetry): always present, always its own row. The statusline
+    // goes straight to the screen later, once nothing else can paint over it.
     {
         let hud = engine.hud_buf.as_mut().unwrap();
         Paragraph::new(row0).render(Rect::new(0, 0, w16, 1), hud);
     }
 
-    // The overlay (help panel) or the model canvas fills everything below
-    // the HUD row.
-    let canvas_area = if let Some(lines) = overlay {
-        let top = canvas_top;
-        let height = h16.saturating_sub(top);
-        let area = Rect::new(0, top, w16, height);
+    if overlay {
+        // Help panel: centred over the canvas, not a full-screen takeover. The
+        // canvas is *not* drawn underneath, so the panel never has to fight
+        // the model for contrast.
+        let lines = help_lines();
+        let inner_w = lines.iter().map(Line::width).max().unwrap_or(0) as u16 + 4;
+        let inner_h = lines.len() as u16 + 2; // +2 for the rounded border
+        // Fall back to the whole canvas when the terminal is too small to
+        // centre in; the text then clips at the panel edge rather than
+        // silently vanishing, which is the honest failure.
+        let mut area = Rect {
+            x: 0,
+            y: canvas_top,
+            width: w16.min(inner_w.max(8)),
+            height: canvas_h.min(inner_h.max(3)),
+        };
+        area.x = (w16.saturating_sub(area.width)) / 2;
+        area.y = canvas_top + (canvas_h.saturating_sub(area.height)) / 2;
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .padding(Padding::new(2, 2, 1, 1));
+            .padding(Padding::new(2, 2, 0, 0));
         let inner = block.inner(area);
         let hud = engine.hud_buf.as_mut().unwrap();
         block.render(area, hud);
@@ -791,46 +1685,37 @@ fn render_frame(
             if i as u16 >= inner.height {
                 break;
             }
-            Paragraph::new(line.as_str())
+            Paragraph::new(line.clone())
                 .render(Rect::new(inner.x, inner.y + i as u16, inner.width, 1), hud);
         }
-        None
-    } else {
-        Some(Rect::new(
-            0,
-            canvas_top,
-            w16,
-            h16.saturating_sub(canvas_top),
-        ))
-    };
+    }
 
-    // Copy the HUD rows into the screen.
+    // Copy the HUD rows into the screen: row 0, then either the whole canvas
+    // (model) or the panel rows over it.
     {
         let screen = &mut engine.screen;
         let hud = engine.hud_buf.as_ref().unwrap();
         blit_hud_rows(screen, hud, 0, canvas_top);
     }
 
-    if let Some(area) = canvas_area {
-        // Model canvas: rasterize into the screen directly.
-        let cw = area.width as usize;
-        let ch = area.height as usize;
-        if cw > 0 && ch > 0 {
-            engine.raster.resize(cw, ch);
-            engine.raster.render(
-                &app.current,
-                &app.view,
-                (0, canvas_top as usize, cw, ch),
-                app.show_axes,
-                &mut engine.screen,
-            );
-        }
-    } else {
-        // Overlay region: copy the panel/help text from the buffer.
+    if overlay {
         let screen = &mut engine.screen;
         let hud = engine.hud_buf.as_ref().unwrap();
-        blit_hud_rows(screen, hud, canvas_top, h16);
+        blit_hud_rows(screen, hud, canvas_top, footer_top);
+    } else if canvas_h > 0 {
+        // Model canvas: rasterize into the screen directly.
+        engine.raster.resize(w, canvas_h as usize);
+        engine.raster.render(
+            &app.current,
+            &app.view,
+            (0, canvas_top as usize, w, canvas_h as usize),
+            app.show_axes,
+            &mut engine.screen,
+        );
     }
+
+    // The statusline always paints last, over whatever the canvas left behind.
+    engine.paint_status(app, w16, footer_top as usize);
 
     // Present: packed-cell diff + one batched write.
     engine.screen.present(stdout)?;
@@ -906,9 +1791,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let is_stdin = target_file == Path::new("-");
     let is_fifo = !is_stdin && !blank && is_fifo_path(&target_file);
     let is_stream = is_stdin || is_fifo;
-    // Row 0 label override: the FIFO's full path (its model name is only the
-    // file stem). stdin and regular files show their model name.
-    let row0_label: Option<String> = if is_fifo {
+    // Statusline label override: the FIFO's full path (its model name is only
+    // the file stem). stdin and regular files show their model name.
+    let strip_label: Option<String> = if is_fifo {
         Some(target_file.display().to_string())
     } else {
         None
@@ -1005,7 +1890,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // L2 engine + viewer state.
     let (cols, rows) = crossterm::terminal::size()?;
-    let mut app = App::new(current_model, model_name, row0_label);
+    let mut app = App::new(current_model, model_name, strip_label);
     let mut engine = Engine::new(cols as usize, rows as usize);
     let mut timers = TimerScheduler::new();
     let mut last = Instant::now();
@@ -1307,120 +2192,831 @@ mod tests {
         assert!(load_model(&p).is_err(), "a deleted file must fail to load");
     }
 
-    // --- HUD layout (row 0) ---
+    // --- telemetry (row 0) ---
 
     #[test]
-    fn hud_row0_carries_the_name_view_and_optional_label() {
-        // Row 0 is always the fixed model + view line. A stream preview may
-        // override the title (the FIFO path, whose model name is only the
-        // file stem); otherwise the model name shows, and the collapsed HUD
-        // appends the help hint.
-        let view = ViewState::default();
-        let row0 = hud_layout("cube", &view, true, None);
+    fn telemetry_row_carries_the_camera_and_no_name() {
+        // Row 0 is telemetry only. The model's name leads the statusline, so
+        // repeating it here would be the one fact on the screen twice — and it
+        // is routinely long enough to push the numbers it shares the row with
+        // off the edge.
+        let view = ViewState {
+            yaw: 0.5,
+            ..ViewState::default()
+        };
+        let row0 = telemetry_line(&view);
+        assert!(row0.starts_with("yaw=0.50"), "camera leads the row: {row0}");
         assert!(
-            row0.starts_with("Wireforge: cube | yaw="),
-            "fixed row must carry the model name and view: {row0}"
+            row0.contains("pitch=") && row0.contains("roll="),
+            "row0: {row0}"
         );
         assert!(
             row0.contains("dist=") && row0.contains("pan=("),
             "row0: {row0}"
         );
-        assert!(row0.ends_with("[?] keys"), "collapsed hint: {row0}");
-
-        let labelled = hud_layout("stream", &view, false, Some("/tmp/stream.fifo"));
         assert!(
-            labelled.starts_with("Wireforge: /tmp/stream.fifo |"),
-            "row0: {labelled}"
+            !row0.contains("Wireforge") && !row0.contains("cube"),
+            "row0 must not repeat the model's name: {row0}"
         );
         assert!(
-            !labelled.contains("[?] keys"),
-            "the expanded HUD hides the hint: {labelled}"
+            !row0.contains("[?]"),
+            "row0 is telemetry only; the hint lives on the statusline: {row0}"
+        );
+    }
+
+    // ---------- keymap: BINDINGS <-> resolve_key_event ----------
+
+    #[test]
+    fn keymap_resolves_every_documented_chord() {
+        // The contract the generated keymap has to keep, written out as
+        // behaviour rather than as a second copy of the table: each row is an
+        // event as a terminal reports it, and what the viewer must do with it.
+        use KeyCode::*;
+        let cases: &[(&str, KeyCode, KeyModifiers, Option<Action>)] = &[
+            (
+                "h rotates",
+                Char('h'),
+                KeyModifiers::NONE,
+                Some(Action::Motion(Motion::YawLeft)),
+            ),
+            (
+                "Shift+h pans, spelled either way",
+                Char('h'),
+                KeyModifiers::SHIFT,
+                Some(Action::Motion(Motion::MoveLeft)),
+            ),
+            (
+                "Shift+H is the same chord",
+                Char('H'),
+                KeyModifiers::SHIFT,
+                Some(Action::Motion(Motion::MoveLeft)),
+            ),
+            ("Shift+q is not q", Char('q'), KeyModifiers::SHIFT, None),
+            (
+                "Shift+Q is not q either",
+                Char('Q'),
+                KeyModifiers::SHIFT,
+                None,
+            ),
+            (
+                "Ctrl+c quits",
+                Char('c'),
+                KeyModifiers::CONTROL,
+                Some(Action::Quit),
+            ),
+            (
+                "Ctrl+q quits",
+                Char('q'),
+                KeyModifiers::CONTROL,
+                Some(Action::Quit),
+            ),
+            (
+                "Ctrl+h turns the model's own way",
+                Char('h'),
+                KeyModifiers::CONTROL,
+                Some(Action::Motion(Motion::LocalYawLeft)),
+            ),
+            (
+                "Ctrl+Shift+h is the same as Ctrl+h",
+                Char('H'),
+                KeyModifiers::CONTROL.union(KeyModifiers::SHIFT),
+                Some(Action::Motion(Motion::LocalYawLeft)),
+            ),
+            (
+                "Ctrl+Left is the same as Ctrl+h",
+                Left,
+                KeyModifiers::CONTROL,
+                Some(Action::Motion(Motion::LocalYawLeft)),
+            ),
+            ("Alt swallows the key", Char('h'), KeyModifiers::ALT, None),
+            (
+                "Alt swallows even a bound one",
+                Char(' '),
+                KeyModifiers::ALT,
+                None,
+            ),
+            (
+                "Ctrl+Space is not Space",
+                Char(' '),
+                KeyModifiers::CONTROL,
+                None,
+            ),
+            (
+                "? is Shift+/",
+                Char('?'),
+                KeyModifiers::NONE,
+                Some(Action::Help),
+            ),
+            (
+                "so is the base spelling",
+                Char('/'),
+                KeyModifiers::SHIFT,
+                Some(Action::Help),
+            ),
+            (
+                "+ is Shift+=",
+                Char('+'),
+                KeyModifiers::NONE,
+                Some(Action::Motion(Motion::MoveForward)),
+            ),
+            (
+                "_ is Shift+-",
+                Char('_'),
+                KeyModifiers::NONE,
+                Some(Action::Motion(Motion::MoveBack)),
+            ),
+            (
+                "c resets the view",
+                Char('c'),
+                KeyModifiers::NONE,
+                Some(Action::Reset),
+            ),
+            ("Shift+0 binds nothing", Char(')'), KeyModifiers::NONE, None),
+            ("Esc quits", Esc, KeyModifiers::NONE, Some(Action::Quit)),
+            (
+                "Shift+Esc is the same key",
+                Esc,
+                KeyModifiers::SHIFT,
+                Some(Action::Quit),
+            ),
+            (
+                "Shift+Space is the same key",
+                Char(' '),
+                KeyModifiers::SHIFT,
+                Some(Action::Spin),
+            ),
+            (
+                "a legacy BackTab is Shift+Tab",
+                BackTab,
+                KeyModifiers::NONE,
+                Some(Action::Axes),
+            ),
+            (
+                "and so is the kitty one",
+                BackTab,
+                KeyModifiers::SHIFT,
+                Some(Action::Axes),
+            ),
+            (
+                "Tab toggles the axes",
+                Tab,
+                KeyModifiers::NONE,
+                Some(Action::Axes),
+            ),
+            (
+                "an unbound letter does nothing",
+                Char('z'),
+                KeyModifiers::NONE,
+                None,
+            ),
+        ];
+        for (what, code, mods, expected) in cases {
+            assert_eq!(
+                resolve_key_event(*code, *mods).map(|(_, action)| action),
+                *expected,
+                "{what}: {code:?}+{mods:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bindings_cover_every_action_exactly_once() {
+        // Two rows describing one action would make the overlay list it twice;
+        // a row describing none would list a phantom.
+        for b in BINDINGS {
+            let hits = BINDINGS.iter().filter(|o| o.action == b.action).count();
+            assert_eq!(hits, 1, "{:?} is documented {hits} times", b.action);
+        }
+    }
+
+    #[test]
+    fn chord_labels_follow_one_convention() {
+        // A single spelling convention, checked mechanically: modifiers in
+        // Ctrl-then-Shift order, no spaces, upper-case only when SHIFT is in
+        // the chord. Anything else is a typo waiting to mislead someone.
+        for b in BINDINGS {
+            for c in b.chords {
+                let l = c.label();
+                assert!(!l.contains(' ') || l == "Space", "{l:?} has a stray space");
+                assert!(
+                    !l.contains("Shift+Ctrl"),
+                    "{l}: modifier order is Ctrl+Shift+"
+                );
+                let ctrl_at = l.find("Ctrl+");
+                let shift_at = l.find("Shift+");
+                if let (Some(cs), Some(sc)) = (ctrl_at, shift_at) {
+                    assert!(cs < sc, "{l}: Ctrl must come before Shift");
+                }
+                // A lower-case letter after Shift+ would mean the modifier is
+                // claimed but the glyph is not shifted. Named keys (`Left`,
+                // `Tab`) have no glyph to case, so only single letters check.
+                if let Some([c]) = l.strip_prefix("Shift+").and_then(|r| {
+                    let mut it = r.chars();
+                    match (it.next(), it.next()) {
+                        (Some(c), None) => Some([c]),
+                        _ => None,
+                    }
+                }) {
+                    assert!(
+                        c.is_uppercase() || !c.is_alphabetic(),
+                        "{l}: Shift+ must be followed by the shifted glyph"
+                    );
+                }
+            }
+        }
+    }
+
+    // ---------- help overlay layout ----------
+
+    #[test]
+    fn help_overlay_lists_every_binding_once() {
+        // The overlay is written by hand, so the hand has to be checked
+        // against the table the keyboard actually resolves from: every
+        // binding's primary chord must appear on the page, or the two have
+        // drifted apart and the operator is reading a lie.
+        let text: String = help_lines()
+            .iter()
+            .map(|l| {
+                let mut s: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+                s.push('\n');
+                s
+            })
+            .collect();
+        for b in BINDINGS {
+            let primary = b.chords[0].label();
+            assert!(
+                text.contains(&primary),
+                "{primary} is missing from the overlay"
+            );
+        }
+    }
+
+    #[test]
+    fn help_overlay_fits_eighty_columns() {
+        // The old overlay was 24 lines of hand-aligned text that overflowed an
+        // 80x24 terminal. The new one must fit both a common viewport.
+        let widths: Vec<usize> = help_lines().iter().map(Line::width).collect();
+        let widest = widths.iter().copied().max().unwrap_or(0);
+        assert!(widest <= 76, "overlay is {widest} cols wide (budget 76)");
+        assert!(
+            help_lines().len() <= 22,
+            "overlay is {} lines tall (budget 22)",
+            help_lines().len()
         );
     }
 
     #[test]
-    fn hud_row0_names_the_empty_state() {
+    fn overlay_key_columns_are_aligned() {
+        // Within each column the chord gutter is computed from the widest
+        // chord, so every doc must start at the same offset. The rows are
+        // hand-written; the spacing under them is not, and this is what keeps
+        // it that way.
+        for column in [HELP_LEFT, HELP_RIGHT] {
+            let column = help_column(column);
+            let gutter = column
+                .iter()
+                .filter(|l| l.spans.len() >= 2)
+                .map(|l| l.spans[0].content.len())
+                .max()
+                .unwrap_or(0);
+            for l in &column {
+                if l.spans.len() < 2 {
+                    continue;
+                }
+                assert_eq!(
+                    l.spans[0].content.len(),
+                    gutter,
+                    "ragged chord column: {:?}",
+                    l.spans[0].content
+                );
+            }
+        }
+    }
+
+    // ---------- statusline ----------
+
+    /// The statusline as the terminal would show it: one `(char, fg, bg)` per
+    /// cell, in order — the same cells the screen gets.
+    fn status_cells(app: &App, width: u16) -> Vec<(char, Color, Color)> {
+        status_cells_for(app, width)
+    }
+
+    /// The statusline's visible text.
+    fn status_text(app: &App, width: u16) -> String {
+        status_cells(app, width)
+            .into_iter()
+            .map(|(c, _, _)| c)
+            .collect()
+    }
+
+    /// The ink of the cell where `needle` starts, so a test can assert what a
+    /// lamp or a hint is actually drawn in.
+    fn status_ink_of(app: &App, width: u16, needle: &str) -> Color {
+        let cells = status_cells(app, width);
+        let text: String = cells.iter().map(|(c, _, _)| *c).collect();
+        let byte = text
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} is not on the strip: {text:?}"));
+        cells[text[..byte].chars().count()].1
+    }
+
+    fn status_app(name: &str) -> App {
+        App::new(Model::default(), name.to_string(), None)
+    }
+
+    #[test]
+    fn the_empty_state_is_named_on_the_statusline() {
         // Started with no FILE on a terminal: there is no model to name, so
-        // Row 0 says so and the view line still reports the camera.
+        // the pill says so rather than leaving the strip anonymous.
         let app = App::new(Model::default(), "no file".to_string(), None);
-        let row0 = hud_layout(
-            &app.name,
-            &app.view,
-            app.hud == Hud::Collapsed,
-            app.row0_label.as_deref(),
+        assert!(
+            status_text(&app, 80).starts_with(" no file "),
+            "the pill names the empty state"
         );
         assert!(
-            row0.starts_with("Wireforge: no file | yaw="),
-            "blank row0: {row0}"
+            telemetry_line(&app.view).contains("dist="),
+            "row 0 keeps reporting the camera either way"
+        );
+    }
+
+    #[test]
+    fn the_pill_prefers_the_stream_path_over_the_file_stem() {
+        // A stream's model name is only the file stem ("stream"), so the FIFO
+        // path is what tells two previews apart. It is the pill's label now
+        // that Row 0 no longer shows one.
+        let app = App::new(
+            Model::default(),
+            "stream".to_string(),
+            Some("/tmp/stream.fifo".to_string()),
+        );
+        let text = status_text(&app, 100);
+        assert!(text.starts_with(" /tmp/stream.fifo "), "pill: {text:?}");
+    }
+
+    #[test]
+    fn the_pill_never_takes_more_than_half_the_row() {
+        // Otherwise a long path would starve the lamps and the hints that
+        // share the strip with it, at any width.
+        let mut app = App::new(Model::default(), "cube".to_string(), None);
+        app.strip_label = Some("/home/someone/very/deep/project/tree/preview.fifo".to_string());
+        for width in [20u16, 40, 80] {
+            let text = status_text(&app, width);
+            // `find` counts bytes and the ellipsis is three of them.
+            let pill = text[..text.find(WEDGE_CLOSE).expect("the pill's closing wedge")]
+                .chars()
+                .count();
+            assert!(
+                pill <= width as usize / 2,
+                "the pill takes {pill} of {width} cells: {text:?}"
+            );
+            assert!(text.contains('…'), "a cut path is marked: {text:?}");
+        }
+        // Roomy enough, and the path is shown whole and unmarked.
+        let text = status_text(&app, 200);
+        assert!(
+            text.contains("/home/someone/very/deep/project/tree/preview.fifo"),
+            "the whole path is shown when it fits: {text:?}"
+        );
+        assert!(!text.contains('…'), "nothing was cut: {text:?}");
+    }
+
+    /// A bare modifier key event, as the kitty protocol reports it.
+    fn modifier_event(m: ModifierKeyCode, kind: KeyEventKind) -> Event {
+        let mut e = KeyEvent::new(KeyCode::Modifier(m), KeyModifiers::empty());
+        e.kind = kind;
+        Event::Key(e)
+    }
+
+    #[test]
+    fn bare_modifiers_are_tracked_only_while_they_are_down() {
+        let mut app = App::new(Model::default(), "cube".to_string(), None);
+        app.dirty = false;
+        app.handle_input(modifier_event(
+            ModifierKeyCode::LeftControl,
+            KeyEventKind::Press,
+        ));
+        assert_eq!(app.held_modifiers(), KeyModifiers::CONTROL);
+        assert!(app.dirty, "a modifier press repaints the strip");
+
+        // The other hand's Ctrl is the same modifier: nothing changes on
+        // screen, and letting one of the two go keeps CONTROL held.
+        app.dirty = false;
+        app.handle_input(modifier_event(
+            ModifierKeyCode::RightControl,
+            KeyEventKind::Press,
+        ));
+        assert_eq!(app.held_modifiers(), KeyModifiers::CONTROL);
+        assert!(!app.dirty, "the second Ctrl has nothing new to show");
+        app.handle_input(modifier_event(
+            ModifierKeyCode::LeftControl,
+            KeyEventKind::Release,
+        ));
+        assert_eq!(app.held_modifiers(), KeyModifiers::CONTROL);
+        assert!(
+            app.release_seen,
+            "a modifier release is still evidence the terminal reports key-up"
+        );
+        app.dirty = false;
+        app.handle_input(modifier_event(
+            ModifierKeyCode::RightControl,
+            KeyEventKind::Release,
+        ));
+        assert_eq!(app.held_modifiers(), KeyModifiers::empty());
+        assert!(app.dirty, "letting go repaints the strip");
+    }
+
+    #[test]
+    fn losing_focus_drops_held_modifiers() {
+        // The release of a modifier held across an alt-tab goes to the other
+        // window, exactly like the release of a held motion key.
+        let mut app = App::new(Model::default(), "cube".to_string(), None);
+        app.handle_input(modifier_event(
+            ModifierKeyCode::LeftShift,
+            KeyEventKind::Press,
+        ));
+        assert_eq!(app.held_modifiers(), KeyModifiers::SHIFT);
+        app.handle_input(Event::FocusLost);
+        assert_eq!(app.held_modifiers(), KeyModifiers::empty());
+    }
+
+    #[test]
+    fn a_held_modifier_switches_the_strip_hints() {
+        let mut app = status_app("cube");
+        let everyday = status_text(&app, 100);
+        assert!(
+            everyday.contains("? help"),
+            "hints by default: {everyday:?}"
+        );
+
+        app.handle_input(modifier_event(
+            ModifierKeyCode::LeftControl,
+            KeyEventKind::Press,
+        ));
+        let ctrl = status_text(&app, 100);
+        assert!(ctrl.contains("Ctrl+h/l/k/j/d/f"), "the Ctrl keys: {ctrl:?}");
+        assert!(
+            !ctrl.contains("? help"),
+            "the everyday hints step aside: {ctrl:?}"
+        );
+
+        app.handle_input(modifier_event(
+            ModifierKeyCode::LeftControl,
+            KeyEventKind::Release,
+        ));
+        assert_eq!(
+            status_text(&app, 100),
+            everyday,
+            "and they come back on release"
+        );
+
+        app.handle_input(modifier_event(
+            ModifierKeyCode::RightShift,
+            KeyEventKind::Press,
+        ));
+        let shift = status_text(&app, 100);
+        assert!(
+            shift.contains("Shift+h/l/k/j pan the view"),
+            "the Shift keys: {shift:?}"
         );
         assert!(
-            row0.contains("dist=") && row0.ends_with("[?] keys"),
-            "blank row0 must keep the view line and the hint: {row0}"
+            !shift.contains("frame the model"),
+            "no binding wears Shift in the Frame group any more: {shift:?}"
         );
     }
 
-    // ---------- stream input (stdin / FIFO) ----------
-
     #[test]
-    fn probe_bytes_wrfm_magic() {
-        // The buffer probe (used by stdin/FIFO) is the same content-first
-        // authority as the file probe: `wrfm <version>` first line -> wrfm.
-        let buf = b"wrfm 2\nvertices 2   edges 1\n\nv 0 0 0\nv 1 1 1\ne 0 1\n";
-        probe_bytes(buf).expect("wrfm magic probes as wrfm");
-        // The magic wins even with obj-looking markers later.
-        let buf2 = b"wrfm 2\nf 1 2 3\n";
-        probe_bytes(buf2).expect("magic wins over obj markers");
+    fn a_modifier_hint_only_names_keys_that_modifier_binds() {
+        // The hint is derived from BINDINGS, so this pins the derivation: every
+        // key it lists must resolve to a real action *with that modifier*, and
+        // every chord wearing the modifier must be listed — otherwise the strip
+        // would be advertising a keyboard that does not exist.
+        for (mods, name) in [
+            (KeyModifiers::CONTROL, "Ctrl+"),
+            (KeyModifiers::SHIFT, "Shift+"),
+        ] {
+            let rows = modifier_hint(mods);
+            assert!(!rows.is_empty(), "a hint for a bound modifier");
+            let mut hinted = 0;
+            for row in rows {
+                let text: String = row.runs.iter().map(|(t, _)| t.as_str()).collect();
+                assert!(text.starts_with(name), "{text:?} must open with {name:?}");
+                let keys = text[name.len()..].split(' ').next().unwrap();
+                for key in keys.split('/') {
+                    // A shifted letter is bound as its upper-case glyph.
+                    let glyph = if mods.contains(KeyModifiers::SHIFT) {
+                        key.to_uppercase()
+                    } else {
+                        key.to_string()
+                    };
+                    let code = KeyCode::Char(glyph.chars().next().expect("one char"));
+                    assert!(
+                        resolve_key_event(code, mods).is_some(),
+                        "{name}{key} is hinted but unbound"
+                    );
+                    hinted += 1;
+                }
+            }
+            let bound = BINDINGS
+                .iter()
+                .filter(|b| b.chords[0].mods.contains(mods))
+                .count();
+            assert_eq!(hinted, bound, "every {name} chord is hinted once");
+        }
     }
 
     #[test]
-    fn probe_bytes_garbage_is_unrecognized() {
-        // A stream of garbage (no magic, no obj markers) is "unrecognized" —
-        // never an empty model; a magic-less `v`/`e` stream is likewise not
-        // wrfm (the v2 breaking change).
-        let err = probe_bytes(b"this is not a wireframe\n").unwrap_err();
-        assert!(err.contains("unrecognized"), "error: {err}");
-        assert!(probe_bytes(b"v 0 0 0\nv 1 1 1\ne 0 1\n").is_err());
-        assert!(probe_bytes(b"").is_err(), "empty stream is unrecognized");
+    fn status_line_fills_the_row_exactly() {
+        // The strip is the one place Wireforge paints a background, so it has
+        // to cover the row edge to edge: a cell short leaves a hole in the
+        // band, a cell long gets clipped. Absurd widths are included so the
+        // fit arithmetic can never underflow, and every hint set is tried,
+        // because a held modifier brings a much wider one.
+        let mut cases = vec![status_app("wireforge.wrfm")];
+        for m in [
+            ModifierKeyCode::LeftControl,
+            ModifierKeyCode::LeftShift,
+            ModifierKeyCode::LeftAlt,
+        ] {
+            let mut app = status_app("wireforge.wrfm");
+            app.mods_down.push(m);
+            cases.push(app);
+        }
+        for app in &cases {
+            for width in 0..=200u16 {
+                let line = status_line(app, width);
+                assert_eq!(
+                    line.width(),
+                    width as usize,
+                    "at width {width} with {:?}: {line:?}",
+                    app.mods_down
+                );
+            }
+        }
     }
 
     #[test]
-    fn load_model_from_text_wrfm_parses() {
-        let (mode, name) = load_model_from_text(
-            "stream",
-            "wrfm 2\nvertices 2   edges 1\n\nv 0 0 0\nv 1 1 1\ne 0 1\n",
-        )
-        .expect("wrfm stream must load");
-        let m = mode;
-        assert_eq!(m.vertices.len(), 2);
-        assert_eq!(m.edges.len(), 1);
-        assert_eq!(name, "stream");
+    fn status_line_paints_a_ground_across_the_whole_row() {
+        // Every cell must carry a ground, or the band breaks and the terminal
+        // shows through mid-strip.
+        let app = status_app("cube");
+        for width in [1u16, 12, 40, 80, 200] {
+            for (i, (ch, _, bg)) in status_cells(&app, width).into_iter().enumerate() {
+                assert_ne!(
+                    bg,
+                    Color::Reset,
+                    "cell {i} ({ch:?}) has no ground at width {width}"
+                );
+            }
+        }
     }
 
     #[test]
-    fn load_model_from_text_garbage_fails() {
-        let err = load_model_from_text("stream", "garbage here\nno markers\n")
-            .expect_err("garbage stream must fail");
-        assert!(err.contains("unrecognized"), "error: {err}");
-    }
-
-    /// OBJ content must point at the converter — wireforge itself reads
-    /// .wrfm only (the ratty/OBJ rendering path is gone).
-    #[test]
-    fn probe_bytes_obj_content_points_at_the_converter() {
-        let err = probe_bytes(b"v 0 0 0\nv 1 0 0\nf 1 2 3\n").unwrap_err();
-        assert!(err.contains("wrfm convert"), "hint: {err}");
-        // The v-without-e heuristic (a bare point cloud) routes there too.
-        let err = probe_bytes(b"v 0 0 0\nv 1 1 1\n").unwrap_err();
-        assert!(err.contains("wrfm convert"), "hint: {err}");
+    fn status_line_leads_with_the_model_name_pill() {
+        let app = status_app("cube");
+        let text = status_text(&app, 80);
+        assert!(
+            text.starts_with(" cube "),
+            "the pill leads the strip: {text:?}"
+        );
+        // The pill drops one cell of accent in before its text, and that cell
+        // carries the pill's own inks.
+        let cells = status_cells(&app, 80);
+        assert_eq!(cells[1].2, ACCENT, "pill ground");
+        assert_eq!(cells[2].1, STRIP, "pill text ink");
     }
 
     #[test]
-    fn load_model_from_text_obj_errors_with_a_convert_hint() {
-        let text = "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n";
-        let err = load_model_from_text("cube", text).expect_err("obj stream must not load");
-        assert!(err.contains("wrfm convert"), "error: {err}");
-    } // ---------- event loop (input / holds) ----------
+    fn status_line_lamps_carry_their_state_in_the_ink() {
+        // Both readings are the same glyph, so the ink is the whole signal.
+        let mut app = status_app("cube");
+        app.auto_spin = false;
+        app.show_axes = false;
+        assert_eq!(
+            status_ink_of(&app, 80, "● SPIN"),
+            STRIP,
+            "an off lamp is unlit"
+        );
+        assert_eq!(
+            status_ink_of(&app, 80, "● AXES"),
+            STRIP,
+            "an off lamp is unlit"
+        );
 
+        app.auto_spin = true;
+        app.show_axes = true;
+        assert_eq!(
+            status_ink_of(&app, 80, "● SPIN"),
+            ACCENT,
+            "a spinning lamp lights"
+        );
+        assert_eq!(
+            status_ink_of(&app, 80, "● AXES"),
+            ACCENT,
+            "both lamps light in the same accent, so the ink means 'on'"
+        );
+    }
+
+    #[test]
+    fn status_line_hints_name_the_canonical_chord() {
+        // The hints are read out of BINDINGS, so a rebind can never leave the
+        // strip advertising a key that does nothing.
+        let app = status_app("cube");
+        let text = status_text(&app, 100);
+        for (action, label) in [
+            (Action::Help, "help"),
+            (Action::Quit, "quit"),
+            (Action::Spin, "spin"),
+            (Action::Axes, "axes"),
+        ] {
+            let b = BINDINGS.iter().find(|b| b.action == action).expect("bound");
+            let want = format!("{} {label}", b.chords[0].label());
+            assert!(text.contains(&want), "{want:?} missing from {text:?}");
+        }
+    }
+
+    #[test]
+    fn status_line_sheds_hints_then_lamps_then_the_name() {
+        let app = status_app("wireforge.wrfm");
+        // Roomy: every hint is on the strip.
+        let wide = status_text(&app, 100);
+        for hint in ["? help", "q quit", "Space spin", "Tab axes"] {
+            assert!(
+                wide.contains(hint),
+                "{hint:?} missing at 100 cols: {wide:?}"
+            );
+        }
+        // Narrow: the hints go first, and the name outlives them.
+        let narrow = status_text(&app, 40);
+        assert!(
+            !narrow.contains("Tab axes"),
+            "the least useful hint sheds first: {narrow:?}"
+        );
+        assert!(
+            narrow.contains("wireforge.wrfm"),
+            "the name outlives the hints: {narrow:?}"
+        );
+        // Narrower still: the lamps go, and a cut name is marked as cut.
+        let tiny = status_text(&app, 14);
+        assert!(!tiny.contains("SPIN"), "the lamps go next: {tiny:?}");
+        assert!(tiny.contains('…'), "a cut name is marked: {tiny:?}");
+    }
+
+    #[test]
+    fn status_line_separates_the_sections_with_powerline_wedges() {
+        // The wedge is what makes the look: one closing the pill into the
+        // lamps, one closing the lamps back onto the strip, and one opening
+        // the hints. A wedge is inked with the outgoing section's ground and
+        // sits on the incoming one.
+        let app = status_app("cube");
+        let cells = status_cells(&app, 80);
+        let wedges = |wanted: char| -> Vec<(Color, Color)> {
+            cells
+                .iter()
+                .filter(|(c, _, _)| *c == wanted)
+                .map(|(_, fg, bg)| (*fg, *bg))
+                .collect()
+        };
+        assert_eq!(
+            wedges(WEDGE_CLOSE),
+            vec![(ACCENT, LAMP), (LAMP, STRIP)],
+            "the pill hands its colour to the lamps, which hand theirs to the strip"
+        );
+        assert_eq!(
+            wedges(WEDGE_OPEN),
+            vec![(LAMP, STRIP)],
+            "the hints arrive out of the strip"
+        );
+    }
+
+    /// `REPORT_ALTERNATE_KEYS` is pushed, so on the kitty path a shifted chord
+    /// arrives as the glyph the active layout types with SHIFT **cleared**
+    /// (crossterm applies the alternate and drops the modifier). That is the
+    /// legacy shape minus its synthesised SHIFT, so it folds into the same
+    /// identity and action — listed chord or not.
+    #[test]
+    fn alternate_key_glyphs_fold_into_the_same_chords() {
+        use KeyCode::*;
+        let bound = [
+            (Char('H'), Char('h'), Action::Motion(Motion::MoveLeft)),
+            (Char('?'), Char('/'), Action::Help),
+            (Char('_'), Char('-'), Action::Motion(Motion::MoveBack)),
+            (Char('+'), Char('='), Action::Motion(Motion::MoveForward)),
+        ];
+        for (glyph, id, expected) in bound {
+            assert_eq!(
+                resolve_key_event(glyph, KeyModifiers::NONE),
+                Some((id, expected)),
+                "glyph {glyph:?} must fold into its listed chord"
+            );
+        }
+        // Chords that are NOT listed stay silent in that shape as well:
+        // `Shift+0` types `)` and binds nothing, `Shift+q` must not quit.
+        assert_eq!(resolve_key_event(Char(')'), KeyModifiers::NONE), None);
+        assert_eq!(resolve_key_event(Char('Q'), KeyModifiers::NONE), None);
+    }
+    #[test]
+    fn app_any_key_event_refreshes_every_hold() {
+        // Without key-up reporting, the OS repeats only the most recently
+        // pressed key, so `l` going down silences `j`. Refreshing per key
+        // would drop `j` mid-hold, which is exactly the reported bug: the
+        // model stops moving down after the timeout but keeps yawing.
+        let mut app = App::new(
+            Model {
+                vertices: vec![(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)],
+                edges: vec![(0, 1)],
+            },
+            "cube".to_string(),
+            None,
+        );
+        for key in ['j', 'l'] {
+            app.handle_input(Event::Key(KeyEvent::new(
+                KeyCode::Char(key),
+                KeyModifiers::NONE,
+            )));
+        }
+        assert_eq!(app.held.len(), 2, "both motion keys are held");
+        let first = app
+            .held
+            .get(&KeyCode::Char('j'))
+            .expect("j must hold the pitch motion")
+            .seen;
+        // Two seconds later only `l` is still repeating.
+        let later = first + Duration::from_secs(2);
+        app.note_key_event(later);
+        app.update_held(later, 0.016);
+        assert_eq!(
+            app.held.len(),
+            2,
+            "the key that stopped repeating must survive"
+        );
+        // Silence past the timeout still ends both, so a lost key-up can
+        // never leave the model spinning on its own.
+        app.update_held(
+            later + LEGACY_HOLD_TIMEOUT + Duration::from_millis(1),
+            0.016,
+        );
+        assert!(app.held.is_empty(), "silence must still end the holds");
+    }
+    #[test]
+    fn app_focus_lost_drops_held_keys() {
+        // The key-up of a key held across an alt-tab reaches the other
+        // window, so no Release arrives: FocusLost is the only signal.
+        let mut app = App::new(
+            Model {
+                vertices: vec![(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)],
+                edges: vec![(0, 1)],
+            },
+            "cube".to_string(),
+            None,
+        );
+        app.handle_input(Event::Key(KeyEvent::new(
+            KeyCode::Right,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.held.len(), 1);
+        app.dirty = false;
+        assert!(!app.handle_input(Event::FocusLost));
+        assert!(app.held.is_empty(), "focus loss must stop every hold");
+        assert!(app.dirty, "the cleared hold must repaint");
+    }
+    #[test]
+    fn app_handle_input_motion_press_starts_continuous() {
+        let mut app = App::new(
+            Model {
+                vertices: vec![(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)],
+                edges: vec![(0, 1)],
+            },
+            "cube".to_string(),
+            None,
+        );
+        app.view.fit_to(&app.current);
+        let yaw0 = app.view.yaw;
+        // Press: enter continuous state (motion applied by update_held)
+        app.handle_input(Event::Key(KeyEvent::new(
+            KeyCode::Right,
+            KeyModifiers::NONE,
+        )));
+        assert!(
+            app.held.contains_key(&KeyCode::Right),
+            "press must enter continuous state"
+        );
+        // Auto-repeat: must not add a new entry
+        app.handle_input(Event::Key(KeyEvent::new(
+            KeyCode::Right,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(
+            app.held.len(),
+            1,
+            "auto-repeat must not accumulate held entries"
+        );
+        // Continuous motion is applied by update_held
+        app.update_held(Instant::now(), 0.016);
+        assert_ne!(
+            app.view.yaw, yaw0,
+            "held key must rotate continuously immediately"
+        );
+    }
     #[test]
     fn app_handle_input_toggles() {
         let mut app = App::new(
@@ -1487,9 +3083,10 @@ mod tests {
         ))));
         assert!(app.handle_input(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))));
     }
-
     #[test]
-    fn app_handle_input_motion_press_starts_continuous() {
+    fn app_held_key_expires_without_release() {
+        // A terminal without the kitty protocol never sends Release, so the
+        // hold timeout is the only thing that can stop the motion.
         let mut app = App::new(
             Model {
                 vertices: vec![(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)],
@@ -1498,35 +3095,25 @@ mod tests {
             "cube".to_string(),
             None,
         );
-        app.view.fit_to(&app.current);
-        let yaw0 = app.view.yaw;
-        // Press: enter continuous state (motion applied by update_held)
         app.handle_input(Event::Key(KeyEvent::new(
             KeyCode::Right,
             KeyModifiers::NONE,
         )));
+        let seen = app
+            .held
+            .get(&KeyCode::Right)
+            .expect("press must hold the motion")
+            .seen;
+        // Exactly at the timeout the key is still down (the bound is <=).
+        app.update_held(seen + LEGACY_HOLD_TIMEOUT, 0.016);
+        assert_eq!(app.held.len(), 1, "the timeout boundary must keep the hold");
+        // One tick past it the key is gone and the model stops by itself.
+        app.update_held(seen + LEGACY_HOLD_TIMEOUT + Duration::from_millis(1), 0.016);
         assert!(
-            app.held.contains_key(&KeyCode::Right),
-            "press must enter continuous state"
-        );
-        // Auto-repeat: must not add a new entry
-        app.handle_input(Event::Key(KeyEvent::new(
-            KeyCode::Right,
-            KeyModifiers::NONE,
-        )));
-        assert_eq!(
-            app.held.len(),
-            1,
-            "auto-repeat must not accumulate held entries"
-        );
-        // Continuous motion is applied by update_held
-        app.update_held(Instant::now(), 0.016);
-        assert_ne!(
-            app.view.yaw, yaw0,
-            "held key must rotate continuously immediately"
+            app.held.is_empty(),
+            "a key that stopped reporting must expire"
         );
     }
-
     #[test]
     fn app_key_release_removes_held_entry() {
         let mut app = App::new(
@@ -1546,14 +3133,215 @@ mod tests {
         app.handle_input(Event::Key(release));
         assert!(app.held.is_empty(), "release must stop motion immediately");
     }
+    #[test]
+    fn app_key_repeat_only_refreshes_the_hold() {
+        // The kitty protocol reports auto-repeat while a key is held; the
+        // one-shot toggles must fire once per tap instead of on every repeat.
+        let mut app = App::new(
+            Model {
+                vertices: vec![(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)],
+                edges: vec![(0, 1)],
+            },
+            "cube".to_string(),
+            None,
+        );
+        app.handle_input(Event::Key(KeyEvent::new(
+            KeyCode::Char(' '),
+            KeyModifiers::NONE,
+        )));
+        assert!(app.auto_spin, "press must toggle auto-spin");
+        let mut repeat = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE);
+        repeat.kind = KeyEventKind::Repeat;
+        app.handle_input(Event::Key(repeat));
+        assert!(app.auto_spin, "auto-repeat must not re-trigger a toggle");
 
+        // A repeat of a motion key refreshes the hold instead.
+        app.handle_input(Event::Key(KeyEvent::new(
+            KeyCode::Right,
+            KeyModifiers::NONE,
+        )));
+        let seen = app
+            .held
+            .get(&KeyCode::Right)
+            .expect("press must hold the motion")
+            .seen;
+        let mut repeat = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        repeat.kind = KeyEventKind::Repeat;
+        app.handle_input(Event::Key(repeat));
+        let refreshed = app
+            .held
+            .get(&KeyCode::Right)
+            .expect("repeat must keep the hold")
+            .seen;
+        assert!(refreshed >= seen, "auto-repeat must refresh the hold");
+    }
+    #[test]
+    fn app_release_seen_holds_never_time_out() {
+        // Once the terminal reports key-up, Release (and FocusLost) end a
+        // hold. A timeout could only ever drop a key that is still down.
+        let mut app = App::new(
+            Model {
+                vertices: vec![(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)],
+                edges: vec![(0, 1)],
+            },
+            "cube".to_string(),
+            None,
+        );
+        let mut release = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        release.kind = KeyEventKind::Release;
+        app.handle_input(Event::Key(release));
+        assert!(app.release_seen, "a Release must enable key-up reporting");
+        app.handle_input(Event::Key(KeyEvent::new(
+            KeyCode::Right,
+            KeyModifiers::NONE,
+        )));
+        let seen = app
+            .held
+            .get(&KeyCode::Right)
+            .expect("press must hold the motion")
+            .seen;
+        // A minute of silence must not stop the rotation...
+        app.update_held(seen + Duration::from_secs(60), 0.016);
+        assert_eq!(
+            app.held.len(),
+            1,
+            "a hold must survive silence once key-up is reported"
+        );
+        // ...and the Release is what ends it.
+        let mut release = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        release.kind = KeyEventKind::Release;
+        app.handle_input(Event::Key(release));
+        assert!(app.held.is_empty(), "release must stop the motion");
+    }
+    #[test]
+    fn load_model_from_text_garbage_fails() {
+        let err = load_model_from_text("stream", "garbage here\nno markers\n")
+            .expect_err("garbage stream must fail");
+        assert!(err.contains("unrecognized"), "error: {err}");
+    }
+    #[test]
+    fn load_model_from_text_obj_errors_with_a_convert_hint() {
+        let text = "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n";
+        let err = load_model_from_text("cube", text).expect_err("obj stream must not load");
+        assert!(err.contains("wrfm convert"), "error: {err}");
+    } // ---------- event loop (input / holds) ----------
+
+    #[test]
+    fn load_model_from_text_wrfm_parses() {
+        let (mode, name) = load_model_from_text(
+            "stream",
+            "wrfm 2\nvertices 2   edges 1\n\nv 0 0 0\nv 1 1 1\ne 0 1\n",
+        )
+        .expect("wrfm stream must load");
+        let m = mode;
+        assert_eq!(m.vertices.len(), 2);
+        assert_eq!(m.edges.len(), 1);
+        assert_eq!(name, "stream");
+    }
+    #[test]
+    fn plain_keys_are_the_viewers_frame_ctrl_the_models() {
+        // The model faces out of the screen (+Z) while the sight line points
+        // into it: plain h/r must read as the viewer's left/right, Ctrl as
+        // the model's own — mirror images at the default view. Pitch has no
+        // mirror: the model's up is the viewer's up, so k/j agree.
+        let mut v = ViewState::default();
+        apply_motion_step(&mut v, Motion::YawLeft, 0.3, 0.0);
+        // The nose is the third column of the model->world matrix.
+        assert!(v.rot[0][2] < 0.0, "plain h must sweep the nose screen-left");
+
+        let mut v = ViewState::default();
+        apply_motion_step(&mut v, Motion::LocalYawLeft, 0.3, 0.0);
+        assert!(
+            v.rot[0][2] > 0.0,
+            "Ctrl+h must yaw to the model's own left (screen-right at default)"
+        );
+
+        let mut v = ViewState::default();
+        apply_motion_step(&mut v, Motion::RollPlus, 0.3, 0.0);
+        assert!(
+            v.roll < 0.0,
+            "plain d rolls about the sight line: the viewer's right dips (image CW)"
+        );
+
+        let mut v = ViewState::default();
+        apply_motion_step(&mut v, Motion::LocalRollPlus, 0.3, 0.0);
+        // Starboard is the model's local -X; a right bank dips it (y < 0).
+        assert!(-v.rot[1][0] < 0.0, "Ctrl+d must dip the model's starboard");
+
+        let mut v = ViewState::default();
+        apply_motion_step(&mut v, Motion::PitchUp, 0.3, 0.0);
+        assert!(v.rot[1][2] > 0.0, "k must tip the nose up in both frames");
+    }
+    #[test]
+    fn probe_bytes_garbage_is_unrecognized() {
+        // A stream of garbage (no magic, no obj markers) is "unrecognized" —
+        // never an empty model; a magic-less `v`/`e` stream is likewise not
+        // wrfm (the v2 breaking change).
+        let err = probe_bytes(b"this is not a wireframe\n").unwrap_err();
+        assert!(err.contains("unrecognized"), "error: {err}");
+        assert!(probe_bytes(b"v 0 0 0\nv 1 1 1\ne 0 1\n").is_err());
+        assert!(probe_bytes(b"").is_err(), "empty stream is unrecognized");
+    }
+    /// OBJ content must point at the converter — wireforge itself reads
+    /// .wrfm only (the ratty/OBJ rendering path is gone).
+    #[test]
+    fn probe_bytes_obj_content_points_at_the_converter() {
+        let err = probe_bytes(b"v 0 0 0\nv 1 0 0\nf 1 2 3\n").unwrap_err();
+        assert!(err.contains("wrfm convert"), "hint: {err}");
+        // The v-without-e heuristic (a bare point cloud) routes there too.
+        let err = probe_bytes(b"v 0 0 0\nv 1 1 1\n").unwrap_err();
+        assert!(err.contains("wrfm convert"), "hint: {err}");
+    }
+    #[test]
+    fn probe_bytes_wrfm_magic() {
+        // The buffer probe (used by stdin/FIFO) is the same content-first
+        // authority as the file probe: `wrfm <version>` first line -> wrfm.
+        let buf = b"wrfm 2\nvertices 2   edges 1\n\nv 0 0 0\nv 1 1 1\ne 0 1\n";
+        probe_bytes(buf).expect("wrfm magic probes as wrfm");
+        // The magic wins even with obj-looking markers later.
+        let buf2 = b"wrfm 2\nf 1 2 3\n";
+        probe_bytes(buf2).expect("magic wins over obj markers");
+    }
+    /// SHIFT is the only modifier that changes an action: Ctrl binds quitting
+    /// (raw mode delivers Ctrl+C / Ctrl+Q as key events, with no SIGINT) plus
+    /// the local-frame rotation letters, and every other modifier swallows the
+    /// key.
+    #[test]
+    fn resolve_key_event_ctrl_quits_or_rotates_locally_and_alt_swallows() {
+        use KeyCode::*;
+        assert!(matches!(
+            resolve_key_event(Char('c'), KeyModifiers::CONTROL),
+            Some((_, Action::Quit))
+        ));
+        assert!(matches!(
+            resolve_key_event(Char('q'), KeyModifiers::CONTROL),
+            Some((_, Action::Quit))
+        ));
+        // Ctrl+h / Ctrl+Left rotate in the model's own (local) frame;
+        // Alt+h must do nothing either.
+        assert_eq!(
+            resolve_key_event(Char('h'), KeyModifiers::CONTROL),
+            Some((Char('h'), Action::Motion(Motion::LocalYawLeft)))
+        );
+        assert_eq!(
+            resolve_key_event(Left, KeyModifiers::CONTROL),
+            Some((Left, Action::Motion(Motion::LocalYawLeft)))
+        );
+        assert_eq!(resolve_key_event(Char('h'), KeyModifiers::ALT), None);
+        assert_eq!(resolve_key_event(Char(' '), KeyModifiers::ALT), None);
+        // Shift+Tab arrives as BackTab on both paths and still toggles the axes.
+        assert!(matches!(
+            resolve_key_event(BackTab, KeyModifiers::SHIFT),
+            Some((_, Action::Axes))
+        ));
+    }
     /// The same physical input can arrive in two shapes: the **base** key plus
     /// SHIFT (a path without alternate keys — still accepted) or the shifted
     /// **glyph** (what a legacy terminal sends, SHIFT synthesised for
     /// upper-case letters, and what the kitty path now sends for keys with an
     /// alternate, SHIFT cleared). Both must resolve alike — to the same action
     /// under the same identity when the chord is listed, or to nothing at all
-    /// when it is not (`Shift+0` is `)`, and `)` is not `0`).
+    /// when it is not (`Shift+0` types `)` and `)` binds nothing).
     #[test]
     fn resolve_key_event_folds_both_terminal_encodings() {
         use KeyCode::*;
@@ -1564,11 +3352,6 @@ mod tests {
                 (Char('h'), KeyModifiers::SHIFT),
                 (Char('H'), KeyModifiers::SHIFT),
                 Some(Action::Motion(Motion::MoveLeft)),
-            ),
-            (
-                (Char('f'), KeyModifiers::SHIFT),
-                (Char('F'), KeyModifiers::SHIFT),
-                Some(Action::Fit),
             ),
             (
                 (Char('/'), KeyModifiers::SHIFT),
@@ -1621,35 +3404,6 @@ mod tests {
             }
         }
     }
-
-    /// `REPORT_ALTERNATE_KEYS` is pushed, so on the kitty path a shifted chord
-    /// arrives as the glyph the active layout types with SHIFT **cleared**
-    /// (crossterm applies the alternate and drops the modifier). That is the
-    /// legacy shape minus its synthesised SHIFT, so it folds into the same
-    /// identity and action — listed chord or not.
-    #[test]
-    fn alternate_key_glyphs_fold_into_the_same_chords() {
-        use KeyCode::*;
-        let bound = [
-            (Char('H'), Char('h'), Action::Motion(Motion::MoveLeft)),
-            (Char('F'), Char('f'), Action::Fit),
-            (Char('?'), Char('/'), Action::Help),
-            (Char('_'), Char('-'), Action::Motion(Motion::MoveBack)),
-            (Char('+'), Char('='), Action::Motion(Motion::MoveForward)),
-        ];
-        for (glyph, id, expected) in bound {
-            assert_eq!(
-                resolve_key_event(glyph, KeyModifiers::NONE),
-                Some((id, expected)),
-                "glyph {glyph:?} must fold into its listed chord"
-            );
-        }
-        // Chords that are NOT listed stay silent in that shape as well:
-        // `Shift+0` types `)` and must not reset, `Shift+q` must not quit.
-        assert_eq!(resolve_key_event(Char(')'), KeyModifiers::NONE), None);
-        assert_eq!(resolve_key_event(Char('Q'), KeyModifiers::NONE), None);
-    }
-
     /// Shift is the only chord component that gained a restriction, so every
     /// plain key must still bind to its documented action.
     #[test]
@@ -1660,10 +3414,9 @@ mod tests {
             (Esc, Action::Quit),
             (Char(' '), Action::Spin),
             (Tab, Action::Axes),
-            (Char('0'), Action::Reset),
-            (Char('f'), Action::Center),
-            (Char('r'), Action::Motion(Motion::RollPlus)),
-            (Char('e'), Action::Motion(Motion::RollMinus)),
+            (Char('c'), Action::Reset),
+            (Char('d'), Action::Motion(Motion::RollPlus)),
+            (Char('f'), Action::Motion(Motion::RollMinus)),
             (Char('h'), Action::Motion(Motion::YawLeft)),
             (Char('='), Action::Motion(Motion::MoveForward)),
             (Char('-'), Action::Motion(Motion::MoveBack)),
@@ -1675,41 +3428,23 @@ mod tests {
             assert_eq!(action, expected, "{code:?}");
         }
     }
-
-    /// SHIFT is the only modifier that changes an action: Ctrl binds quitting
-    /// (raw mode delivers Ctrl+C / Ctrl+Q as key events, with no SIGINT) plus
-    /// the local-frame rotation letters, and every other modifier swallows the
-    /// key.
+    /// `r` and `e` gave their keys to `d`/`f`; nothing — plain or with Ctrl —
+    /// may fire from them any more.
     #[test]
-    fn resolve_key_event_ctrl_quits_or_rotates_locally_and_alt_swallows() {
+    fn r_and_e_are_unbound() {
         use KeyCode::*;
-        assert!(matches!(
-            resolve_key_event(Char('c'), KeyModifiers::CONTROL),
-            Some((_, Action::Quit))
-        ));
-        assert!(matches!(
-            resolve_key_event(Char('q'), KeyModifiers::CONTROL),
-            Some((_, Action::Quit))
-        ));
-        // Ctrl+h / Ctrl+Left rotate in the model's own (local) frame;
-        // Alt+h must do nothing either.
-        assert_eq!(
-            resolve_key_event(Char('h'), KeyModifiers::CONTROL),
-            Some((Char('h'), Action::Motion(Motion::LocalYawLeft)))
-        );
-        assert_eq!(
-            resolve_key_event(Left, KeyModifiers::CONTROL),
-            Some((Left, Action::Motion(Motion::LocalYawLeft)))
-        );
-        assert_eq!(resolve_key_event(Char('h'), KeyModifiers::ALT), None);
-        assert_eq!(resolve_key_event(Char(' '), KeyModifiers::ALT), None);
-        // Shift+Tab arrives as BackTab on both paths and still toggles the axes.
-        assert!(matches!(
-            resolve_key_event(BackTab, KeyModifiers::SHIFT),
-            Some((_, Action::Axes))
-        ));
+        for (code, mods) in [
+            (Char('r'), KeyModifiers::NONE),
+            (Char('e'), KeyModifiers::NONE),
+            (Char('r'), KeyModifiers::CONTROL),
+            (Char('e'), KeyModifiers::CONTROL),
+        ] {
+            assert!(
+                resolve_key_event(code, mods).is_none(),
+                "{code:?}+{mods:?} must bind nothing"
+            );
+        }
     }
-
     /// Regression: `held` used to be keyed by Motion, so a modifier change
     /// between Press and Release made key-up resolve to a *different* motion —
     /// the original one kept running, and with key-up reporting there is no
@@ -1761,221 +3496,5 @@ mod tests {
         release.kind = KeyEventKind::Release;
         app.handle_input(Event::Key(release));
         assert!(app.held.is_empty(), "unshifted key-up must stop the hold");
-    }
-
-    #[test]
-    fn plain_keys_are_the_viewers_frame_ctrl_the_models() {
-        // The model faces out of the screen (+Z) while the sight line points
-        // into it: plain h/r must read as the viewer's left/right, Ctrl as
-        // the model's own — mirror images at the default view. Pitch has no
-        // mirror: the model's up is the viewer's up, so k/j agree.
-        let mut v = ViewState::default();
-        apply_motion_step(&mut v, Motion::YawLeft, 0.3, 0.0);
-        // The nose is the third column of the model->world matrix.
-        assert!(v.rot[0][2] < 0.0, "plain h must sweep the nose screen-left");
-
-        let mut v = ViewState::default();
-        apply_motion_step(&mut v, Motion::LocalYawLeft, 0.3, 0.0);
-        assert!(
-            v.rot[0][2] > 0.0,
-            "Ctrl+h must yaw to the model's own left (screen-right at default)"
-        );
-
-        let mut v = ViewState::default();
-        apply_motion_step(&mut v, Motion::RollPlus, 0.3, 0.0);
-        assert!(
-            v.roll < 0.0,
-            "plain r rolls about the sight line: the viewer's right dips (image CW)"
-        );
-
-        let mut v = ViewState::default();
-        apply_motion_step(&mut v, Motion::LocalRollPlus, 0.3, 0.0);
-        // Starboard is the model's local -X; a right bank dips it (y < 0).
-        assert!(-v.rot[1][0] < 0.0, "Ctrl+r must dip the model's starboard");
-
-        let mut v = ViewState::default();
-        apply_motion_step(&mut v, Motion::PitchUp, 0.3, 0.0);
-        assert!(v.rot[1][2] > 0.0, "k must tip the nose up in both frames");
-    }
-
-    #[test]
-    fn app_held_key_expires_without_release() {
-        // A terminal without the kitty protocol never sends Release, so the
-        // hold timeout is the only thing that can stop the motion.
-        let mut app = App::new(
-            Model {
-                vertices: vec![(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)],
-                edges: vec![(0, 1)],
-            },
-            "cube".to_string(),
-            None,
-        );
-        app.handle_input(Event::Key(KeyEvent::new(
-            KeyCode::Right,
-            KeyModifiers::NONE,
-        )));
-        let seen = app
-            .held
-            .get(&KeyCode::Right)
-            .expect("press must hold the motion")
-            .seen;
-        // Exactly at the timeout the key is still down (the bound is <=).
-        app.update_held(seen + LEGACY_HOLD_TIMEOUT, 0.016);
-        assert_eq!(app.held.len(), 1, "the timeout boundary must keep the hold");
-        // One tick past it the key is gone and the model stops by itself.
-        app.update_held(seen + LEGACY_HOLD_TIMEOUT + Duration::from_millis(1), 0.016);
-        assert!(
-            app.held.is_empty(),
-            "a key that stopped reporting must expire"
-        );
-    }
-
-    #[test]
-    fn app_release_seen_holds_never_time_out() {
-        // Once the terminal reports key-up, Release (and FocusLost) end a
-        // hold. A timeout could only ever drop a key that is still down.
-        let mut app = App::new(
-            Model {
-                vertices: vec![(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)],
-                edges: vec![(0, 1)],
-            },
-            "cube".to_string(),
-            None,
-        );
-        let mut release = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
-        release.kind = KeyEventKind::Release;
-        app.handle_input(Event::Key(release));
-        assert!(app.release_seen, "a Release must enable key-up reporting");
-        app.handle_input(Event::Key(KeyEvent::new(
-            KeyCode::Right,
-            KeyModifiers::NONE,
-        )));
-        let seen = app
-            .held
-            .get(&KeyCode::Right)
-            .expect("press must hold the motion")
-            .seen;
-        // A minute of silence must not stop the rotation...
-        app.update_held(seen + Duration::from_secs(60), 0.016);
-        assert_eq!(
-            app.held.len(),
-            1,
-            "a hold must survive silence once key-up is reported"
-        );
-        // ...and the Release is what ends it.
-        let mut release = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
-        release.kind = KeyEventKind::Release;
-        app.handle_input(Event::Key(release));
-        assert!(app.held.is_empty(), "release must stop the motion");
-    }
-
-    #[test]
-    fn app_any_key_event_refreshes_every_hold() {
-        // Without key-up reporting, the OS repeats only the most recently
-        // pressed key, so `l` going down silences `j`. Refreshing per key
-        // would drop `j` mid-hold, which is exactly the reported bug: the
-        // model stops moving down after the timeout but keeps yawing.
-        let mut app = App::new(
-            Model {
-                vertices: vec![(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)],
-                edges: vec![(0, 1)],
-            },
-            "cube".to_string(),
-            None,
-        );
-        for key in ['j', 'l'] {
-            app.handle_input(Event::Key(KeyEvent::new(
-                KeyCode::Char(key),
-                KeyModifiers::NONE,
-            )));
-        }
-        assert_eq!(app.held.len(), 2, "both motion keys are held");
-        let first = app
-            .held
-            .get(&KeyCode::Char('j'))
-            .expect("j must hold the pitch motion")
-            .seen;
-        // Two seconds later only `l` is still repeating.
-        let later = first + Duration::from_secs(2);
-        app.note_key_event(later);
-        app.update_held(later, 0.016);
-        assert_eq!(
-            app.held.len(),
-            2,
-            "the key that stopped repeating must survive"
-        );
-        // Silence past the timeout still ends both, so a lost key-up can
-        // never leave the model spinning on its own.
-        app.update_held(
-            later + LEGACY_HOLD_TIMEOUT + Duration::from_millis(1),
-            0.016,
-        );
-        assert!(app.held.is_empty(), "silence must still end the holds");
-    }
-
-    #[test]
-    fn app_focus_lost_drops_held_keys() {
-        // The key-up of a key held across an alt-tab reaches the other
-        // window, so no Release arrives: FocusLost is the only signal.
-        let mut app = App::new(
-            Model {
-                vertices: vec![(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)],
-                edges: vec![(0, 1)],
-            },
-            "cube".to_string(),
-            None,
-        );
-        app.handle_input(Event::Key(KeyEvent::new(
-            KeyCode::Right,
-            KeyModifiers::NONE,
-        )));
-        assert_eq!(app.held.len(), 1);
-        app.dirty = false;
-        assert!(!app.handle_input(Event::FocusLost));
-        assert!(app.held.is_empty(), "focus loss must stop every hold");
-        assert!(app.dirty, "the cleared hold must repaint");
-    }
-
-    #[test]
-    fn app_key_repeat_only_refreshes_the_hold() {
-        // The kitty protocol reports auto-repeat while a key is held; the
-        // one-shot toggles must fire once per tap instead of on every repeat.
-        let mut app = App::new(
-            Model {
-                vertices: vec![(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)],
-                edges: vec![(0, 1)],
-            },
-            "cube".to_string(),
-            None,
-        );
-        app.handle_input(Event::Key(KeyEvent::new(
-            KeyCode::Char(' '),
-            KeyModifiers::NONE,
-        )));
-        assert!(app.auto_spin, "press must toggle auto-spin");
-        let mut repeat = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE);
-        repeat.kind = KeyEventKind::Repeat;
-        app.handle_input(Event::Key(repeat));
-        assert!(app.auto_spin, "auto-repeat must not re-trigger a toggle");
-
-        // A repeat of a motion key refreshes the hold instead.
-        app.handle_input(Event::Key(KeyEvent::new(
-            KeyCode::Right,
-            KeyModifiers::NONE,
-        )));
-        let seen = app
-            .held
-            .get(&KeyCode::Right)
-            .expect("press must hold the motion")
-            .seen;
-        let mut repeat = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
-        repeat.kind = KeyEventKind::Repeat;
-        app.handle_input(Event::Key(repeat));
-        let refreshed = app
-            .held
-            .get(&KeyCode::Right)
-            .expect("repeat must keep the hold")
-            .seen;
-        assert!(refreshed >= seen, "auto-repeat must refresh the hold");
     }
 }
