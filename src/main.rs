@@ -1509,18 +1509,37 @@ struct StatusCache {
 
 impl Engine {
     fn new(w: usize, h: usize) -> Self {
-        Engine {
+        let mut engine = Engine {
             screen: render::Screen::new(w, h),
             raster: render::Rasterizer::new(),
             hud_buf: None,
             status: None,
-        }
+        };
+        // No Resize event precedes the first frame, so the opening frame needs
+        // a canvas already in place.
+        engine.size_raster_to_canvas();
+        engine
     }
 
-    /// Terminal resize: reallocate the screen and drop the HUD buffer (it was sized for the old screen).
+    /// Point the rasterizer at the canvas of the screen's current size.
+    ///
+    /// The screen is the authority, so this is safe to call after any change
+    /// to it: the rasterizer's grid always matches the region `compose_frame`
+    /// renders through.
+    fn size_raster_to_canvas(&mut self) {
+        let (w, h) = self.screen.size();
+        let (_, _, cw, ch) = model_canvas_rect(w, h);
+        self.raster.resize(cw, ch);
+    }
+
+    /// Terminal resize: reallocate the screen, drop the HUD buffer (it was
+    /// sized for the old screen) and carry the rasterizer's canvas along.
+    /// The `Resize` event is the only thing that changes the canvas size, so
+    /// this is the only place a frame's grid is ever allocated.
     fn resize(&mut self, w: usize, h: usize) {
         self.screen.resize(w, h);
         self.hud_buf = None;
+        self.size_raster_to_canvas();
     }
 
     /// Paint the statusline on `row`, rebuilding it only when something it
@@ -1624,10 +1643,26 @@ fn blit_hud_rect(screen: &mut render::Screen, hud: &Buffer, r: Rect) {
     }
 }
 
+/// The model canvas on a screen of `w`x`h` cells, as `(x, y, w, h)`: row 0 is
+/// the fixed telemetry band and the last row is the hint footer, so the canvas
+/// is every row between them. Height 0 when the terminal is too short to hold
+/// both bands.
+///
+/// The one place the canvas geometry is spelled out: the terminal Resize path
+/// sizes the rasterizer with it and `compose_frame` renders with it, so the
+/// grid the model is painted into and the region it is painted through cannot
+/// drift apart.
+fn model_canvas_rect(w: usize, h: usize) -> (usize, usize, usize, usize) {
+    (0, 1, w, h.saturating_sub(2))
+}
+
 /// Compose one frame into the engine's retained screen: the telemetry band,
 /// the model canvas, the help panel over it (in its own rect only) and the
 /// statusline. Presenting is `render_frame`'s job; splitting the two is what
 /// lets the frame tests read composition off `engine.screen`.
+///
+/// The rasterizer's canvas is NOT sized here: it follows the screen in
+/// `Engine::resize`, so a frame costs no allocation.
 fn compose_frame(app: &mut App, engine: &mut Engine) {
     let (w, h) = engine.screen.size();
     if w == 0 || h == 0 {
@@ -1636,11 +1671,10 @@ fn compose_frame(app: &mut App, engine: &mut Engine) {
     let w16 = w as u16;
     let h16 = h as u16;
     let row0 = telemetry_line(&app.view);
-    // Row 0 is the fixed model+view telemetry; the last row is the hint
-    // footer. The canvas is whatever is left between them.
-    let canvas_top: u16 = 1;
+    let (canvas_x, canvas_top, canvas_w, canvas_h) = model_canvas_rect(w, h);
+    let canvas_top = canvas_top as u16;
+    let canvas_h = canvas_h as u16;
     let footer_top: u16 = h16.saturating_sub(1);
-    let canvas_h: u16 = footer_top.saturating_sub(canvas_top);
     let overlay = app.hud == Hud::Expanded;
 
     // Reuse a persistent ratatui Buffer for the cold overlays.
@@ -1709,11 +1743,10 @@ fn compose_frame(app: &mut App, engine: &mut Engine) {
     if canvas_h > 0 {
         // Model canvas: rasterize into the screen directly. It draws under
         // the help panel too — the panel only claims the cells it covers.
-        engine.raster.resize(w, canvas_h as usize);
         engine.raster.render(
             &app.current,
             &app.view,
-            (0, canvas_top as usize, w, canvas_h as usize),
+            (canvas_x, canvas_top as usize, canvas_w, canvas_h as usize),
             app.show_axes,
             &mut engine.screen,
         );
@@ -2508,6 +2541,69 @@ mod tests {
                     gutter,
                     "ragged chord column: {:?}",
                     l.spans[0].content
+                );
+            }
+        }
+    }
+
+    // --- Event-driven canvas sizing ---
+
+    #[test]
+    fn model_canvas_rect_leaves_room_for_both_bands() {
+        // Rows 1..23 of a 24-row screen: row 0 is the telemetry band and the
+        // last row is the statusline.
+        assert_eq!(model_canvas_rect(80, 24), (0, 1, 80, 22));
+        // Too short for both bands: the canvas collapses to nothing rather
+        // than underflowing.
+        assert_eq!(model_canvas_rect(80, 2), (0, 1, 80, 0));
+        assert_eq!(model_canvas_rect(80, 1), (0, 1, 80, 0));
+        assert_eq!(model_canvas_rect(80, 0), (0, 1, 80, 0));
+    }
+
+    #[test]
+    fn engine_new_sizes_the_raster_to_the_model_canvas() {
+        // No Resize event precedes the first frame, so `Engine::new` must hand
+        // the rasterizer a canvas itself — otherwise the opening frame
+        // rasterizes into a 0x0 grid and draws nothing.
+        let engine = Engine::new(80, 24);
+        // Rows 1..23: row 0 is the telemetry band, the last row the statusline.
+        assert_eq!(engine.raster.canvas_size(), (80, 22));
+    }
+
+    #[test]
+    fn engine_resize_carries_the_raster_to_the_new_canvas() {
+        // A terminal Resize event is the only thing that changes the canvas,
+        // so `Engine::resize` is where the rasterizer follows it.
+        let mut engine = Engine::new(80, 24);
+        engine.resize(120, 40);
+        assert_eq!(engine.screen.size(), (120, 40));
+        assert_eq!(engine.raster.canvas_size(), (120, 38));
+    }
+
+    #[test]
+    fn compose_frame_draws_inside_the_canvas_after_a_resize() {
+        // The stride the rasterizer paints with and the region it is handed
+        // must be the same canvas: a grid left at the old size paints outside
+        // the new bounds (or panics) instead of into them.
+        let mut app = App::new(Model::default(), "cube".to_string(), None);
+        let mut engine = Engine::new(80, 24);
+        compose_frame(&mut app, &mut engine);
+        engine.resize(120, 40);
+        compose_frame(&mut app, &mut engine);
+
+        let (w, h) = engine.screen.size();
+        let is_braille =
+            |x: usize, y: usize| ('\u{2800}'..='\u{28ff}').contains(&engine.screen.symbol(x, y));
+        let dots = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .filter(|&(x, y)| is_braille(x, y))
+            .count();
+        assert!(dots > 0, "the model must still be drawn after a resize");
+        for y in [0, h - 1] {
+            for x in 0..w {
+                assert!(
+                    !is_braille(x, y),
+                    "the canvas must not paint over its bands: ({x},{y})"
                 );
             }
         }

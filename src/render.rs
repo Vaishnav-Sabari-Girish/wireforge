@@ -351,6 +351,13 @@ impl Rasterizer {
         self.proj_px_h = 0;
     }
 
+    /// The canvas grid size in cells, `(width, height)` (used by the canvas
+    /// sizing tests, which read the grid the resize path installed).
+    #[cfg(test)]
+    pub fn canvas_size(&self) -> (usize, usize) {
+        (self.cw, self.ch)
+    }
+
     /// Batch-project all vertices when the cache is stale.
     fn project(&mut self, model: &Model, view: &ViewState, px_w: usize, px_h: usize) {
         let n = model.vertices.len();
