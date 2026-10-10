@@ -179,6 +179,13 @@ impl Screen {
         self.cur[y * self.w + x]
     }
 
+    /// The char drawn in a current-frame cell (used by the frame tests, which
+    /// read composition through the screen rather than through the widgets).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn symbol(&self, x: usize, y: usize) -> char {
+        char::from_u32((self.cur[y * self.w + x] >> 16) as u32).unwrap_or(' ')
+    }
+
     /// Append a decimal integer to the output buffer (no allocation).
     fn push_usize(out: &mut Vec<u8>, mut n: usize) {
         if n == 0 {

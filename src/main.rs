@@ -1596,19 +1596,25 @@ fn fire_due_timers(app: &mut App, engine: &mut Engine, timers: &mut TimerSchedul
     }
 }
 
-/// Copy rows `[y0, y1)` of the HUD buffer into the screen (char + fg + bg).
+/// Copy the rectangle `r` of the HUD buffer into the screen (char + fg + bg).
+///
+/// The rect, not the row, is the unit: the help panel is centred over the
+/// canvas, so only the columns it actually covers may overwrite the model.
 ///
 /// Backgrounds matter here and nowhere else: the model canvas paints dots on
 /// the terminal's own background, while the statusline block is the one place
 /// Wireforge fills cells.
-fn blit_hud_rows(screen: &mut render::Screen, hud: &Buffer, y0: u16, y1: u16) {
-    let (w, _) = screen.size();
-    for y in y0..y1 {
-        for x in 0..w {
-            let cell = &hud[(x as u16, y)];
+fn blit_hud_rect(screen: &mut render::Screen, hud: &Buffer, r: Rect) {
+    let (w, h) = screen.size();
+    let (w16, h16) = (w as u16, h as u16);
+    let y_end = r.y.saturating_add(r.height).min(h16);
+    let x_end = r.x.saturating_add(r.width).min(w16);
+    for y in r.y..y_end {
+        for x in r.x..x_end {
+            let cell = &hud[(x, y)];
             let ch = cell.symbol().chars().next().unwrap_or(' ');
             screen.set(
-                x,
+                x as usize,
                 y as usize,
                 ch,
                 render::ink_idx(cell.fg),
@@ -1618,15 +1624,14 @@ fn blit_hud_rows(screen: &mut render::Screen, hud: &Buffer, y0: u16, y1: u16) {
     }
 }
 
-/// Render the current state into the terminal.
-fn render_frame(
-    app: &mut App,
-    engine: &mut Engine,
-    stdout: &mut io::Stdout,
-) -> Result<(), Box<dyn Error>> {
+/// Compose one frame into the engine's retained screen: the telemetry band,
+/// the model canvas, the help panel over it (in its own rect only) and the
+/// statusline. Presenting is `render_frame`'s job; splitting the two is what
+/// lets the frame tests read composition off `engine.screen`.
+fn compose_frame(app: &mut App, engine: &mut Engine) {
     let (w, h) = engine.screen.size();
     if w == 0 || h == 0 {
-        return Ok(());
+        return;
     }
     let w16 = w as u16;
     let h16 = h as u16;
@@ -1656,10 +1661,11 @@ fn render_frame(
         Paragraph::new(row0).render(Rect::new(0, 0, w16, 1), hud);
     }
 
-    if overlay {
-        // Help panel: centred over the canvas, not a full-screen takeover. The
-        // canvas is *not* drawn underneath, so the panel never has to fight
-        // the model for contrast.
+    // The panel's rect on screen, when it is up. The model is rasterized
+    // first and the panel's rows are blitted over exactly this rect, so the
+    // panel is opaque where it covers and invisible everywhere else.
+    let panel = if overlay {
+        // Help panel: centred over the canvas, not a full-screen takeover.
         let lines = help_lines();
         let inner_w = lines.iter().map(Line::width).max().unwrap_or(0) as u16 + 4;
         let inner_h = lines.len() as u16 + 2; // +2 for the rounded border
@@ -1688,22 +1694,21 @@ fn render_frame(
             Paragraph::new(line.clone())
                 .render(Rect::new(inner.x, inner.y + i as u16, inner.width, 1), hud);
         }
-    }
+        Some(area)
+    } else {
+        None
+    };
 
-    // Copy the HUD rows into the screen: row 0, then either the whole canvas
-    // (model) or the panel rows over it.
+    // Blit row 0 from the HUD buffer; the canvas never paints over it.
     {
         let screen = &mut engine.screen;
         let hud = engine.hud_buf.as_ref().unwrap();
-        blit_hud_rows(screen, hud, 0, canvas_top);
+        blit_hud_rect(screen, hud, Rect::new(0, 0, w16, canvas_top));
     }
 
-    if overlay {
-        let screen = &mut engine.screen;
-        let hud = engine.hud_buf.as_ref().unwrap();
-        blit_hud_rows(screen, hud, canvas_top, footer_top);
-    } else if canvas_h > 0 {
-        // Model canvas: rasterize into the screen directly.
+    if canvas_h > 0 {
+        // Model canvas: rasterize into the screen directly. It draws under
+        // the help panel too — the panel only claims the cells it covers.
         engine.raster.resize(w, canvas_h as usize);
         engine.raster.render(
             &app.current,
@@ -1714,10 +1719,25 @@ fn render_frame(
         );
     }
 
+    // The panel, if any, paints over the model in exactly its own rectangle.
+    if let Some(panel) = panel {
+        let screen = &mut engine.screen;
+        let hud = engine.hud_buf.as_ref().unwrap();
+        blit_hud_rect(screen, hud, panel);
+    }
+
     // The statusline always paints last, over whatever the canvas left behind.
     engine.paint_status(app, w16, footer_top as usize);
+}
 
-    // Present: packed-cell diff + one batched write.
+/// Render the current state into the terminal: compose a frame, then present
+/// it (packed-cell diff + one batched write).
+fn render_frame(
+    app: &mut App,
+    engine: &mut Engine,
+    stdout: &mut io::Stdout,
+) -> Result<(), Box<dyn Error>> {
+    compose_frame(app, engine);
     engine.screen.present(stdout)?;
     Ok(())
 }
@@ -2491,6 +2511,75 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn help_panel_occludes_only_the_cells_it_covers() {
+        // Pressing `?` used to blank the canvas. The panel must instead claim
+        // exactly its own rectangle on top of the model: whatever it covers is
+        // occluded, and every cell outside it draws as if `?` were never
+        // pressed — the two frames differ only inside the panel.
+        let compose = |overlay: bool| {
+            let mut app = App::new(Model::default(), "cube".to_string(), None);
+            app.hud = if overlay {
+                Hud::Expanded
+            } else {
+                Hud::Collapsed
+            };
+            let mut engine = Engine::new(120, 40);
+            compose_frame(&mut app, &mut engine);
+            engine
+        };
+        let plain = compose(false);
+        let over = compose(true);
+
+        let is_braille = |e: &Engine, x: usize, y: usize| {
+            ('\u{2800}'..='\u{28ff}').contains(&e.screen.symbol(x, y))
+        };
+        let braille = |e: &Engine| {
+            let (w, h) = e.screen.size();
+            (0..h)
+                .flat_map(|y| (0..w).map(move |x| (x, y)))
+                .filter(|&(x, y)| is_braille(e, x, y))
+                .count()
+        };
+        assert!(braille(&plain) > 0, "the empty scene must draw its axes");
+
+        // Find the panel by its rounded corners and measure it on screen,
+        // rather than re-deriving the layout math the renderer just ran.
+        let (w, h) = over.screen.size();
+        let (px, py) = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .find(|&(x, y)| over.screen.symbol(x, y) == '╭')
+            .expect("the help panel must be on screen");
+        let mut pw = 1;
+        while px + pw < w && matches!(over.screen.symbol(px + pw, py), '─' | '╮') {
+            pw += 1;
+        }
+        let mut ph = 1;
+        while py + ph < h && matches!(over.screen.symbol(px, py + ph), '│' | '╰') {
+            ph += 1;
+        }
+
+        let mut covered = 0usize; // model cells the panel hides
+        let mut leaked = 0usize; // model cells surviving under the panel
+        let mut touched = 0usize; // cells outside the panel the overlay altered
+        for y in 0..h {
+            for x in 0..w {
+                if x >= px && x < px + pw && y >= py && y < py + ph {
+                    leaked += usize::from(is_braille(&over, x, y));
+                    covered += usize::from(is_braille(&plain, x, y));
+                } else if over.screen.cell(x, y) != plain.screen.cell(x, y) {
+                    touched += 1;
+                }
+            }
+        }
+        assert!(covered > 0, "the panel must sit over part of the model");
+        assert_eq!(leaked, 0, "the panel must occlude the model underneath");
+        assert_eq!(
+            touched, 0,
+            "outside the panel the frame must be identical to the one without the overlay"
+        );
     }
 
     // ---------- statusline ----------
